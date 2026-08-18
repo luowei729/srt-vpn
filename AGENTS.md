@@ -40,3 +40,4 @@
   - 阿里云 47.102.196.219：srv_cn 服务端(9100) + 上传接收(9800) 已停（保留编译产物 /root/srt-vpn-src）
   - Docker 测试流程：`docker build -t srt-vpn:local .` 后 `--net=host -v <config>:/app/configs/x.conf:ro -c /app/configs/x.conf`
   - 云端 Docker 镜像：GitHub Actions 手动触发 push GHCR 后拉取运行
+- [2026-08-19 22:30] **P1 完成 + UDP 代理 + 稳定性加固**：① SOCKS5 UDP ASSOCIATE 已实现（socks5.rs start_udp_associate：中继 socket + 首包定目标 + Open(proto=1)），服务器端 start_udp_forward（UDP socket 双向）；单 UDP ASSOCIATE 固定首个目标（DNS/QUIC 场景），多目标后续扩展；② 服务器稳定性加固：TcpStream::connect 10s 超时 + 转发空闲 300s 看门狗（防此前卡死/泄漏根因）；③ PROJECT_PLAN P1 全部标记完成。UDP 隧道回环已验证（发/收 ECHO 双向正常）。

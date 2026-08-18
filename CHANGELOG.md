@@ -2,6 +2,41 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-19 22:30] - UDP 代理实现 + 服务器稳定性加固 + P1 完成标记
+
+### 改动前总结
+SOCKS5 UDP ASSOCIATE 返回"不支持"，服务器 UDP 转发返回"尚未实现"；服务器转发会话
+无超时清理（此前服务端卡死/会话泄漏隐患）；PROJECT_PLAN P1 待办项文档过时。
+
+### 改动后总结
+**1. UDP 代理（SOCKS5 UDP ASSOCIATE）**
+- `src/client/socks5.rs`：`start_udp_associate` 完整实现
+  - UDP 中继 Socket（随机端口）→ 回复 SOCKS5 绑定地址+端口
+  - 首个数据报确定目标 → Open(proto=1) 建隧道 UDP 会话
+  - 双向：中继收包→隧道；隧道响应→封装 SOCKS5 UDP 头→回客户端
+- `src/server/forward.rs`：`start_udp_forward` 实现
+  - UDP socket bind 随机端口，隧道 Data 帧→send 目标；目标响应→Data 帧回传
+- 设计约定：单 UDP ASSOCIATE 会话固定首个目标（DNS/QUIC/游戏等单目标场景），
+  多目标为后续扩展
+
+**2. 服务器稳定性加固（防卡死/泄漏）**
+- forward.rs：`TcpStream::connect` 加 10s 超时（防目标不可达永久挂起）
+- forward.rs：转发循环加空闲看门狗（300s 无双向活动则关闭会话）
+- 针对此前服务端"只收不回包+CPU打满+会话泄漏"故障根因的根除
+
+**3. P1 完成标记**
+- PROJECT_PLAN.md：P1 全部子项标记 [x]，新增功能（UDP代理/加固/Docker/CI）纳入已完成
+
+### 验证
+- ✅ UDP ASSOCIATE 回环测试：发 hello-udp → 隧道 → UDP echo → 回 ECHO:hello-udp（双向正常）
+- ✅ TCP 代理回归（HTTP 200）、15 单元测试通过、release 编译零警告
+- ✅ 多线程上传/带宽优化等此前功能无回归
+
+### 涉及文件
+- src/client/socks5.rs（UDP ASSOCIATE）
+- src/server/forward.rs（UDP 转发 + connect 超时 + 看门狗）
+- PROJECT_PLAN.md（P1 完成）
+
 ## [2026-08-19 21:30] - Docker 容器化(Alpine) + GitHub Actions 手动发布 + 启动命令文档
 
 ### 改动前总结

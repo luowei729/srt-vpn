@@ -81,10 +81,94 @@ pub async fn handle_open_with_rx(
             start_tcp_forward(session_id, &open, rx, conn, mux_enc, registry).await
         }
         PROTO_UDP => {
-            Err("UDP 直连转发尚未实现（P2）".to_string())
+            start_udp_forward(session_id, &open, rx, conn, mux_enc, registry).await
         }
         _ => Err(format!("未知协议类型: {}", open.proto)),
     }
+}
+
+/// UDP 直连转发（服务器端，2026-08-19 新增）
+///
+/// 设计（对应 SOCKS5 UDP 场景，固定目标会话）：
+/// - Open 帧 proto=1 携带目标 `host:port`（客户端通过 UDP ASSOCIATE 指定）
+/// - 服务端 UdpSocket::bind 随机本地端口，作为该会话的 UDP 中继出口
+/// - 来自隧道的 Data 帧负载 = 原始 UDP payload → send_to(目标)
+/// - 目标返回的 UDP 数据报 → 封装为 Data 帧发回隧道
+///
+/// 双向用 tokio::select! 同时驱动"隧道→UDP"和"UDP→隧道"两个方向。
+async fn start_udp_forward(
+    session_id: u16,
+    open: &OpenRequest,
+    rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    conn: Arc<SrtConnection>,
+    mux_enc: Arc<MuxEncoder>,
+    registry: SessionRegistry,
+) -> Result<(), String> {
+    // 1. 解析目标（DNS 解析为 socket 地址）
+    let target = format!("{}:{}", open.host, open.port);
+    // 用 tokio 解析（支持域名）
+    let target_addr = tokio::net::lookup_host(&target)
+        .await
+        .map_err(|e| format!("解析目标 {target} 失败: {e}"))?
+        .next()
+        .ok_or_else(|| format!("目标 {target} 无法解析"))?;
+    tracing::info!(session = session_id, target = %target, "UDP 转发会话建立");
+
+    // 2. 创建 UDP socket（随机本地端口）
+    let socket = std::sync::Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await
+        .map_err(|e| format!("UDP socket bind 失败: {e}"))?);
+    socket.connect(target_addr).await
+        .map_err(|e| format!("UDP connect 失败: {e}"))?;
+
+    // 3. 用已注册的接收通道建立隧道会话
+    let mut session = TunnelSession::new(session_id, rx, conn, mux_enc, registry.clone());
+
+    // 4. 双向转发：
+    //    - 隧道 Data 帧 → UDP send
+    //    - UDP recv → 隧道 Data 帧
+    let mut udp_buf = [0u8; 65536]; // UDP 最大数据报
+    loop {
+        tokio::select! {
+            // 方向 1：隧道 → UDP 目标
+            recv_result = session.recv() => {
+                match recv_result {
+                    Some(data) => {
+                        // 隧道数据（原始 UDP payload）→ 发给目标
+                        if let Err(e) = socket.send(&data).await {
+                            tracing::debug!(session = session_id, error = %e, "UDP send 失败");
+                        }
+                    }
+                    None => {
+                        // 隧道会话关闭（客户端关闭 UDP 会话）
+                        tracing::debug!(session = session_id, "UDP 会话隧道侧关闭");
+                        break;
+                    }
+                }
+            }
+            // 方向 2：UDP 目标响应 → 隧道
+            recv_from = socket.recv_from(&mut udp_buf) => {
+                match recv_from {
+                    Ok((len, _src)) => {
+                        // 目标响应数据报 → 封装为 Data 帧发回隧道
+                        let payload = &udp_buf[..len];
+                        if let Err(e) = session.send_data(payload).await {
+                            tracing::debug!(session = session_id, error = %e, "UDP 回传失败");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(session = session_id, error = %e, "UDP recv 失败");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. 清理：关闭会话（发 Close 帧）
+    tracing::debug!(session = session_id, "UDP 转发会话结束");
+    let _ = session.send_control(FrameType::Close, &[]).await;
+    Ok(())
 }
 
 /// TCP 直连转发（服务器端）
@@ -103,10 +187,16 @@ pub async fn start_tcp_forward(
     registry: SessionRegistry,
 ) -> Result<(), String> {
     // 1. 连接目标（支持 IPv4/DNS）
+    //    稳定性加固（2026-08-19）：connect 加 10s 超时，避免目标不可达时
+    //    转发任务永久挂起（此前"连接目标超时"会话死循环导致服务端卡死的根因之一）
     let target = format!("{}:{}", open.host, open.port);
-    let mut stream = TcpStream::connect(&target)
-        .await
-        .map_err(|e| format!("连接目标 {target} 失败: {e}"))?;
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TcpStream::connect(&target),
+    )
+    .await
+    .map_err(|_| format!("连接目标 {target} 超时"))?
+    .map_err(|e| format!("连接目标 {target} 失败: {e}"))?;
     tracing::info!(session = session_id, target = %target, "TCP 转发会话建立");
 
     // 2. 用已注册的接收通道建立隧道会话（不再自行注册，避免竞态）
@@ -123,8 +213,21 @@ pub async fn start_tcp_forward(
     let mut rx_bytes: u64 = 0; // 隧道→目标 累计字节（诊断）
     let mut tx_bytes: u64 = 0; // 目标→隧道 累计字节（诊断）
 
+    // 稳定性加固（2026-08-19）：空闲看门狗。双向 N 秒内无任何数据活动则关闭会话，
+    // 防止"目标侧 hang 住"的死会话永久占资源（此前服务端卡死/会话泄漏的根因）。
+    // 每次有双向数据活动时重置看门狗（sleep 重新计时）。
+    const IDLE_TIMEOUT_SECS: u64 = 300;
+    let idle_duration = std::time::Duration::from_secs(IDLE_TIMEOUT_SECS);
+    // 用 pin! 固定 Sleep（!Unpin），以便 select 借用 &mut 并在活动分支 reset
+    let mut idle_watchdog = std::pin::pin!(tokio::time::sleep(idle_duration));
+
     loop {
         tokio::select! {
+            // 看门狗：长时间无活动则退出（返回 Err 由上层清理会话）
+            _ = &mut idle_watchdog => {
+                tracing::warn!(session = session_id, idle_secs = IDLE_TIMEOUT_SECS, "转发会话空闲超时，关闭");
+                return Err(format!("会话 {session_id} 空闲超时（>{}s）", IDLE_TIMEOUT_SECS));
+            }
             // 方向 1：目标 → 隧道
             read_result = stream.read(&mut target_buf), if !target_eof => {
                 match read_result {
@@ -146,6 +249,8 @@ pub async fn start_tcp_forward(
                             tracing::debug!(session = session_id, tx_total = tx_bytes, "目标→隧道 进度");
                         }
                         session.send_data_batch(&target_buf[..n]).await?;
+                        // 有活动：重置看门狗
+                        idle_watchdog.as_mut().reset(tokio::time::Instant::now() + idle_duration);
                     }
                     Err(e) => {
                         return Err(format!("读目标数据失败: {e}"));
@@ -163,6 +268,8 @@ pub async fn start_tcp_forward(
                         }
                         stream.write_all(&data).await
                             .map_err(|e| format!("写目标数据失败: {e}"))?;
+                        // 有活动：重置看门狗
+                        idle_watchdog.as_mut().reset(tokio::time::Instant::now() + idle_duration);
                     }
                     None => {
                         // 隧道会话关闭（客户端关闭）
