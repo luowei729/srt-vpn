@@ -1,0 +1,91 @@
+//! cli.rs — CLI 参数解析
+//!
+//! 启动命令：srt-vpn -c server.conf / srt-vpn -c client.json
+//!
+//! 参数设计（设计树 Q13）：
+//! - -c: 配置文件路径（必选，server.conf 或 client.json）
+//! - -m: UDP 可靠/尽力而为模式（仅服务端有效，覆盖配置）
+//! - -v: 日志级别（0-4，默认 2）
+//! - -h: 帮助
+//! - SOCKS5 完整设定参数（覆盖配置文件）：
+//!   --socks5-listen: SOCKS5 监听地址（如 127.0.0.1:1080）
+//!   --socks5-user:   SOCKS5 用户名
+//!   --socks5-pass:   SOCKS5 密码
+//!   --socks5-users:  多用户配置（可选，格式 user:pass 逗号分隔）
+
+use clap::{ArgAction, Parser};
+use serde::{Deserialize, Serialize};
+
+/// SRT-VPN 命令行参数
+#[derive(Parser, Debug, Clone)]
+#[command(name = "srt-vpn", version, about = "基于 SRT 直播流协议的 VPN 隧道")]
+pub struct Args {
+    /// 配置文件路径（server.conf / client.json，JSON 语法）
+    #[arg(short = 'c', long = "config", value_name = "FILE")]
+    pub config: String,
+
+    /// UDP 传输模式（仅服务端）：reliable=可靠传输（默认）| best-effort=尽力而为
+    #[arg(short = 'm', long = "udp-mode", value_name = "MODE")]
+    pub udp_mode: Option<String>,
+
+    /// 日志级别（0=ERROR, 1=WARN, 2=INFO, 3=DEBUG, 4=TRACE）
+    #[arg(short = 'v', long = "verbose", default_value = "2", value_name = "LEVEL")]
+    pub verbose: u8,
+
+    /// SOCKS5 监听地址（覆盖配置，如 127.0.0.1:1080）
+    #[arg(long = "socks5-listen", value_name = "ADDR")]
+    pub socks5_listen: Option<String>,
+
+    /// SOCKS5 用户名（覆盖配置）
+    #[arg(long = "socks5-user", value_name = "USER")]
+    pub socks5_user: Option<String>,
+
+    /// SOCKS5 密码（覆盖配置，注意：命令行明文，建议仅在测试环境使用）
+    #[arg(long = "socks5-pass", value_name = "PASS")]
+    pub socks5_pass: Option<String>,
+
+    /// SOCKS5 多用户（可选，格式 user:pass,user2:pass2，覆盖配置）
+    #[arg(long = "socks5-users", value_name = "USERS", action = ArgAction::Append)]
+    pub socks5_users: Vec<String>,
+}
+
+/// 解析 CLI 参数（panic-free，错误时 clap 自动打印帮助并退出）
+pub fn parse_args() -> Args {
+    Args::parse()
+}
+
+/// UDP 模式枚举（服务端 -m 参数）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UdpMode {
+    /// 可靠传输（SRT 自动重传，默认）
+    Reliable,
+    /// 尽力而为（不重传，低延迟）
+    BestEffort,
+}
+
+impl UdpMode {
+    /// 从字符串解析 UDP 模式
+    pub fn parse_str(s: &str) -> Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "reliable" => Ok(Self::Reliable),
+            "best-effort" | "besteffort" | "best_effort" => Ok(Self::BestEffort),
+            other => Err(format!("无效的 UDP 模式 '{other}'（可选：reliable / best-effort）")),
+        }
+    }
+}
+
+/// 日志级别数值转字符串（用于日志初始化）
+/// （当前 main.rs 直接用 verbose 数值，此方法预留）
+#[allow(dead_code)]
+impl Args {
+    pub fn log_level_str(&self) -> &'static str {
+        match self.verbose {
+            0 => "error",
+            1 => "warn",
+            2 => "info",
+            3 => "debug",
+            _ => "trace",
+        }
+    }
+}

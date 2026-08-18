@@ -1,0 +1,17 @@
+# ===== Rust 构建产物 =====
+# target 目录是 cargo 编译产物，体积巨大且可随时重建，绝不入库
+/target/
+
+# ===== Python 虚拟环境 =====
+# 本项目调试/测试用的 venv，不入库
+/.venv/
+
+# ===== 敏感凭据（绝不提交到公网）=====
+# 含服务器 root 密码 / SSH IP / 隧道 passphrase / SOCKS5 账号，严禁 push
+/DEPLOY_CREDENTIALS.md
+
+# ===== 编辑器 / 系统杂项 =====
+.vscode/
+*.swp
+*.swo
+.DS_Store

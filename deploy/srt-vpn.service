@@ -1,0 +1,27 @@
+# SRT-VPN 服务端 systemd 服务样例（已在服务器 129.150.44.117 实测部署）
+# 部署方法（本机为 /root/srt-vpn 时）：
+#   cp deploy/srt-vpn.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now srt-vpn
+
+[Unit]
+Description=SRT-VPN Server (SRT 协议隧道)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 服务端配置路径（按实际部署位置修改）
+ExecStart=/root/srt-vpn/target/release/srt-vpn -c /root/srt-vpn/configs/server.conf
+# 生产环境建议使用专用用户运行（非 root）
+# User=srtvpn
+# Group=srtvpn
+# 崩溃/异常自动重启
+Restart=on-failure
+RestartSec=5
+# 日志走 journald（JSON 结构化输出）
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
