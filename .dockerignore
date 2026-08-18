@@ -1,0 +1,23 @@
+# ===== Docker 构建忽略（优化镜像缓存 + 避免泄漏）=====
+# 构建产物
+/target/
+/.venv/
+
+# 敏感凭据（严禁进镜像）
+/DEPLOY_CREDENTIALS.md
+
+# 本地配置（在容器通过 -v 挂载，不带进镜像）
+/configs/*.json
+/configs/*.conf
+
+# Git / 编辑器 / CI 文件（GitHub Actions 在仓库跑，无需进镜像）
+/.git/
+/.github/
+/.vscode/
+DOCKER.md
+*.swp
+*.swo
+
+# 测试临时文件与文档
+/examples/
+/scripts/

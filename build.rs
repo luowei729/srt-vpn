@@ -59,11 +59,25 @@ fn main() {
     println!("cargo:rustc-link-lib=stdc++");
     println!("cargo:rustc-link-lib=crypto");
     println!("cargo:rustc-link-lib=ssl");
-    println!("cargo:rustc-link-lib=pthread");
+    // 注意：Alpine/musl 中 pthread 是 libc 内置，无需（也不能）单独链接；
+    // glibc 环境才需要 -lpthread。按 TARGET 原生支持判定（Docker Alpine 场景关键）。
+    if target_has_libpthread() {
+        println!("cargo:rustc-link-lib=pthread");
+    }
     println!("cargo:rustc-link-lib=m");
 
     // 6. 让 cargo 感知源码变化（源码改动时自动触发重编译）
     println!("cargo:rerun-if-changed={}", srt_src.display());
+}
+
+/// 判断当前编译目标是否需要显式链接 libpthread
+/// - glibc（标准 Linux / Debian / 本机）：需要 -lpthread
+/// - musl（Alpine）：pthread 已并入 libc，单独链接会报"无法找到 -lpthread"或产生
+///   冗余 stub；返回 false 跳过
+fn target_has_libpthread() -> bool {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    // musl 目标（如 x86_64-unknown-linux-musl / aarch64-unknown-linux-musl）
+    !target.contains("musl")
 }
 
 /// 获取可用 CPU 核数（限制最大并行度，避免 OOM）
