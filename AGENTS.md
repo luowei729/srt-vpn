@@ -33,3 +33,10 @@
 - [2026-08-19 04:35] **客户端三合一代理（SOCKS5+HTTP+HTTPS）**：监听端口首字节嗅探——0x05=SOCKS5，HTTP 方法首字母（G/P/O/D/C/T/H）=HTTP 代理。http_proxy.rs 支持 CONNECT 隧道（回 200 后透传，含头后 TLS 数据）+ 普通 HTTP（透传请求头）。proxy.rs 的 start_forward_with_reply(reply, prepend) 统一建隧道：reply=给客户端的成功响应，prepend=先发隧道的预读数据。测速注意：官方 speedtest CLI 无 --proxy 参数也不认 http_proxy 环境变量，需用 proxychains 或支持代理的工具连 http 代理。
 - [2026-08-19 05:30] **send_data_batch 同步投递优化**：逐帧 `send_async().await`（每帧 tokio 切换）改为 `send()` 同步投递（crossbeam unbounded 不阻塞），本机上传 17→76MB/s。**payload 用官方默认 1316，用户明确不用 1456**。**多线程上传已证明支持**（8线程 92MB/s、16线程 142MB/s、16×8MB 全完整），用户公网"多线程上传0"是上行 QoS/链路限制。公网下载 CPU100% 是 SRT 高RTT重传开销，应用层非瓶颈（本机同吞吐 CPU 仅10%）。
 - [2026-08-19 20:10] **国内服务器多线程验证（47.102.196.219, Ubuntu22.04 x86_64, root/782094Abc）+ 测速陷阱**：隧道原生支持多线程（单线21MB/s、8线33MB/s、16线31MB/s、32线全成功）。**关键测速陷阱：curl 目标写 127.0.0.1:9800 时，服务端转发连的是【服务端本机】的9800，接收服务必须起在服务端机器上**，否则 Connection refused 导致"上传0"假象（此前用户"多线程上传0"由此导致，非隧道bug）。国内服务器部署：装Rust+libssl-dev本地编译（GLIBC匹配）。
+- [2026-08-19 21:30] **Docker容器化 + CI**：Dockerfile 多阶段 Alpine（rust:1.97-alpine + alpine:3.20 runtime，镜像<50MB，--net=host 运行）；build.rs 按 musl/glibc 条件链接 pthread；.github/workflows/release.yml 手动触发（workflow_dispatch）构建 amd64/arm64 push GHCR；README.md/DOCKER.md 写明月启动命令+配置映射（仅 mode/passphrase/server(listen) 必填，其余默认）；仓库 github.com/luowei729/srt-vpn，本地 git 提交推送 main。
+- [2026-08-19 21:40] **已停止所有手动测试服务，后续统一用 Docker 跑**：
+  - 本机：所有 srt-vpn 进程、1080/1081/1082 代理、回环测试、Python 测试服务（9800/9900）已全部清理
+  - 新加坡 129.150.44.117：systemctl stop+disable srt-vpn，9000/9800 已停（保留部署文件，可随时 systemctl start）
+  - 阿里云 47.102.196.219：srv_cn 服务端(9100) + 上传接收(9800) 已停（保留编译产物 /root/srt-vpn-src）
+  - Docker 测试流程：`docker build -t srt-vpn:local .` 后 `--net=host -v <config>:/app/configs/x.conf:ro -c /app/configs/x.conf`
+  - 云端 Docker 镜像：GitHub Actions 手动触发 push GHCR 后拉取运行
