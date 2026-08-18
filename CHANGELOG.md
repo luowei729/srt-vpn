@@ -2,6 +2,44 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-19 21:30] - Docker 容器化(Alpine) + GitHub Actions 手动发布 + 启动命令文档
+
+### 改动前总结
+项目无 Docker 构建、无 CI 自动发布，md 文档缺少清晰的 server/client 启动命令和配置映射。
+
+### 改动后总结
+**1. Docker 容器化（Alpine 基础镜像）**
+- `Dockerfile`：多阶段构建
+  - builder：`rust:1.97-alpine` + build-base/cmake/openssl-dev，编译 libsrt 静态库 + Rust release
+  - runtime：`alpine:3.20` + libstdc++/openssl/ca-certificates/tzdata，非 root 运行（uid 1000）
+  - 镜像 <50MB（vs Debian ~150MB），适合 VPN 常驻进程
+  - `--network=host` 运行（SRT 是 UDP）
+- `build.rs`：**按 musl/glibc 条件链接 pthread**（Alpine/musl 中 pthread 内置 libc，
+  跳过 `-lpthread`；glibc 环境仍链接）。benign 但避免 Alpine 链接错误。
+
+**2. GitHub Actions 手动发布镜像**
+- `.github/workflows/release.yml`：`workflow_dispatch`（手动触发，可填版本号）
+- docker/build-push-action 构建 **amd64 + arm64**，push GHCR（ghcr.io），打版本号+latest tag
+- srt-1.5.6 已 git 跟踪（334 文件），checkout 后构建可得源码
+
+**3. 启动命令与配置映射文档**
+- 新增 `README.md`：server/client 启动命令（原生 + Docker）+ 配置映射表
+- 新增 `DOCKER.md`：容器化部署完整文档（构建/启动/配置/路径约定）
+- 配置必填/默认规则：仅 `mode`/`passphrase`/`server`(client)/`listen`(server) 必填，
+  其余省略即默认（config.rs validate 已保证）
+- `.dockerignore`：排除 target/venv/敏感文件/本地配置，优化镜像缓存
+
+### 验证
+- 本机构建 release 通过（build.rs 修改未破坏 glibc 路径）
+- git 提交并推送（luowei729/srt-vpn 仓库 main）
+- Note：Alpine 首次镜像构建需在 GitHub Actions 验证；如 musl 编译 libsrt 失败，
+  文档已给出回退 Debian 方案
+
+### 涉及文件
+- Dockerfile（新增）、.dockerignore（新增）、.github/workflows/release.yml（新增）
+- README.md（新增）、DOCKER.md（新增）
+- build.rs（pthread 条件链接）
+
 ## [2026-08-19 20:10] - 国内服务器多线程上传验证：隧道原生支持多线程（结论修正）
 
 ### 背景

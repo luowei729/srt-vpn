@@ -17,6 +17,11 @@ GitHub 仓库 → **Actions** 页 → `Build & Publish Docker Image` → **Run w
 - 推送至 GHCR（GitHub Container Registry）
 - 打 `版本号` + `latest` 两个 tag
 
+> **注意（首次构建如失败）**：镜像基于 **Alpine (musl)**。若 GitHub Actions 构建日志
+> 显示 libsrt C++ 编译报错（musl 兼容问题），可在 `Dockerfile` 将两阶段基础镜像
+> 换回 Debian 系（`rust:1.97-slim` + `debian:bookworm-slim`），依赖包随之改为
+> `libssl-dev` + `libstdc++6 libssl3`（glibc），其余不变。两种方案代码通用。
+
 ### 3. 本地构建（调试用）
 ```bash
 # 需 Docker + 本机有 rust 重编（也可以直接 docker build）
