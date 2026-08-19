@@ -33,7 +33,21 @@ pub async fn accept_loop(srt_cfg: &SrtConfig, app_cfg: &Config) -> Result<(), St
     // 此前是普通局部变量只增不减，客户端断开后 max_clients 被离线客户端永久占满，
     // 服务器最终拒绝所有新连接。现改为 Arc<AtomicUsize>，客户端任务结束时 fetch_sub(1)。
     let client_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let srt_cfg = srt_cfg.clone();
+
+    // 2026-08-19 M1 配套修复（accept 并行化端口冲突 bug）：
+    // 旧模型每连接重建监听 socket（bind->listen->accept(1个)->close），
+    // 并行化后多任务同时 bind 同一端口 -> "Another socket is already listening"
+    // 无限报错（新加坡部署实测）。现监听 socket 建立一次常驻（SrtListener），
+    // 各 accept 任务并发调 accept_one（srt_accept 线程安全）。
+    let listener = {
+        let cfg = srt_cfg.clone();
+        tokio::task::spawn_blocking(move || SrtConnection::bind_listener(&cfg))
+            .await
+            .map_err(|e| format!("监听任务异常: {e}"))?
+            .map_err(|e| format!("SRT 监听建立失败: {e}"))?
+    };
+    let listener = Arc::new(listener);
+
     loop {
         // 达到最大客户端数时等待（P1 简单：拒绝新连接）
         let cur = client_count.load(std::sync::atomic::Ordering::Relaxed);
@@ -48,14 +62,14 @@ pub async fn accept_loop(srt_cfg: &SrtConfig, app_cfg: &Config) -> Result<(), St
         // 名额预占：spawn 前 +1（防并发 accept 超卖），认证失败时 -1 回退。
         let cfg_c = app_cfg.clone();
         let count_c = client_count.clone();
-        let srt_cfg_c = srt_cfg.clone();
+        let listener_c = listener.clone();
         tokio::spawn(async move {
             // 名额预占（B1 原子计数；认证失败/accept 失败时回退）
             count_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             // 阻塞 accept 放 spawn_blocking（M1：不占 tokio worker）
-            let accept_cfg = srt_cfg_c.clone();
-            let conn = match tokio::task::spawn_blocking(move || SrtConnection::accept(&accept_cfg))
+            // 监听 socket 常驻复用（M1 配套修复：不再每连接 bind）
+            let conn = match tokio::task::spawn_blocking(move || listener_c.accept_one())
                 .await
             {
                 Ok(Ok(c)) => c,

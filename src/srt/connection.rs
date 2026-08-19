@@ -314,10 +314,16 @@ impl SrtConnection {
         }
     }
 
-    /// 服务端监听 + 接受连接（阻塞式）
+    /// 服务端监听 socket（一次 bind+listen，常驻；供 accept_one 循环复用）
     ///
-    /// 返回接受的连接（已配置好并启动事件循环）
-    pub fn accept(cfg: &SrtConfig) -> Result<Self, SrtError> {
+    /// 2026-08-19 M1 配套修复（accept 并行化引入的端口占用 bug）：
+    /// 旧 SrtConnection::accept 每次调用都走完整 bind->listen->accept(1个)->close(监听)。
+    /// 串行 accept_loop 下无问题；但 M1 并行化后多个任务同时 bind 同一端口 ->
+    /// "Another socket is already listening on the same port" 无限报错，
+    /// 除第一个任务外全部 accept 失败。
+    /// 正确模型：监听 socket 全局唯一且常驻（bind 一次），accept 可在
+    /// 多任务中并发调用（srt_accept 线程安全，内核/libsrt 内部排队）。
+    pub fn bind_listener(cfg: &SrtConfig) -> Result<SrtListener, SrtError> {
         unsafe {
             // S6：全局初始化（幂等 + atexit 注册 cleanup，防退出段错误）
             srt_global_init()?;
@@ -345,27 +351,33 @@ impl SrtConnection {
                 srt_close(sock);
                 return Err(SrtError::Connect(err));
             }
+            tracing::info!(listen = %addr, "SRT 监听 socket 已建立（常驻）");
+            Ok(SrtListener { sock })
+        }
+    }
 
-            // 接受连接
+    /// 在监听 socket 上接受一个连接（阻塞直到新客户端到来或出错）
+    ///
+    /// 由 SrtListener 调用；每客户端一次（可在多任务并发调用，
+    /// 监听 socket 常驻不重复 bind）。
+    fn accept_from_listener(listen_sock: SRTSOCKET) -> Result<Self, SrtError> {
+        unsafe {
+            // 接受连接（阻塞；srt_accept 线程安全，多任务并发调用由 libsrt 内部排队）
             let mut peer: libc::sockaddr_in = std::mem::zeroed();
             let mut peer_len = std::mem::size_of::<libc::sockaddr_in>() as c_int;
             let accepted = srt_accept(
-                sock,
+                listen_sock,
                 &mut peer as *mut libc::sockaddr_in as *mut libc::sockaddr,
                 &mut peer_len,
             );
             if accepted == -1 {
-                let err = last_error_str();
-                srt_close(sock);
-                return Err(SrtError::Connect(err));
+                return Err(SrtError::Connect(last_error_str()));
             }
             // 关键：accept 返回后等待握手完全完成！
             // 实测：responder 立即发数据时，initiator 的握手（URQ_CONCLUSION/AGREEMENT）
             // 还没完成，会触发 "Connection was broken"，数据丢失。
             // 等待 300ms 让握手完成后再进入认证/收发。
             std::thread::sleep(std::time::Duration::from_millis(300));
-            // 关闭监听 socket（单客户端模式；多客户端由上层循环调用）
-            srt_close(sock);
 
             // 已接受的连接设为非阻塞（配合 epoll 事件循环收发）
             Self::set_nonblocking(accepted)?;
@@ -419,7 +431,12 @@ impl SrtConnection {
         }
     }
 
-    /// 应用 socket 选项（创建后、连接前调用）
+    /// 服务端监听器（常驻监听 socket 封装）
+    ///
+    /// 2026-08-19 M1 配套修复：accept 并行化后监听 socket 必须全局唯一常驻
+    /// （旧模型每连接重建 bind 会端口冲突）。
+    /// - `accept_one`：阻塞接受一个连接（可在多任务并发调用）
+    /// - Drop：关闭监听 socket（唯一释放方）
     unsafe fn apply_options(sock: SRTSOCKET, cfg: &SrtConfig) -> Result<(), SrtError> {
         let set = |opt: SRT_SOCKOPT, val: &dyn std::any::Any| -> Result<(), SrtError> {
             // 统一转换：支持 i32（大多数选项）和 i64（MAXBW/MININPUTBW/OHEADBW 等）
@@ -971,5 +988,40 @@ fn sockaddr_from(addr: SocketAddr) -> Result<libc::sockaddr_in, SrtError> {
             Ok(sa)
         }
         SocketAddr::V6(_) => Err(SrtError::Param("IPv6 暂不支持（P1 仅 IPv4）".to_string())),
+    }
+}
+
+// ============================================================================
+// 服务端监听器（2026-08-19 M1 配套修复新增）
+//
+// 背景：accept 并行化后，旧模型"每连接重建监听 socket（bind->listen->accept(1个)
+// ->close）"会导致多任务同时 bind 同一端口 -> "Another socket is already
+// listening on the same port" 无限报错（新加坡部署实测）。
+//
+// 正确模型：监听 socket 全局唯一且常驻（bind_listener 建立一次），
+// accept_one 可在多任务并发调用（srt_accept 线程安全，libsrt 内部排队）。
+// ============================================================================
+
+/// 服务端监听器（常驻监听 socket 封装，详见上方注释）
+pub struct SrtListener {
+    /// 常驻监听 socket（由 bind_listener 建立，Drop 时关闭）
+    sock: SRTSOCKET,
+}
+
+// 跨线程移动（accept_loop 经 spawn_blocking 调用 accept_one）
+unsafe impl Send for SrtListener {}
+unsafe impl Sync for SrtListener {}
+
+impl SrtListener {
+    /// 在常驻监听 socket 上接受一个连接（阻塞，可并发调用）
+    pub fn accept_one(&self) -> Result<SrtConnection, SrtError> {
+        SrtConnection::accept_from_listener(self.sock)
+    }
+}
+
+impl Drop for SrtListener {
+    fn drop(&mut self) {
+        // 监听 socket 唯一释放方（S1 同款原则：单一释放点，幂等安全）
+        unsafe { srt_close(self.sock) };
     }
 }
