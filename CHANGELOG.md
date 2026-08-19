@@ -2,6 +2,41 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-20 01:30] - CI 双架构并行编译修复 + 公网 Docker 隧道验证
+
+### 改动前总结
+GitHub Actions 用 buildx 单 job 双架构（QEMU 模拟 arm64）构建失败两次：
+1. Alpine 缺 `linux/if.h`（`socketconfig.h` 编译失败）
+2. Alpine 缺 OpenSSL 静态库（Rust musl `-Wl,-Bstatic` 下 ld 找不到 `-lcrypto/-lssl`）
+
+### 改动后总结
+**1. Dockerfile 修复（Alpine 构建依赖）**
+- 加 `linux-headers`：提供 `linux/if.h`（libsrt `socketconfig.h` 需要）
+- 加 `openssl-libs-static`：提供 `libcrypto.a/libssl.a`（Rust musl 默认 `-Bstatic` 链接必须静态库，只有 openssl-dev 的 `.so` stub 会报 cannot find）
+
+**2. build.rs OpenSSL 库路径探测**
+- 新增 `openssl_lib_dirs()`：pkg-config `--variable=libdir openssl` 优先，常见路径兜底
+- 显式输出 `cargo:rustc-link-search`（Alpine/musl ld 默认不搜 `/usr/lib`）
+
+**3. workflow 双 runner 并行原生编译（用户建议）**
+- amd64：`ubuntu-latest`（x86_64 原生）
+- arm64：`ubuntu-24.04-arm`（GitHub 原生 ARM runner，无 QEMU 模拟）
+- 两个 job 并行，各自构建 `tag-amd64` / `tag-arm64` 单架构镜像
+- merge job 用 `docker buildx imagetools create` 合并多架构 manifest + latest
+
+**效果**：arm64 1m33s + amd64 2m15s 并行 + 合并 16s ≈ 2.5 分钟完成（对比 QEMU 模拟数分钟且不稳）
+
+### 验证
+- ✅ 双架构构建成功，GHCR 多架构 manifest（amd64+arm64）
+- ✅ 新加坡（aarch64，Docker 容器）pull 镜像启动服务端：`--net=host` + 挂载配置
+- ✅ 本机客户端连接公网隧道，**TCP + UDP 大包（100B/2048B 2片/8000B 7片）全部通过**
+- ✅ 服务端日志确认 TCP 转发会话 + UDP 多目标转发会话正常
+
+### 涉及文件
+- Dockerfile
+- build.rs
+- .github/workflows/release.yml
+
 ## [2026-08-19 23:30] - UDP 大包分片重组（>1301B 数据报支持）
 
 ### 改动前总结
