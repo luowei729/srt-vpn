@@ -1,5 +1,11 @@
 # ============================================================
-# 手动发布版本：workflow_dispatch 触发 → 并行编译 amd64/arm64 镜像 → 推送 GHCR
+# 发布工作流：手动 workflow_dispatch 或打 tag（v*）触发
+#
+# 产出（2026-08-19 扩展）：
+# 1. Docker 多架构镜像（amd64/arm64）→ 推送 GHCR（原有逻辑）
+# 2. 纯静态二进制（amd64/arm64）→ 上传 Release assets
+#    - passwall 组件更新使用：文件名 srt-vpn-linux-amd64 / srt-vpn-linux-arm64
+#    - Alpine/musl 全静态链接（含 OpenSSL），OpenWrt 上零依赖直接运行
 #
 # 并行策略（2026-08-19 优化）：
 # - amd64：ubuntu-latest（x86_64 原生编译）
@@ -8,10 +14,11 @@
 #     快数倍（libsrt C++ 源码编译量大，QEMU 模拟 arm64 极慢）
 # - 最后 merge job 用 docker buildx imagetools create 合并多架构 manifest
 #
-# 用法：GitHub 仓库 Actions 页面 → "Build & Publish Docker Image" →
-#       Run workflow（可填版本号 tag）
+# 用法：
+# - 手动：Actions 页面 → "Build & Publish" → Run workflow（可填版本号 tag）
+# - 自动：push v* tag（如 v0.2.0），自动生成 Release 并附加二进制 + 镜像
 # ============================================================
-name: Build & Publish Docker Image
+name: Build & Publish
 
 on:
   workflow_dispatch:
@@ -20,6 +27,9 @@ on:
         description: '发布版本号（镜像 tag，如 1.0.0；留空则用 git describe）'
         required: false
         default: ''
+  push:
+    tags:
+      - 'v*'
 
 jobs:
   # 双架构并行构建（各用原生 runner，互不阻塞）
@@ -90,6 +100,122 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.version.outputs.TAG }}
             org.opencontainers.image.description=SRT-VPN - 基于 SRT 直播流协议的 VPN 隧道
+
+  # 纯静态二进制（passwall 组件更新用）
+  # 在 Alpine/musl 环境编译 libsrt + OpenSSL 静态库 -> 全静态链接
+  # 产出：srt-vpn-linux-amd64 / srt-vpn-linux-arm64（无任何动态依赖，可直接跑在 OpenWrt 上）
+  # 说明：GitHub runner（Ubuntu）本身不是 Alpine，这里用 rust:1.97-alpine 容器编译，
+  #       保证 musl 静态链接（与 Dockerfile builder 阶段完全一致）
+  build-binaries:
+    name: Build Static Binaries (${{ matrix.arch }})
+    needs: [build]   # 复用 build 的 TAG 输出作为版本号，保证与镜像 tag 一致
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      # 静态编译环境（与 Dockerfile builder 阶段一致，在 Alpine 容器内编译保证 musl 静态）
+      # linux-headers：libsrt 源码包含 <linux/if.h>（2026-08-19 CI 踩坑）
+      # openssl-libs-static：Rust musl 默认 -Wl,-Bstatic 必须静态 OpenSSL 库
+      #                     （openssl-dev 只有 .so stub 会报 cannot find -lcrypto）
+      # 挂载宿主 dist 目录经 Docker 卷写入产物（避免容器退出后文件丢失）
+      - name: 在 Alpine 容器内静态编译
+        run: |
+          mkdir -p "$PWD/dist"
+          docker run --rm -v "$PWD":/build -v "$PWD/dist":/dist -w /build \
+            rust:1.97-alpine sh -c '
+              set -e
+              apk add --no-cache build-base cmake openssl-dev openssl-libs-static linux-headers pkgconfig
+              cargo build --release
+              cp target/release/srt-vpn /dist/srt-vpn-linux-${{ matrix.arch }}
+              chmod +x /dist/srt-vpn-linux-${{ matrix.arch }}
+            '
+
+      - name: 验证静态链接
+        run: |
+          file dist/srt-vpn-linux-${{ matrix.arch }}
+          # 真静态二进制 ldd 会报 "not a dynamic executable"
+          ldd dist/srt-vpn-linux-${{ matrix.arch }} 2>&1 | head -3 || true
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: srt-vpn-linux-${{ matrix.arch }}
+          path: dist/srt-vpn-linux-${{ matrix.arch }}
+
+  # 通过 softprops/action-gh-release 上传二进制到 Release
+  # - push tag（v*）触发：tag_name = 触发的 tag（更新该 tag 的 release 并附加二进制）
+  # - workflow_dispatch 触发：创建/更新 v<version> 或 git describe 的 release
+  release:
+    name: Upload Binaries to Release
+    needs: [build, build-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 下载所有架构二进制
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 确定 Release tag
+        id: reltag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # tag 触发：直接用触发的 tag 名（如 v0.2.0）
+            echo "TAG=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.inputs.version }}" ]; then
+            # 手动触发且填了版本号：规范化加 v 前缀（v1.0.0 或 1.0.0 -> v1.0.0）
+            v="${{ github.event.inputs.version }}"
+            case "$v" in
+              v*) echo "TAG=$v" >> "$GITHUB_OUTPUT" ;;
+              *) echo "TAG=v$v" >> "$GITHUB_OUTPUT" ;;
+            esac
+          else
+            # 手动触发未填版本：用 git describe（与 build job 一致）
+            echo "TAG=$(git describe --tags --always 2>/dev/null || echo latest)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 生成/更新 Release 并上传二进制
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.reltag.outputs.TAG }}
+          name: SRT-VPN ${{ steps.reltag.outputs.TAG }}
+          body: |
+            ## SRT-VPN ${{ needs.build.outputs.tag }}
+
+            ### 二进制（passwall 组件更新使用）
+            - `srt-vpn-linux-amd64` — x86_64 纯静态
+            - `srt-vpn-linux-arm64` — aarch64 纯静态
+
+            ### Docker 镜像
+            `ghcr.io/${{ github.repository }}:${{ needs.build.outputs.tag }}`
+
+            > 纯静态构建：Alpine/musl 全静态链接（含 OpenSSL），OpenWrt 上零依赖直接运行。
+          files: artifacts/*
 
   # 合并多架构 manifest（等两个单架构 job 都成功后）
   merge:

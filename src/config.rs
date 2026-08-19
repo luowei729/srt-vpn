@@ -110,6 +110,16 @@ impl Default for Socks5Config {
     }
 }
 
+impl Socks5Config {
+    /// 是否配置了任何认证方式（单用户或用户表）
+    ///
+    /// 2026-08-19 审查修复：SOCKS5 握手根据此值决定是否接受"无认证"方法。
+    /// 配置了认证时必须走 0x02 用户名密码认证，禁止 0x00 绕过。
+    pub fn has_auth(&self) -> bool {
+        self.username.is_some() || !self.users.is_empty()
+    }
+}
+
 /// 客户端自动重连配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconnectConfig {

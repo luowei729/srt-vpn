@@ -19,8 +19,8 @@ use crate::tunnel::multiplex::MuxEncoder;
 /// 客户端运行入口
 pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
     let server_addr = cfg.server.clone().ok_or("客户端配置缺少 server 字段")?;
-    // 解析服务器地址（host:port）
-    let peer_addr = parse_addr(&server_addr)?;
+    // 解析服务器地址（host:port，支持 IPv4 与域名；IPv6 由 srt 层暂不支持）
+    let peer_addr = resolve_addr(&server_addr).await?;
 
     // 0. 启动指标服务（如果配置了端口）
     // 2026-08-19 审查修复（F1）：此前只有服务端启动了 metrics HTTP，
@@ -386,9 +386,27 @@ async fn connect_with_retry(cfg: &SrtConfig, app_cfg: &Config) -> Result<SrtConn
     }
 }
 
-/// 解析 host:port 地址
-pub fn parse_addr(addr: &str) -> Result<std::net::SocketAddr, String> {
-    addr.parse()
-        .map_err(|_| format!("地址格式无效: {addr}（应为 host:port）"))
+/// 解析 host:port 地址（支持 IPv4 字面量与域名，返回 SocketAddr）
+///
+/// 2026-08-19 passwall 对接增强：passwall 节点地址常填域名（vpn.example.com:9000），
+/// 原 parse_addr 用 SocketAddr::parse 只接受 IP 字面量（域名报"地址格式无效"）。
+/// 现拆成两步：
+///   1. 先按 IP 字面量解析（127.0.0.1:9000 -> 直接成功，保持原有行为）
+///   2. 失败则按域名用 tokio lookup_host 解析（取第一个解析结果）
+/// 注意：仅解析出 SocketAddr 传给 SRT 层，不影响 srt 层只支持 IPv4 的限制
+pub async fn resolve_addr(addr: &str) -> Result<std::net::SocketAddr, String> {
+    // 1. IP 字面量优先（原 parse_addr 行为，零开销）
+    if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+        return Ok(sa);
+    }
+
+    // 2. 域名解析（如 vpn.example.com:9000）
+    // tokio 内部走 getaddrinfo，支持 A/AAAA 记录
+    let mut addrs = tokio::net::lookup_host(addr)
+        .await
+        .map_err(|e| format!("域名解析失败: {addr}: {e}"))?;
+    // 优先取 IPv4（SRT 层只支持 IPv4，见 sockaddr_from）
+    let first_v4 = addrs.find(|a| a.is_ipv4());
+    first_v4.ok_or_else(|| format!("地址格式无效或无可用的 IPv4 解析结果: {addr}（应为 host:port）"))
 }
 // L 级清理（2026-08-19）：crypto_to_pbkeylen 重复实现移除，统一用 config::crypto_to_pbkeylen

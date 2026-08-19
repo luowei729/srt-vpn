@@ -248,6 +248,13 @@ srt-vpn/
 > - M 级 8 项：多客户端并行接入、nonce 一次性语义、重组器过期清理、日志优先级修正、UDP 回包来源锁定、max_clients 校验、可靠性协商标注 P2、心跳 RTT 指标（last_rtt_ms）
 > - L 级：删冗余依赖/死模块（session.rs）、过时注释全面修正、重复函数收敛
 > - 测试 25 通过，release 零警告；端到端 TCP/UDP 四类目标/断线重连 4 轮/退出安全全验证
+
+> 对接扩展 2026-08-19（passwall 集成，详见 CHANGELOG 17:55 条目）：
+> - **静态二进制发布**：release.yml 新增 build-binaries（Alpine/musl 全静态 amd64/arm64）+ release（上传 Release assets）+ push v* tag 触发
+> - **客户端域名支持**：resolve_addr（lookup_host 取 IPv4），passwall 节点地址可为域名
+> - **SOCKS5 认证强制**：配置了认证时只接受 0x02 方法（has_auth 判定），修复认证可绕过漏洞
+> - passwall 侧接入：组件更新（com.lua）+ 节点类型（7_srt-vpn.lua）+ app.sh srtvpn 分支 + util_srt-vpn.lua，见 openwrt-passwall-srt-vpn 仓库
+
 ### P2（规划）：TUN 模式 + iptables NAT + 动态 PID + 黑名单
 
 ### P3（规划）：性能 → 拟真 → 安全 → 跨平台打磨

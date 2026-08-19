@@ -20,6 +20,10 @@ use clap::{ArgAction, Parser};
 use serde::{Deserialize, Serialize};
 
 /// SRT-VPN 命令行参数
+///
+/// 版本号约定（2026-08-19 passwall 对接）：
+/// - `-V / --version`：clap 自动生成，输出 "srt-vpn <version>"（短参数 -V 大写，与 -v 日志级别不冲突）
+/// - passwall 组件更新（com.lua cmd_version）用 `-V | awk '{print $2}'` 解析出纯版本号（如 0.1.0）
 #[derive(Parser, Debug, Clone)]
 #[command(name = "srt-vpn", version, about = "基于 SRT 直播流协议的 VPN 隧道")]
 pub struct Args {

@@ -168,14 +168,20 @@ async fn handle_connection(
             .map_err(|e| format!("读认证方法列表失败: {e}"))?;
     }
 
-    // 2. 选择认证方法：优先用户名密码（0x02），否则无认证（0x00）
+    // 2. 选择认证方法：根据配置决定
+    //    2026-08-19 审查修复：配置了用户名密码（或用户表）时【只接受 0x02 用户名密码认证】，
+    //    未配置时才接受 0x00 无认证。
+    //    原逻辑无论配置如何都接受 0x00（循环里只要客户端提议 0x00 就选它），
+    //    导致"配置了认证但无认证也能连"的安全漏洞（passwall 节点配置 socks 认证时
+    //    实际形同虚设）。
+    let auth_configured = socks5_cfg.has_auth();
     let mut selected = None;
     for &m in &methods {
-        if m == METHOD_USER_PASS {
+        if m == METHOD_USER_PASS && auth_configured {
             selected = Some(METHOD_USER_PASS);
             break;
         }
-        if m == METHOD_NO_AUTH {
+        if m == METHOD_NO_AUTH && !auth_configured {
             selected = Some(METHOD_NO_AUTH);
         }
     }

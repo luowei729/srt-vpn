@@ -2,6 +2,32 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-19 17:55] - passwall 对接：静态二进制发布 + 域名解析 + SOCKS5 认证修复
+
+### 改动前总结
+用户需求：① srt-vpn 发版时 actions 编译出 amd64/arm64 纯静态二进制，供 OpenWrt passwall「组件更新」点击下载作为新核心；② passwall 侧（openwrt-passwall-srt-vpn 仓库）最小侵入新增 srt-vpn 核心，可配置节点对接。
+
+### 改动后总结（srt-vpn 侧）
+- **cli.rs**：确认 `-V/--version`（clap 自带）输出 `srt-vpn 0.1.0`，passwall 组件更新 `cmd_version="-V | awk '{print $2}'"` 解析纯版本号（不动代码，仅确认行为）
+- **release.yml 扩展**：新增 `build-binaries` job（Alpine 容器内全静态编译 amd64/arm64，产出 `srt-vpn-linux-amd64/arm64` 上传 release assets）+ `release` job（softprops/action-gh-release 上传二进制到 Release）+ `push v* tag` 触发；原 Docker 镜像构建/合并逻辑保留
+- **client/mod.rs**：`parse_addr` → `resolve_addr`（支持域名解析，`lookup_host` 取 IPv4）。原因：passwall 节点常填域名，原 SocketAddr::parse 只认 IP；实测 `localhost:9000` 成功连接
+- **socks5.rs + config.rs**：修复认证绕过漏洞——配置了用户名/密码（或用户表）时 SOCKS5 握手**只接受 0x02 用户密码认证**，未配置才接受 0x00 无认证；新增 `Socks5Config::has_auth()`。原因：passwall 节点可配本地 socks 认证，原逻辑"无认证也能连"使认证形同虚设
+- 兼容性：以上均为正向增强，Docker/原生/CLI 用法零破坏
+
+### 验证
+- ✅ cargo test 25 个全过、release 零警告
+- ✅ 模拟 passwall 生成的完整配置（域名 + aes-256 + SOCKS5 认证 + 自定义重连/心跳）端到端 HTTP 200
+- ✅ 模拟最小配置（仅必填）端到端 HTTP 200
+- ✅ 认证修复验证：无认证客户端无凭据可访问；有认证客户端带凭据 200、无凭据被拒（HTTP 000）
+- ✅ 域名解析验证：`localhost:9000` 经 lookup_host 成功连接
+
+### 涉及文件
+- src/cli.rs（仅注释说明，无代码变更）
+- .github/workflows/release.yml（build-binaries + release job + tag 触发）
+- src/client/mod.rs（resolve_addr 域名解析）
+- src/client/socks5.rs（认证方法选择按配置）
+- src/config.rs（Socks5Config::has_auth）
+
 ## [2026-08-19 16:05] - M1 并行 accept 两版 bug 修复 + fix4 部署（新加坡/本地 1080）
 
 ### 改动前总结
