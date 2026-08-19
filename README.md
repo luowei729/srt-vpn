@@ -13,38 +13,78 @@
 
 ### 服务端（Server）
 ```bash
-# 原生
+# 原生（配置文件方式）
 ./target/release/srt-vpn -c configs/server.conf
 
-# Docker（Alpine 镜像，--net=host 暴露 SRT UDP）
+# 原生（纯环境变量方式，无需配置文件）
+SRT_MODE=server SRT_PASSPHRASE=你的强密码 SRT_LISTEN=0.0.0.0:9000 ./target/release/srt-vpn
+
+# Docker（--net=host 暴露 SRT UDP；-e 环境变量指定参数，无需挂载配置文件）
 docker run -d --name srt-vpn-server --restart=unless-stopped \
   --network=host \
-  -v /opt/srt-vpn/server.conf:/app/configs/server.conf:ro \
-  ghcr.io/<你的用户名>/<仓库名>:latest -c /app/configs/server.conf
+  -e SRT_MODE=server \
+  -e SRT_PASSPHRASE=你的强密码 \
+  -e SRT_LISTEN=0.0.0.0:9000 \
+  ghcr.io/luowei729/srt-vpn:latest
 ```
 
 ### 客户端（Client）
 ```bash
-# 原生
+# 原生（配置文件方式）
 ./target/release/srt-vpn -c configs/client.json
 
-# Docker（映射 SOCKS5 TCP 端口，SRT 走宿主机网络）
+# 原生（纯环境变量方式，可完整指定 SOCKS5 监听 IP/端口/用户名/密码）
+SRT_MODE=client SRT_PASSPHRASE=你的强密码 SRT_SERVER=服务器IP:9000 \
+  SRT_SOCKS5_LISTEN=0.0.0.0:1080 SRT_SOCKS5_USER=user1 SRT_SOCKS5_PASS=password123 \
+  ./target/release/srt-vpn
+
+# Docker（映射 SOCKS5 端口；-e 环境变量指定参数）
 docker run -d --name srt-vpn-client --restart=unless-stopped \
-  --network=host \
-  -v /opt/srt-vpn/client.json:/app/configs/client.json:ro \
-  ghcr.io/<你的用户名>/<仓库名>:latest -c /app/configs/client.json
+  -p 1080:1080 \
+  -e SRT_MODE=client \
+  -e SRT_PASSPHRASE=你的强密码 \
+  -e SRT_SERVER=服务器IP:9000 \
+  -e SRT_SOCKS5_LISTEN=0.0.0.0:1080 \
+  -e SRT_SOCKS5_USER=user1 \
+  -e SRT_SOCKS5_PASS=password123 \
+  ghcr.io/luowei729/srt-vpn:latest
 ```
 
 ### CLI 参数
 ```
--c, --config <FILE>       配置文件路径（server.conf / client.json，JSON）
--m, --udp-mode <MODE>     服务端 UDP 模式：reliable | best-effort（覆盖配置）
--v, --verbose <LEVEL>     日志级别 0-4（默认 2）
-    --socks5-listen <A>   客户端 SOCKS5 监听（覆盖配置）
-    --socks5-user <U>     客户端 SOCKS5 用户名（覆盖配置）
-    --socks5-pass <P>     客户端 SOCKS5 密码（覆盖配置）
+-c, --config <FILE>       配置文件路径（可选；省略时用 SRT_* 环境变量配置）
+-v, --verbose <LEVEL>     日志级别 0-4（默认 2，可用 SRT_LOG_LEVEL 覆盖）
+    --socks5-listen <A>   客户端 SOCKS5 监听（覆盖配置/环境变量）
+    --socks5-user <U>     客户端 SOCKS5 用户名（覆盖）
+    --socks5-pass <P>     客户端 SOCKS5 密码（覆盖）
 -h, --help                帮助
 ```
+
+### 环境变量（`-e` 指定，覆盖配置文件；所有配置参数均可覆盖）
+
+| 环境变量 | 对应配置字段 | 角色 |
+|---|---|---|
+| `SRT_MODE` | `mode` | 通用（必填） |
+| `SRT_PASSPHRASE` | `passphrase` | 通用（必填） |
+| `SRT_CRYPTO` | `crypto` | 通用 |
+| `SRT_METRICS_PORT` | `metrics_port` | 通用 |
+| `SRT_LOG_LEVEL` | `log_level` | 通用 |
+| `SRT_LISTEN` | `listen` | server（必填） |
+| `SRT_UDP_MODE` | `udp_mode` | server |
+| `SRT_MAX_CLIENTS` | `max_clients` | server |
+| `SRT_SOCKS5_USERS` | `socks5_users` | server（`user:pass,user2:pass2`） |
+| `SRT_SERVER` | `server` | client（必填） |
+| `SRT_STREAMID` | `streamid` | client |
+| `SRT_SOCKS5_LISTEN` | `socks5.listen` | client（监听 IP+端口） |
+| `SRT_SOCKS5_USER` | `socks5.username` | client |
+| `SRT_SOCKS5_PASS` | `socks5.password` | client |
+| `SRT_RECONNECT_INTERVAL` | `reconnect.interval_secs` | client |
+| `SRT_RECONNECT_MAX` | `reconnect.max_retries` | client |
+| `SRT_HEARTBEAT_SECS` | `heartbeat_secs` | client |
+
+> 配置优先级：CLI > 环境变量(SRT_*) > 配置文件 > 默认值
+> `-m` 已移除（2026-08-20）：UDP 模式直接用 `SRT_UDP_MODE` 或配置文件 `udp_mode` 指定
+> Docker 场景无需挂载配置文件，全部用 `-e SRT_*` 指定；也支持配置文件 + `-e` 覆盖混合方式
 
 ---
 

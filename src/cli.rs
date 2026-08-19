@@ -1,10 +1,10 @@
 //! cli.rs — CLI 参数解析
 //!
 //! 启动命令：srt-vpn -c server.conf / srt-vpn -c client.json
+//! 也可不指定 -c：纯环境变量配置（Docker -e 场景，见 config::from_env）
 //!
 //! 参数设计（设计树 Q13）：
-//! - -c: 配置文件路径（必选，server.conf 或 client.json）
-//! - -m: UDP 可靠/尽力而为模式（仅服务端有效，覆盖配置）
+//! - -c: 配置文件路径（可选；省略时用环境变量构建配置，Docker -e 场景）
 //! - -v: 日志级别（0-4，默认 2）
 //! - -h: 帮助
 //! - SOCKS5 完整设定参数（覆盖配置文件）：
@@ -12,6 +12,9 @@
 //!   --socks5-user:   SOCKS5 用户名
 //!   --socks5-pass:   SOCKS5 密码
 //!   --socks5-users:  多用户配置（可选，格式 user:pass 逗号分隔）
+//!
+//! 配置优先级：CLI > 环境变量(SRT_*) > 配置文件 > 默认值
+//! -m 已移除（2026-08-20）：UDP 模式直接配置文件/环境变量改，不再单独 CLI 参数
 
 use clap::{ArgAction, Parser};
 use serde::{Deserialize, Serialize};
@@ -20,13 +23,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Parser, Debug, Clone)]
 #[command(name = "srt-vpn", version, about = "基于 SRT 直播流协议的 VPN 隧道")]
 pub struct Args {
-    /// 配置文件路径（server.conf / client.json，JSON 语法）
+    /// 配置文件路径（可选；省略时用 SRT_* 环境变量构建配置，Docker -e 场景）
     #[arg(short = 'c', long = "config", value_name = "FILE")]
-    pub config: String,
-
-    /// UDP 传输模式（仅服务端）：reliable=可靠传输（默认）| best-effort=尽力而为
-    #[arg(short = 'm', long = "udp-mode", value_name = "MODE")]
-    pub udp_mode: Option<String>,
+    pub config: Option<String>,
 
     /// 日志级别（0=ERROR, 1=WARN, 2=INFO, 3=DEBUG, 4=TRACE）
     #[arg(short = 'v', long = "verbose", default_value = "2", value_name = "LEVEL")]

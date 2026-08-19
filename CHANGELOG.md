@@ -2,6 +2,51 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-20 02:00] - 环境变量配置支持 + CLI 简化（-m 移除，-c 可选）
+
+### 改动前总结
+- 配置只能通过 JSON 文件指定，Docker 需挂载配置文件才能启动
+- `-m` 单独 CLI 参数控制 UDP 模式（配置里也有 udp_mode 字段，重复）
+- `-c` 强制必填
+
+### 改动后总结
+**1. 环境变量配置（Docker -e 场景，无需挂载配置文件）**
+- 前缀 `SRT_`，**所有配置参数均可覆盖**：
+  - 通用：`SRT_MODE`（必填）/ `SRT_PASSPHRASE`（必填）/ `SRT_CRYPTO` / `SRT_METRICS_PORT` / `SRT_LOG_LEVEL`
+  - 服务端：`SRT_LISTEN`（必填）/ `SRT_UDP_MODE` / `SRT_MAX_CLIENTS` / `SRT_SOCKS5_USERS`（`user:pass,user2:pass2` 明文转 argon2）
+  - 客户端：`SRT_SERVER`（必填）/ `SRT_STREAMID` / `SRT_SOCKS5_LISTEN`（IP+端口）/ `SRT_SOCKS5_USER` / `SRT_SOCKS5_PASS` / `SRT_RECONNECT_INTERVAL` / `SRT_RECONNECT_MAX` / `SRT_HEARTBEAT_SECS`
+- config.rs 新增 `from_env()`（纯环境变量构建）+ `apply_env()`（配置文件基础上覆盖）
+- 配置优先级：**CLI > 环境变量(SRT_*) > 配置文件 > 默认值**
+
+**2. CLI 简化**
+- `-m` 移除（2026-08-20）：UDP 模式直接用 `SRT_UDP_MODE` 或配置文件 `udp_mode`
+- `-c` 变可选：省略时纯环境变量启动（`srt-vpn` 无参数直接跑）
+
+**3. main.rs 适配**
+- 有 `-c`：加载文件 → apply_env 覆盖 → apply_cli 覆盖
+- 无 `-c`：from_env 构建（缺必填项打印提示退出）
+- 日志级别：CLI -v > 配置 log_level（含 SRT_LOG_LEVEL）
+
+**4. Docker 使用方式变更**
+- 不再需要挂载配置文件：`docker run -e SRT_MODE=... -e SRT_PASSPHRASE=... ghcr.io/luowei729/srt-vpn:latest`
+- 支持"配置文件 + -e 覆盖"混合方式
+- README/DOCKER.md 镜像地址确定：`ghcr.io/luowei729/srt-vpn`
+
+### 验证
+- ✅ 纯环境变量启动服务端/客户端正常（SRT_MODE+SRT_PASSPHRASE+SRT_LISTEN/SRT_SERVER）
+- ✅ SOCKS5 完整覆盖（SRT_SOCKS5_LISTEN 监听 IP+端口 / USER / PASS）生效
+- ✅ 重连参数覆盖生效（日志显示 interval=2）
+- ✅ 必填校验生效（缺 passphrase/长度不足报错退出）
+- ✅ 多用户 SRT_SOCKS5_USERS 解析正常（alice/bob 转 argon2）
+- ✅ 19 单元测试通过、release 编译零警告
+
+### 涉及文件
+- src/cli.rs（-m 移除、-c 可选）
+- src/config.rs（from_env/apply_env/辅助函数）
+- src/main.rs（加载逻辑 + 日志级别优先级）
+- README.md / DOCKER.md / Dockerfile（启动介绍更新）
+- PROJECT_PLAN.md（决策表同步）
+
 ## [2026-08-20 01:30] - CI 双架构并行编译修复 + 公网 Docker 隧道验证
 
 ### 改动前总结

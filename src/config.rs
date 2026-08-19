@@ -146,6 +146,108 @@ fn default_heartbeat() -> u64 {
     5
 }
 
+// ===== 环境变量配置辅助函数（Docker -e 场景） =====
+
+/// 解析 SRT_MODE 环境变量（必填）
+fn parse_env_mode() -> Result<Mode, String> {
+    let m = std::env::var("SRT_MODE")
+        .map_err(|_| "环境变量 SRT_MODE 缺失（server / client）".to_string())?;
+    match m.as_str() {
+        "server" => Ok(Mode::Server),
+        "client" => Ok(Mode::Client),
+        other => Err(format!("SRT_MODE 无效 '{other}'（可选：server / client）")),
+    }
+}
+
+/// 解析可选的 u16 环境变量（端口），未设置返回 Ok(None)
+fn parse_env_opt_u16(name: &str) -> Result<Option<u16>, String> {
+    match std::env::var(name) {
+        Ok(v) => v
+            .parse::<u16>()
+            .map(Some)
+            .map_err(|_| format!("{name} 不是有效端口号")),
+        Err(_) => Ok(None),
+    }
+}
+
+/// 解析可选的 u8 环境变量（日志级别 0-4），未设置返回 Ok(None)
+fn parse_env_opt_u8(name: &str) -> Result<Option<u8>, String> {
+    match std::env::var(name) {
+        Ok(v) => v
+            .parse::<u8>()
+            .map(Some)
+            .map_err(|_| format!("{name} 不是有效数字")),
+        Err(_) => Ok(None),
+    }
+}
+
+/// 从环境变量构建服务端 SOCKS5 用户表
+/// 格式：SRT_SOCKS5_USERS="user1:pass1,user2:pass2"（逗号分隔，明文密码转 argon2）
+fn parse_env_socks5_users() -> Result<Vec<Socks5User>, String> {
+    let raw = match std::env::var("SRT_SOCKS5_USERS") {
+        Ok(v) => v,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut users = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (u, p) = entry
+            .split_once(':')
+            .ok_or_else(|| format!("SRT_SOCKS5_USERS 条目 '{entry}' 格式应为 user:pass"))?;
+        // 明文密码转 argon2 哈希存储（与 CLI --socks5-users 一致）
+        let hash = crate::auth::hash_password(p)
+            .map_err(|e| format!("SRT_SOCKS5_USERS 用户 '{u}' 哈希失败: {e}"))?;
+        users.push(Socks5User {
+            username: u.trim().to_string(),
+            password_hash: hash,
+        });
+    }
+    Ok(users)
+}
+
+/// 从环境变量构建客户端自动重连配置（未设置 SRT_RECONNECT_* 返回 None）
+fn build_reconnect_from_env() -> Result<Option<ReconnectConfig>, String> {
+    let interval = std::env::var("SRT_RECONNECT_INTERVAL")
+        .ok()
+        .map(|s| s.parse::<u64>().map_err(|_| "SRT_RECONNECT_INTERVAL 不是有效数字".to_string()))
+        .transpose()?;
+    let max = std::env::var("SRT_RECONNECT_MAX")
+        .ok()
+        .map(|s| s.parse::<i64>().map_err(|_| "SRT_RECONNECT_MAX 不是有效数字".to_string()))
+        .transpose()?;
+    if interval.is_some() || max.is_some() {
+        Ok(Some(ReconnectConfig {
+            interval_secs: interval.unwrap_or_else(default_reconnect_interval),
+            max_retries: max.unwrap_or_else(default_reconnect_max),
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// 从环境变量构建客户端 SOCKS5 配置（未设置任何 SRT_SOCKS5_* 返回 None）
+fn build_socks5_from_env() -> Result<Option<Socks5Config>, String> {
+    let listen = std::env::var("SRT_SOCKS5_LISTEN").unwrap_or_else(|_| default_socks5_listen());
+    let username = std::env::var("SRT_SOCKS5_USER").ok();
+    let password = std::env::var("SRT_SOCKS5_PASS").ok();
+    // 只要设置了任一 SRT_SOCKS5_* 就返回 Some（否则 None=用默认/文件值）
+    let any_set = std::env::var("SRT_SOCKS5_LISTEN").is_ok()
+        || username.is_some()
+        || password.is_some();
+    if any_set {
+        Ok(Some(Socks5Config {
+            listen,
+            username,
+            password,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
 impl Config {
     /// 从文件加载配置
     pub fn load(path: &str) -> Result<Self, String> {
@@ -156,6 +258,133 @@ impl Config {
             .map_err(|e| format!("解析配置文件 {path} 失败: {e}"))?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// 从环境变量构建配置（Docker -e 场景，无配置文件时使用）
+    ///
+    /// 环境变量（前缀 SRT_，与配置字段一一对应）：
+    /// - SRT_MODE / SRT_PASSPHRASE：必填（mode + passphrase）
+    /// - SRT_CRYPTO / SRT_METRICS_PORT：可选（crypto / metrics_port）
+    /// - 服务端：SRT_LISTEN（必填）/ SRT_UDP_MODE / SRT_MAX_CLIENTS
+    /// - 客户端：SRT_SERVER（必填）/ SRT_SOCKS5_LISTEN / SRT_SOCKS5_USER /
+    ///   SRT_SOCKS5_PASS / SRT_HEARTBEAT_SECS
+    ///
+    /// 解析失败/必填缺失返回 Err。非 SRT_ 前缀变量忽略。
+    pub fn from_env() -> Result<Self, String> {
+        let cfg = Config {
+            mode: parse_env_mode()?,
+            passphrase: std::env::var("SRT_PASSPHRASE")
+                .map_err(|_| "环境变量 SRT_PASSPHRASE 缺失（SRT 加密密钥，两端必须一致）".to_string())?,
+            crypto: std::env::var("SRT_CRYPTO").unwrap_or_else(|_| default_crypto()),
+            metrics_port: parse_env_opt_u16("SRT_METRICS_PORT")?,
+            log_level: parse_env_opt_u8("SRT_LOG_LEVEL")?,
+            listen: std::env::var("SRT_LISTEN").ok(),
+            udp_mode: std::env::var("SRT_UDP_MODE")
+                .ok()
+                .map(|s| UdpMode::parse_str(&s).map_err(|e| e.to_string()))
+                .transpose()?
+                .unwrap_or_else(default_udp_mode),
+            max_clients: std::env::var("SRT_MAX_CLIENTS")
+                .ok()
+                .map(|s| s.parse::<usize>().map_err(|_| "SRT_MAX_CLIENTS 不是有效数字".to_string()))
+                .transpose()?
+                .unwrap_or_else(default_max_clients),
+            socks5_users: parse_env_socks5_users()?,
+            server: std::env::var("SRT_SERVER").ok(),
+            streamid: std::env::var("SRT_STREAMID").ok(),
+            socks5: build_socks5_from_env()?,
+            reconnect: build_reconnect_from_env()?,
+            heartbeat_secs: std::env::var("SRT_HEARTBEAT_SECS")
+                .ok()
+                .map(|s| s.parse::<u64>().map_err(|_| "SRT_HEARTBEAT_SECS 不是有效数字".to_string()))
+                .transpose()?
+                .unwrap_or_else(default_heartbeat),
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// 应用环境变量覆盖（优先级：环境变量 > 配置文件）
+    ///
+    /// 用于已有配置文件时补充环境变量覆盖（Docker 场景：基础配置在文件，
+    /// 需要临时改的参数用 -e 传入，无需重写配置）。
+    pub fn apply_env(&mut self) {
+        if let Ok(m) = parse_env_mode() {
+            self.mode = m;
+        }
+        if let Ok(p) = std::env::var("SRT_PASSPHRASE") {
+            self.passphrase = p;
+        }
+        if let Ok(c) = std::env::var("SRT_CRYPTO") {
+            self.crypto = c;
+        }
+        if let Ok(mp) = parse_env_opt_u16("SRT_METRICS_PORT") {
+            self.metrics_port = mp;
+        }
+        if let Ok(l) = std::env::var("SRT_LISTEN") {
+            self.listen = Some(l);
+        }
+        if let Ok(u) = std::env::var("SRT_UDP_MODE") {
+            if let Ok(udp) = UdpMode::parse_str(&u) {
+                self.udp_mode = udp;
+            }
+        }
+        if let Ok(mc) = std::env::var("SRT_MAX_CLIENTS") {
+            if let Ok(v) = mc.parse::<usize>() {
+                self.max_clients = v;
+            }
+        }
+        if let Ok(ll) = parse_env_opt_u8("SRT_LOG_LEVEL") {
+            self.log_level = ll;
+        }
+        if let Ok(users) = parse_env_socks5_users() {
+            if !users.is_empty() {
+                self.socks5_users = users;
+            }
+        }
+        if let Ok(s) = std::env::var("SRT_SERVER") {
+            self.server = Some(s);
+        }
+        if let Ok(sid) = std::env::var("SRT_STREAMID") {
+            self.streamid = Some(sid);
+        }
+        if let Ok(rc) = build_reconnect_from_env() {
+            if rc.is_some() {
+                self.reconnect = rc;
+            }
+        }
+        if let Ok(listen) = std::env::var("SRT_SOCKS5_LISTEN") {
+            match &mut self.socks5 {
+                Some(s5) => s5.listen = listen,
+                None => self.socks5 = Some(Socks5Config {
+                    listen,
+                    username: None,
+                    password: None,
+                }),
+            }
+        }
+        let user = std::env::var("SRT_SOCKS5_USER").ok();
+        let pass = std::env::var("SRT_SOCKS5_PASS").ok();
+        if user.is_some() || pass.is_some() {
+            match &mut self.socks5 {
+                Some(s5) => {
+                    if let Some(u) = user { s5.username = Some(u); }
+                    if let Some(p) = pass { s5.password = Some(p); }
+                }
+                None => {
+                    self.socks5 = Some(Socks5Config {
+                        listen: default_socks5_listen(),
+                        username: user,
+                        password: pass,
+                    });
+                }
+            }
+        }
+        if let Ok(h) = std::env::var("SRT_HEARTBEAT_SECS") {
+            if let Ok(v) = h.parse::<u64>() {
+                self.heartbeat_secs = v;
+            }
+        }
     }
 
     /// 校验配置合法性（必填字段 + 取值范围）
@@ -197,17 +426,8 @@ impl Config {
         Ok(())
     }
 
-    /// 应用 CLI 参数覆盖（优先级：CLI > 配置）
+    /// 应用 CLI 参数覆盖（优先级：CLI > 环境变量 > 配置文件）
     pub fn apply_cli(&mut self, args: &crate::cli::Args) {
-        // -m 覆盖 udp_mode（仅服务端有意义）
-        if let Some(m) = &args.udp_mode {
-            match UdpMode::parse_str(m) {
-                Ok(udp_mode) => self.udp_mode = udp_mode,
-                Err(e) => {
-                    tracing::warn!(error = %e, "忽略无效的 -m 参数");
-                }
-            }
-        }
         // --socks5-listen 覆盖客户端 SOCKS5 监听地址
         if let Some(listen) = &args.socks5_listen {
             match &mut self.socks5 {

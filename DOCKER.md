@@ -4,7 +4,7 @@
 
 ### 1. 推送代码到 GitHub 仓库
 ```bash
-git remote add origin https://github.com/<你的用户名>/<仓库名>.git
+git remote add origin https://github.com/luowei729/srt-vpn.git
 git push -u origin main
 ```
 
@@ -12,131 +12,126 @@ git push -u origin main
 GitHub 仓库 → **Actions** 页 → `Build & Publish Docker Image` → **Run workflow**
 （可填版本号，如 `1.0.0`；留空自动用 git describe）。
 
-工作流自动：
-- 构建 **amd64 + arm64** 双架构镜像
-- 推送至 GHCR（GitHub Container Registry）
-- 打 `版本号` + `latest` 两个 tag
-
-> **注意（首次构建如失败）**：镜像基于 **Alpine (musl)**。若 GitHub Actions 构建日志
-> 显示 libsrt C++ 编译报错（musl 兼容问题），可在 `Dockerfile` 将两阶段基础镜像
-> 换回 Debian 系（`rust:1.97-slim` + `debian:bookworm-slim`），依赖包随之改为
-> `libssl-dev` + `libstdc++6 libssl3`（glibc），其余不变。两种方案代码通用。
+工作流自动（双 runner 并行原生编译，~2.5 分钟）：
+- **amd64**：ubuntu-latest（x86_64 原生）
+- **arm64**：ubuntu-24.04-arm（GitHub 原生 ARM runner，免 QEMU 模拟）
+- 合并多架构 manifest → 推送 GHCR，打 `版本号` + `latest` 两个 tag
 
 ### 3. 本地构建（调试用）
 ```bash
-# 需 Docker + 本机有 rust 重编（也可以直接 docker build）
 docker build -t srt-vpn:local .
 ```
 
 ### 4. 拉取镜像
 ```bash
-# 需先登录（首次）
-echo $GITHUB_TOKEN | docker login ghcr.io -u <用户名> --password-stdin
-docker pull ghcr.io/<你的用户名>/<仓库名>:latest
+# 首次需登录
+echo $GITHUB_TOKEN | docker login ghcr.io -u luowei729 --password-stdin
+docker pull ghcr.io/luowei729/srt-vpn:latest
 ```
 
 ---
 
 ## 二、服务端（Server）启动
 
-### 配置文件（server.conf）
-```json
-{
-  "mode": "server",
-  "listen": "0.0.0.0:9000",
-  "passphrase": "改成你的强密码",
-  "crypto": "aes-128",
-  "udp_mode": "reliable",
-  "max_clients": 32,
-  "metrics_port": 9090,
-  "socks5_users": []
-}
+### 方式 1：Docker + 环境变量（推荐，无需配置文件）
+```bash
+docker run -d --name srt-vpn-server \
+  --restart=unless-stopped \
+  --network=host \
+  -e SRT_MODE=server \
+  -e SRT_PASSPHRASE=改成你的强密码 \
+  -e SRT_LISTEN=0.0.0.0:9000 \
+  ghcr.io/luowei729/srt-vpn:latest
 ```
 
-### Docker 启动命令（宿主机映射）
+### 方式 2：Docker + 配置文件 + 环境变量覆盖（混合）
 ```bash
-# 服务端是 UDP（SRT），需 --network=host 暴露 UDP 端口；metrics 走回环
+# 基础参数在文件，需要临时改的用 -e 覆盖（无需重写配置）
 docker run -d --name srt-vpn-server \
   --restart=unless-stopped \
   --network=host \
   -v /opt/srt-vpn/server.conf:/app/configs/server.conf:ro \
-  ghcr.io/<你的用户名>/<仓库名>:latest \
+  -e SRT_PASSPHRASE=临时改的密码 \
+  -e SRT_LISTEN=0.0.0.0:9100 \
+  ghcr.io/luowei729/srt-vpn:latest \
   -c /app/configs/server.conf
 ```
 
-### 原生启动命令（非容器）
+### 方式 3：原生启动（非容器）
 ```bash
-./target/release/srt-vpn -c configs/server.conf
-# 可选参数：
-#   -m reliable|best-effort      # UDP 传输模式（覆盖配置）
-#   -v 2                         # 日志级别 0-4
+SRT_MODE=server SRT_PASSPHRASE=你的强密码 SRT_LISTEN=0.0.0.0:9000 \
+  ./target/release/srt-vpn
+# 或配置文件方式：./target/release/srt-vpn -c configs/server.conf
 ```
 
 ---
 
 ## 三、客户端（Client）启动
 
-### 配置文件（client.json）
-```json
-{
-  "mode": "client",
-  "server": "你的服务器IP:9000",
-  "passphrase": "与服务器相同",
-  "crypto": "aes-128",
-  "streamid": "#!::r=live/srtvpn,m=video",
-  "socks5": {
-    "listen": "0.0.0.0:1080"
-  },
-  "reconnect": { "interval_secs": 5, "max_retries": 10 },
-  "heartbeat_secs": 5,
-  "metrics_port": 9091
-}
-```
-
-### Docker 启动命令（宿主机映射）
+### 方式 1：Docker + 环境变量（推荐，可完整指定 SOCKS5 监听 IP/端口/用户名/密码）
 ```bash
-# 客户端是 TCP SOCKS5 服务，映射 1080；SRT 走宿主机网络连服务器
 docker run -d --name srt-vpn-client \
   --restart=unless-stopped \
-  --network=host \
+  -p 1080:1080 \
+  -e SRT_MODE=client \
+  -e SRT_PASSPHRASE=与服务器相同的密码 \
+  -e SRT_SERVER=你的服务器IP:9000 \
+  -e SRT_SOCKS5_LISTEN=0.0.0.0:1080 \
+  -e SRT_SOCKS5_USER=user1 \
+  -e SRT_SOCKS5_PASS=password123 \
+  ghcr.io/luowei729/srt-vpn:latest
+```
+
+### 方式 2：Docker + 配置文件 + 环境变量覆盖（混合）
+```bash
+docker run -d --name srt-vpn-client \
+  --restart=unless-stopped \
+  -p 1080:1080 \
   -v /opt/srt-vpn/client.json:/app/configs/client.json:ro \
-  ghcr.io/<你的用户名>/<仓库名>:latest \
+  -e SRT_SERVER=新服务器IP:9000 \
+  -e SRT_SOCKS5_LISTEN=0.0.0.0:1080 \
+  ghcr.io/luowei729/srt-vpn:latest \
   -c /app/configs/client.json
 ```
 
-### 原生启动命令（非容器）
+### 方式 3：原生启动（非容器）
 ```bash
-./target/release/srt-vpn -c configs/client.json
-# 可选参数（覆盖配置）：
-#   --socks5-listen 0.0.0.0:1080   # SOCKS5 监听地址
-#   --socks5-user user1            # SOCKS5 用户名
-#   --socks5-pass pass123          # SOCKS5 密码
-#   -v 2                           # 日志级别
+SRT_MODE=client SRT_PASSPHRASE=你的强密码 SRT_SERVER=服务器IP:9000 \
+  SRT_SOCKS5_LISTEN=0.0.0.0:1080 SRT_SOCKS5_USER=user1 SRT_SOCKS5_PASS=password123 \
+  ./target/release/srt-vpn
+# 或配置文件方式：./target/release/srt-vpn -c configs/client.json
 ```
 
 ---
 
-## 四、配置映射说明（必填 / 默认）
+## 四、环境变量配置映射（所有配置参数均可 -e 覆盖）
 
-| 字段 | 角色 | 是否必填 | 默认值 | 说明 |
-|---|---|---|---|---|
-| `mode` | 通用 | ✅ 必填 | 无 | `server` / `client` |
-| `passphrase` | 通用 | ✅ 必填 | 无 | SRT 加密密钥，两端必须一致 |
-| `crypto` | 通用 | ⭕ 可选 | `aes-128` | `aes-128/192/256` |
-| `metrics_port` | 通用 | ⭕ 可选 | 关闭 | 回环指标 HTTP 端口 |
-| `listen` | server | ✅ 必填 | 无 | 如 `0.0.0.0:9000` |
-| `udp_mode` | server | ⭕ 可选 | `reliable` | `reliable`/`best-effort` |
-| `max_clients` | server | ⭕ 可选 | `32` | 最大客户端数 |
-| `socks5_users` | server | ⭕ 可选 | `[]` | 客户端 SOCKS5 认证用户表 |
-| `server` | client | ✅ 必填 | 无 | 服务器 IP:端口，**必须指定** |
-| `streamid` | client | ⭕ 可选 | 内置 | SRT streamid（含 k= 令牌自动附加） |
-| `socks5.listen` | client | ⭕ 可选 | `127.0.0.1:1080` | SOCKS5 监听地址 |
-| `socks5.username/password` | client | ⭕ 可选 | 无认证 | 本地 SOCKS5 认证 |
-| `reconnect` | client | ⭕ 可选 | 5s/10次 | 自动重连 |
-| `heartbeat_secs` | client | ⭕ 可选 | `5` | 心跳间隔 |
+| 环境变量 | 对应配置字段 | 角色 | 默认值 |
+|---|---|---|---|
+| `SRT_MODE` | `mode` | 通用 ✅ 必填 | 无 |
+| `SRT_PASSPHRASE` | `passphrase` | 通用 ✅ 必填 | 无 |
+| `SRT_CRYPTO` | `crypto` | 通用 | `aes-128` |
+| `SRT_METRICS_PORT` | `metrics_port` | 通用 | 关闭 |
+| `SRT_LOG_LEVEL` | `log_level` | 通用 | `-v` 默认 2 |
+| `SRT_LISTEN` | `listen` | server ✅ 必填 | 无 |
+| `SRT_UDP_MODE` | `udp_mode` | server | `reliable` |
+| `SRT_MAX_CLIENTS` | `max_clients` | server | `32` |
+| `SRT_SOCKS5_USERS` | `socks5_users` | server | `[]`（格式 `user:pass,user2:pass2`） |
+| `SRT_SERVER` | `server` | client ✅ 必填 | 无 |
+| `SRT_STREAMID` | `streamid` | client | 内置（自动附 k= 令牌） |
+| `SRT_SOCKS5_LISTEN` | `socks5.listen` | client | `127.0.0.1:1080` |
+| `SRT_SOCKS5_USER` | `socks5.username` | client | 无认证 |
+| `SRT_SOCKS5_PASS` | `socks5.password` | client | 无认证 |
+| `SRT_RECONNECT_INTERVAL` | `reconnect.interval_secs` | client | `5` |
+| `SRT_RECONNECT_MAX` | `reconnect.max_retries` | client | `10` |
+| `SRT_HEARTBEAT_SECS` | `heartbeat_secs` | client | `5` |
 
-**规则**：只有 `mode`、`passphrase`、`server`（client）/`listen`（server）为必填；
-其余字段可省略（省略即用默认值）。
+**配置优先级**：CLI > 环境变量(SRT_*) > 配置文件 > 默认值
+
+**注意**：
+- `-m` 已移除（2026-08-20）：UDP 模式用 `SRT_UDP_MODE` 或配置文件 `udp_mode` 指定
+- Docker 场景**无需挂载配置文件**，全部用 `-e SRT_*` 指定
+- 服务端 UDP（SRT）需 `--network=host`；客户端 SOCKS5 TCP 可 `-p 1080:1080`
 
 ---
 
@@ -145,7 +140,7 @@ docker run -d --name srt-vpn-client \
 | 路径 | 用途 |
 |---|---|
 | `/usr/local/bin/srt-vpn` | 二进制 |
-| `/app/configs/` | 推荐配置挂载目录（内置为空） |
+| `/app/configs/` | 配置文件挂载目录（可选，环境变量方式无需使用） |
 | `/app` | 工作目录（srtvpn 用户，uid 1000） |
 
-容器默认 `USER srtvpn`（非 root），挂载配置需确保权限可读。
+容器默认 `USER srtvpn`（非 root），若挂载配置文件需确保权限可读。
