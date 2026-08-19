@@ -303,6 +303,11 @@ impl TunnelSession {
         self.send_control(FrameType::Open, &payload).await
     }
 
+    /// SRT 连接引用（转发循环抽取后供子函数发送用，2026-08-20）
+    pub fn conn_ref(&self) -> Arc<SrtConnection> {
+        self.conn.clone()
+    }
+
     /// 关闭会话（发送 Close 帧 + 从注册表移除）
     /// （P1 后半段接入会话管理时启用）
     #[allow(dead_code)]
@@ -353,6 +358,13 @@ pub fn dispatch_frame(
             registry.route(frame.session_id, SessionEvent::Close);
             DispatchAction::Closed(frame.session_id)
         }
+        // 2026-08-20 修复：Rst 帧处理（服务端对僵尸会话回发的重置信号）。
+        // 客户端收到 Rst = 该会话已死且数据被丢，立即投递 Close 事件让本地
+        // 转发任务停止发送并释放会话（否则任务要等 300s 看门狗才回收）。
+        FrameType::Rst => {
+            registry.route(frame.session_id, SessionEvent::Close);
+            DispatchAction::Rst(frame.session_id)
+        }
         FrameType::Open => DispatchAction::Open(frame.session_id, frame.payload.clone()),
         _ => DispatchAction::Other,
     }
@@ -369,6 +381,8 @@ pub enum DispatchAction {
     Fin(u16),
     /// 收到关闭
     Closed(u16),
+    /// 收到重置（2026-08-20：对端通知会话已死，本地立即清理）
+    Rst(u16),
     /// 收到打开请求（服务端处理）
     Open(u16, Vec<u8>),
     /// 其他帧（心跳/ACK 等，接收循环自行处理）

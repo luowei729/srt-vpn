@@ -68,13 +68,47 @@ pub async fn start_forward_with_reply(
     let (session_id, rx) = registry
         .allocate()
         .ok_or("隧道会话数已达上限，拒绝打开")?;
-    let mut session = TunnelSession::new(session_id, rx, conn, mux_enc, registry.clone());
+    let mut session = TunnelSession::new(session_id, rx, conn.clone(), mux_enc.clone(), registry.clone());
 
     tracing::info!(session = session_id, dst = %format!("{dst}:{dst_port}"), "分配隧道会话");
 
     // 2. 发送 Open 帧通知服务器建立到目标的连接
-    session.send_open(PROTO_TCP, &dst, dst_port).await?;
+    //
+    //    2026-08-20 修复（对称讣告）：转发结果统一在外层收口发 Close 帧。
+    //    旧实现仅循环正常退出后发 Close；本地读失败/写失败等异常路径
+    //    直接 ? 冒泡退出 -> 服务端不知道客户端会话已死，服务端转发任务
+    //    要等 300s 看门狗才回收（期间目标连接空挂）。
+    //    现所有退出路径统一发 Close（幂等），服务端立即清理。
+    let fwd_result = forward_loop(&mut client, &mut session, session_id, &dst, dst_port, reply, prepend).await;
 
+    // 会话终结讣告（所有路径统一；隧道断开时发送失败可忽略，服务端整条隧道会一起清）
+    let _ = session.send_control(FrameType::Close, &[]).await;
+    let _ = client.shutdown().await;
+
+    match fwd_result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::warn!(session = session_id, error = %e, "转发任务异常结束（已通知服务端）");
+            Err(e)
+        }
+    }
+}
+
+/// 双向转发主循环（2026-08-20 从 start_forward_with_reply 抽取，
+/// 使讣告逻辑在调用方统一收口，不遗漏任何退出路径）
+async fn forward_loop(
+    client: &mut TcpStream,
+    session: &mut TunnelSession,
+    session_id: u16,
+    dst: &str,
+    dst_port: u16,
+    reply: &[u8],
+    prepend: &[u8],
+) -> Result<(), String> {
+    let conn = session.conn_ref();
+    // 2. 发送 Open 帧通知服务器建立到目标的连接
+    session.send_open(PROTO_TCP, &dst, dst_port).await?;
+    let _ = conn; // 保留引用供后续扩展（当前循环内直接用 session 发送）
     // 3. 回复成功（SOCKS5 CONNECT 成功 / HTTP 200 Connection established）
     //    注：普通 HTTP 代理 reply 为空（不回复，等目标响应转发回来）
     if !reply.is_empty() {
@@ -182,16 +216,11 @@ pub async fn start_forward_with_reply(
         }
     }
 
-    // 5. 清理：关闭会话（发 Close 帧 + 移除注册表）
+    // 会话结束日志（Close 讣告由调用方 start_forward_with_reply 统一发送，2026-08-20）
     let (txv, rxv) = (
         tx_total.load(std::sync::atomic::Ordering::Relaxed),
         rx_total.load(std::sync::atomic::Ordering::Relaxed),
     );
     tracing::info!(session = session_id, tx = txv, rx = rxv, "TCP 转发会话结束");
-    let _ = session.send_control(FrameType::Close, &[]).await;
-    client
-        .shutdown()
-        .await
-        .map_err(|e| format!("关闭客户端连接失败: {e}"))?;
     Ok(())
 }

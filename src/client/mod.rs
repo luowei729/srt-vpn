@@ -247,6 +247,11 @@ async fn run_recv_inner(
                                 // 对端 Close：事件已投递到会话通道，转发任务清理退出
                                 tracing::debug!(session = sid, "对端关闭会话");
                             }
+                            // 2026-08-20：服务端 Rst（会话已死），事件已投递，
+                            // 转发任务收到 Close 事件立即停止发送并释放会话
+                            crate::tunnel::dispatch::DispatchAction::Rst(sid) => {
+                                tracing::info!(session = sid, "服务端 Rst（会话已死），本地立即清理");
+                            }
                             crate::tunnel::dispatch::DispatchAction::Open(_sid, _payload) => {
                                 tracing::warn!("客户端收到意外的 Open 帧");
                             }

@@ -72,18 +72,47 @@ pub async fn handle_open_with_rx(
 ) -> Result<(), String> {
     tracing::debug!(session = session_id, payload_len = open_payload.len(), "handle_open_with_rx 开始");
     // 1. 解析 Open 载荷
-    let open = parse_open_payload(open_payload).ok_or("Open 载荷格式无效")?;
+    //
+    // 2026-08-20 修复（多线程上传带宽暴跌根因）：
+    // 旧实现仅"正常结束"路径发 Close 帧，连接失败/读目标失败/RST/看门狗超时等
+    // 异常路径直接 return Err 静默退出 -> 客户端不知道会话已死，继续向僵尸会话
+    // 灌上传数据（实测故障时段单会话丢弃 1297 帧/分钟，隧道带宽被垃圾帧占满）。
+    // 现在所有退出路径统一在外层兜底发 Close 帧（死前讣告），客户端收到后
+    // 立即停止发送并释放会话 ID，杜绝僵尸会话。
+    let open = match parse_open_payload(open_payload) {
+        Some(o) => o,
+        None => {
+            let e = "Open 载荷格式无效";
+            notify_session_closed(session_id, &conn, &mux_enc).await;
+            return Err(e.to_string());
+        }
+    };
     tracing::info!(session = session_id, proto = open.proto, host = %open.host, port = open.port, "处理 Open 请求");
 
-    // 2. 按协议分派
-    match open.proto {
+    // 2. 按协议分派（无论成功/失败/超时，外层统一发 Close 通知客户端）
+    let result = match open.proto {
         PROTO_TCP => {
-            start_tcp_forward(session_id, &open, rx, conn, mux_enc, registry).await
+            start_tcp_forward(session_id, &open, rx, conn.clone(), mux_enc.clone(), registry).await
         }
         PROTO_UDP => {
-            start_udp_forward(session_id, &open, rx, conn, mux_enc, registry).await
+            start_udp_forward(session_id, &open, rx, conn.clone(), mux_enc.clone(), registry).await
         }
         _ => Err(format!("未知协议类型: {}", open.proto)),
+    };
+    // 会话终结讣告：任何退出路径（含 Err）都通知客户端（幂等，客户端收到即清理）
+    notify_session_closed(session_id, &conn, &mux_enc).await;
+    result
+}
+
+/// 会话终结通知（发 Close 帧；连接已断则忽略失败）
+///
+/// 2026-08-20 新增：服务端会话死亡的唯一讣告出口。
+/// 无论会话因何原因结束（目标 RST/超时/错误），客户端必须得知才能停止发送。
+async fn notify_session_closed(session_id: u16, conn: &Arc<SrtConnection>, mux_enc: &Arc<MuxEncoder>) {
+    let frame = mux_enc.encode_frame(FrameType::Close, session_id, 0, &[]);
+    if let Err(e) = conn.send(frame) {
+        // 隧道本身断开时发不出去（客户端整条隧道都在重建，会话随之清空），忽略
+        tracing::debug!(session = session_id, error = %e, "发送会话 Close 讣告失败（隧道可能已断开）");
     }
 }
 
@@ -270,9 +299,8 @@ async fn start_udp_forward(
         }
     }
 
-    // 4. 清理：关闭会话（发 Close 帧）
+    // 4. 清理：会话结束（Close 讣告由外层 handle_open_with_rx 统一发送，2026-08-20）
     tracing::debug!(session = session_id, "UDP 转发会话结束");
-    let _ = session.send_control(FrameType::Close, &[]).await;
     Ok(())
 }
 
@@ -647,9 +675,8 @@ pub async fn start_tcp_forward(
         }
     }
 
-    // 4. 清理：关闭会话（发 Close 帧 + 移除注册表）
+    // 4. 清理：会话结束（Close 讣告由外层 handle_open_with_rx 统一发送，2026-08-20）
     tracing::debug!(session = session_id, "TCP 转发会话结束");
-    let _ = session.send_control(FrameType::Close, &[]).await;
     stream
         .shutdown()
         .await

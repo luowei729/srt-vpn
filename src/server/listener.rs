@@ -348,7 +348,16 @@ fn dispatch_one_frame(
             tracing::trace!(session = frame.session_id, len = frame.payload.len(), "数据已路由到转发会话");
         }
         crate::tunnel::dispatch::DispatchAction::UnknownSession(sid) => {
-            tracing::warn!(session = sid, "数据帧无法路由（转发会话不存在）");
+            // 2026-08-20 修复（多线程上传带宽暴跌根因之二）：
+            // 数据帧找不到会话 = 客户端还在向已死的会话灌数据（僵尸会话）。
+            // 旧实现只打日志丢弃，客户端永远不知道会话已死，持续白灌数据
+            // （实测故障时段 2039 帧/分钟被丢，隧道带宽被垃圾帧占满）。
+            // 现回发 Rst 帧：客户端收到后立即停止发送并释放本地会话（加速收敛）。
+            tracing::warn!(session = sid, "数据帧无法路由（转发会话不存在），回发 Rst 通知客户端清理");
+            let rst = mux_enc_arc.encode_frame(FrameType::Rst, sid, 0, &[]);
+            if let Err(e) = conn.send(rst) {
+                tracing::debug!(session = sid, error = %e, "发送 Rst 失败（隧道可能已断开）");
+            }
         }
         crate::tunnel::dispatch::DispatchAction::Fin(sid) => {
             // 客户端 FIN（半关闭）：事件已由 dispatch_frame 投递到会话通道，
@@ -360,6 +369,11 @@ fn dispatch_one_frame(
             // 客户端 Close：事件已投递到会话通道，转发任务收到后清理退出；
             // 此处仅记录日志（不再直接 remove，避免与任务 Drop 双重移除）
             tracing::info!(session = sid, "客户端关闭会话");
+        }
+        // 2026-08-20：客户端 Rst（其本地会话异常终止），事件已投递，
+        // 服务端转发任务收到 Close 事件后自行退出（对称清理）
+        crate::tunnel::dispatch::DispatchAction::Rst(sid) => {
+            tracing::info!(session = sid, "客户端 Rst（会话已死），转发任务清理");
         }
         crate::tunnel::dispatch::DispatchAction::Open(sid, payload) => {
             // 客户端请求打开会话 -> 建立到目标的直连转发
