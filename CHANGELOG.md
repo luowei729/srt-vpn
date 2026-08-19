@@ -2,6 +2,28 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-20 02:10] - Docker CMD 修复 + 环境变量方式生产部署（新加坡/本地 1080）
+
+### 改动前总结
+Docker 容器默认 `CMD ["--help"]`，用 `-e` 环境变量启动时无命令参数 → 打印帮助退出。
+
+### 改动后总结
+- Dockerfile：`CMD` 改为空（`CMD []`），容器无参数直接跑主程序（纯环境变量启动）；帮助用 `-h` 查看
+- 重新构建 `env-config-20260820` 镜像
+
+### 生产部署（环境变量方式，无配置文件）
+- **新加坡 129.150.44.117**（aarch64，Docker 容器 `srtvpn-sg`）：
+  `docker run -d --net=host -e SRT_MODE=server -e SRT_PASSPHRASE=... -e SRT_LISTEN=0.0.0.0:9000 ghcr.io/luowei729/srt-vpn:env-config-20260820`
+- **本地**（x86_64，原生二进制）：`SRT_MODE=client ... SRT_SOCKS5_LISTEN=0.0.0.0:1080` 监听 1080
+
+### 验证（隧道连通性全通过）
+- ✅ TCP：经 1080 访问百度 HTTP/HTTPS 均 200（curl socks5h）
+- ✅ UDP：小包 100B、大包 2048B（分片）、超大包 8000B（7 片）回显一致
+- ✅ 两端认证通过，服务端 clients=1
+
+### 涉及文件
+- Dockerfile
+
 ## [2026-08-20 02:00] - 环境变量配置支持 + CLI 简化（-m 移除，-c 可选）
 
 ### 改动前总结
