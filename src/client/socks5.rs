@@ -18,9 +18,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use crate::config::Socks5Config;
-use crate::srt::connection::SrtConnection;
-use crate::tunnel::dispatch::SessionRegistry;
-use crate::tunnel::multiplex::MuxEncoder;
 
 /// SOCKS5 协议常量
 const SOCKS5_VERSION: u8 = 0x05;
@@ -72,9 +69,7 @@ pub struct Socks5ServerConfig {
 /// recv_loop 因隧道断开退出时置位，serve 收到信号立即返回 Err，让重连循环接管。
 pub async fn serve(
     listen_addr: &str,
-    conn: Arc<SrtConnection>,
-    mux_enc: Arc<MuxEncoder>,
-    registry: SessionRegistry,
+    pool: Arc<crate::client::pool::TunnelPool>,
     socks5_cfg: Socks5Config,
     mut tunnel_closed: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
@@ -97,12 +92,10 @@ pub async fn serve(
                 let (stream, peer) = accept_res
                     .map_err(|e| format!("SOCKS5 accept 失败: {e}"))?;
                 tracing::debug!(peer = %peer, "SOCKS5 新连接");
-                let conn_c = conn.clone();
-                let mux_c = mux_enc.clone();
-                let reg_c = registry.clone();
+                let pool_c = pool.clone();
                 let cfg_c = socks5_cfg.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, peer, conn_c, mux_c, reg_c, cfg_c).await {
+                    if let Err(e) = handle_connection(stream, peer, pool_c, cfg_c).await {
                         tracing::debug!(peer = %peer, error = %e, "SOCKS5 连接处理结束");
                     }
                 });
@@ -121,9 +114,7 @@ pub async fn serve(
 async fn handle_connection(
     mut stream: TcpStream,
     peer: std::net::SocketAddr,
-    conn: Arc<SrtConnection>,
-    mux_enc: Arc<MuxEncoder>,
-    registry: SessionRegistry,
+    pool: Arc<crate::client::pool::TunnelPool>,
     socks5_cfg: Socks5Config,
 ) -> Result<(), String> {
     // 0. 协议嗅探（2026-08-19 新增 HTTP/HTTPS 代理支持）
@@ -140,7 +131,7 @@ async fn handle_connection(
     if first[0] != SOCKS5_VERSION && is_http_start {
         // HTTP/HTTPS 代理：把首字节传给 http_proxy（作为请求行第一个字符）
         return crate::client::http_proxy::handle_http_proxy(
-            stream, first[0], peer, conn, mux_enc, registry,
+            stream, first[0], peer, pool,
         )
         .await;
     }
@@ -294,19 +285,12 @@ async fn handle_connection(
     match cmd {
         CMD_CONNECT => {
             tracing::info!(peer = %peer, dst = %format!("{dst_addr}:{dst_port}"), "SOCKS5 CONNECT");
-            // 建立隧道会话并双向转发
-            // proxy::start_tcp_forward 内部：
-            //   1. 分配会话 ID + 发 Open 帧（目标地址）
-            //   2. 双向转发：客户端流 ↔ 隧道 Data 帧
-            //   3. 半关闭传播 + 会话关闭
-            // 转发函数会先发 CONNECT 成功响应，再开始转发
+            // 建立隧道会话并双向转发（B 方案：pool 内轮询选连接）
             crate::client::proxy::start_tcp_forward(
                 stream,
                 dst_addr,
                 dst_port,
-                conn,
-                mux_enc,
-                registry,
+                pool,
             )
             .await
         }
@@ -316,9 +300,7 @@ async fn handle_connection(
             start_udp_associate(
                 stream,
                 peer,
-                conn,
-                mux_enc,
-                registry,
+                pool,
             )
             .await
         }
@@ -406,9 +388,7 @@ fn validate_credential(username: &str, password: &str, cfg: &Socks5Config) -> bo
 async fn start_udp_associate(
     stream: TcpStream,
     peer: std::net::SocketAddr,
-    conn: Arc<SrtConnection>,
-    mux_enc: Arc<MuxEncoder>,
-    registry: SessionRegistry,
+    pool: Arc<crate::client::pool::TunnelPool>,
 ) -> Result<(), String> {
     use crate::tunnel::dispatch::TunnelSession;
 
@@ -489,10 +469,11 @@ async fn start_udp_associate(
     // 3. 建立单个隧道 UDP 会话（proto=1，多目标：目标由每帧地址头动态指定）
     //    Open 目标用占位（服务器多目标模式忽略 Open 固定目标）
     //    2026-08-19 审查修复（F4）：allocate 增加会话上限，失败时返回 None
-    let (sid, rx) = registry
+    //    B 方案（2026-08-20）：从连接池轮询选连接建会话（每条独立 FileCC 窗口）
+    let (tconn, sid, rx) = pool
         .allocate()
         .ok_or("隧道会话数已达上限，UDP ASSOCIATE 被拒绝")?;
-    let mut session = TunnelSession::new(sid, rx, conn, mux_enc, registry.clone());
+    let mut session = TunnelSession::new(sid, rx, tconn.conn, tconn.mux_enc, tconn.registry);
     session.send_open(1, "0.0.0.0", 0).await?;
     tracing::info!(session = sid, client = %peer, "UDP ASSOCIATE 隧道会话建立（多目标）");
 

@@ -14,10 +14,6 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
-use crate::srt::connection::SrtConnection;
-use crate::tunnel::dispatch::SessionRegistry;
-use crate::tunnel::multiplex::MuxEncoder;
-
 /// 拆分 authority（host:port），支持 IPv6 [::1]:port，无端口用默认
 fn split_host_port(authority: &str, default_port: u16) -> (String, u16) {
     match authority.rsplit_once(':') {
@@ -46,9 +42,7 @@ pub async fn handle_http_proxy(
     mut stream: TcpStream,
     first_byte: u8,
     peer: std::net::SocketAddr,
-    conn: Arc<SrtConnection>,
-    mux_enc: Arc<MuxEncoder>,
-    registry: SessionRegistry,
+    pool: Arc<crate::client::pool::TunnelPool>,
 ) -> Result<(), String> {
     // 1. 读取 HTTP 请求头（请求行 + 头部，到空行）
     //    先把嗅探读到的首字节计入 header
@@ -122,7 +116,7 @@ pub async fn handle_http_proxy(
         let reply: Vec<u8> = b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec();
         let tunnel_prepend = header[hdr_end..].to_vec();
         crate::client::proxy::start_forward_with_reply(
-            stream, dst, dst_port, conn, mux_enc, registry, &reply, &tunnel_prepend,
+            stream, dst, dst_port, pool, &reply, &tunnel_prepend,
         )
         .await
     } else {
@@ -130,7 +124,7 @@ pub async fn handle_http_proxy(
         // 注：header 已含请求行+头，目标需要它们。这里整个 header 作为 prepend。
         let prepend = header[..].to_vec();
         crate::client::proxy::start_forward_with_reply(
-            stream, dst, dst_port, conn, mux_enc, registry, &[], &prepend,
+            stream, dst, dst_port, pool, &[], &prepend,
         )
         .await
     }

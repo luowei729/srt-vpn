@@ -7,6 +7,7 @@
 //!   挑战-应答认证 → 隧道复用（会话映射）→ 服务器转发
 
 pub mod http_proxy;
+pub mod pool;
 pub mod proxy;
 pub mod socks5;
 
@@ -15,6 +16,13 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::srt::connection::{SrtConfig, SrtConnection};
 use crate::tunnel::multiplex::MuxEncoder;
+
+/// 连接池大小（B 方案，2026-08-20 验证期先固定 4；后续可配置化）
+///
+/// 取值依据：公网对照实验 4 连接并发 151 MB/s（+70% 于单连接 89 MB/s）。
+/// 4 条已获大部分收益，过多连接会显著增加 UDP 流数量（伪装权衡）与
+/// 服务端 max_clients 占用，收益递减。
+const POOL_SIZE: usize = 4;
 
 /// 客户端运行入口
 pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
@@ -80,10 +88,11 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
         .unwrap_or(socks5_cfg.listen.clone());
 
     loop {
-        let conn = if first_connect {
-            // 首次建连：调用 connect_with_retry（内部会按 reconnect 配置重试直到成功或达上限）
+        // 建池：POOL_SIZE 条连接（每条独立 FileCC 拥塞窗口，B 方案核心）
+        let conns_raw = if first_connect {
+            // 首次建池：调用 connect_pool_with_retry（内部按 reconnect 配置重试直到成功或达上限）
             first_connect = false;
-            connect_with_retry(&srt_cfg, cfg).await?
+            connect_pool_with_retry(&srt_cfg, cfg).await?
         } else {
             // 断线重连：按 reconnect 配置重试上限
             attempt += 1;
@@ -97,7 +106,7 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
             }
             tracing::warn!(attempt, interval, "隧道断开，准备重连");
             tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-            match connect_once(&srt_cfg).await {
+            match connect_pool_once(&srt_cfg).await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(error = %e, "重连 SRT 失败");
@@ -107,60 +116,69 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
         };
 
         // S4 修复（2026-08-19）：连接成功进入服务态后清零重连计数。
-        // 旧实现 attempt 是"累计断线次数"，长期运行的客户端累计达 max_retries
-        // 后直接退出进程（瞬时抖动 10 次也不该退），违背 Q16 自动重连意图。
         // 语义改为"连续失败次数"：成功即清零。
         attempt = 0;
-        tracing::info!("SRT 连接建立成功");
-        let conn = Arc::new(conn);
+        tracing::info!(conns = conns_raw.len(), "SRT 连接池建立成功");
 
-        // 重建隧道组件（每次重连都是全新连接，编码器/注册表一并重建）
-        let mux_enc = Arc::new(MuxEncoder::new(true));
-        let registry = crate::tunnel::dispatch::SessionRegistry::new();
+        // 每条连接构建 TunnelConn（独立编码器/注册表/FileCC 窗口）
+        let mut tconns = Vec::with_capacity(conns_raw.len());
+        for c in conns_raw {
+            tconns.push(pool::TunnelConn {
+                conn: Arc::new(c),
+                mux_enc: Arc::new(MuxEncoder::new(true)),
+                registry: crate::tunnel::dispatch::SessionRegistry::new(),
+            });
+        }
+        let tunnel_pool = Arc::new(pool::TunnelPool::new(tconns));
         let passphrase = cfg.passphrase.clone();
 
-        // 注册指标连接数（客户端侧也统计活跃连接）
+        // 注册指标连接数（客户端侧按池大小统计）
         let m = crate::metrics::metrics();
-        m.active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        m.total_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        m.active_connections.fetch_add(tunnel_pool.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        m.total_connections.fetch_add(tunnel_pool.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
-        // 启动隧道接收循环（SRT 收 → 分发到会话）
-        // 断开信号：recv_loop 退出时置位 → serve 停止 accept → 重连循环接管（B3）
+        // 断开信号：任一 recv_loop 退出时置位 → serve 停止 accept → 重连循环接管（B3）
         let (tunnel_closed_tx, tunnel_closed_rx) = tokio::sync::watch::channel(false);
-        let recv_conn = conn.clone();
-        let recv_mux = mux_enc.clone();
-        let recv_reg = registry.clone();
-        let recv_task = tokio::spawn(recv_loop(recv_conn, recv_mux, passphrase, recv_reg, tunnel_closed_tx));
-
-        // 启动主动心跳定时器（B4：按 heartbeat_secs 周期主动发心跳帧保活）
-        let hb_conn = conn.clone();
-        let hb_mux = mux_enc.clone();
         let heartbeat_secs = cfg.heartbeat_secs.max(1);
-        let hb_task = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(heartbeat_secs)).await;
-                let hb = hb_mux.encode_heartbeat();
-                if let Err(e) = hb_conn.send(hb) {
-                    tracing::warn!(error = %e, "心跳发送失败");
-                    break; // 连接不可用，退出心跳任务（由重连循环重建）
+
+        // 每条连接 spawn 接收循环 + 主动心跳（B 方案：每连接独立 recv_loop/心跳）
+        let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        for i in 0..tunnel_pool.len() {
+            let c = tunnel_pool.get(i).clone();
+            // 接收循环（SRT 收 → 分发到该连接的会话）
+            let recv_conn = c.conn.clone();
+            let recv_mux = c.mux_enc.clone();
+            let recv_reg = c.registry.clone();
+            let recv_pw = passphrase.clone();
+            let recv_tx = tunnel_closed_tx.clone();
+            tasks.push(tokio::spawn(recv_loop(recv_conn, recv_mux, recv_pw, recv_reg, recv_tx)));
+
+            // 主动心跳（B4：按 heartbeat_secs 周期发心跳帧保活）
+            let hb_conn = c.conn.clone();
+            let hb_mux = c.mux_enc.clone();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(heartbeat_secs)).await;
+                    let hb = hb_mux.encode_heartbeat();
+                    if let Err(e) = hb_conn.send(hb) {
+                        tracing::warn!(error = %e, "心跳发送失败");
+                        break; // 连接不可用，退出心跳任务（由重连循环重建）
+                    }
                 }
-            }
-        });
+            }));
+        }
 
         // 启动 SOCKS5 服务；运行中断开（serve 返回 Err）或监听失败 -> 按错误类型分流
         // S2 修复（2026-08-19）：监听失败（"listen:" 前缀）= 致命配置错误，
         // 重连一万次也解决不了端口被占 -> 直接退出进程让运维感知；
         // 其余 Err（隧道断开/accept 失败）-> 走重连循环。
-        let serve_result = socks5::serve(&listen_addr, conn.clone(), mux_enc, registry, socks5_cfg.clone(), tunnel_closed_rx).await;
-        // 心跳任务收尾（连接已失效，abort 防泄漏）
-        hb_task.abort();
-        // 释放连接指标
-        m.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-
-        // S2：recv_task 不再无条件 await（旧实现监听失败时 recv_loop 不会退出，
-        // await 永久挂起卡死客户端）。abort 让其随连接失效终止；
-        // 断线场景下 recv_loop 本就即将退出，abort 无副作用。
-        recv_task.abort();
+        let serve_result = socks5::serve(&listen_addr, tunnel_pool.clone(), socks5_cfg.clone(), tunnel_closed_rx).await;
+        // 清理：abort 全部任务 + 清空会话通道 + 释放连接指标
+        for t in tasks {
+            t.abort();
+        }
+        tunnel_pool.close_all_sessions();
+        m.active_connections.fetch_sub(tunnel_pool.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
         match serve_result {
             Ok(()) => {
@@ -180,15 +198,25 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
     }
 }
 
-/// 建立单次 SRT 连接（重连循环与初始建连共用）
-async fn connect_once(srt_cfg: &SrtConfig) -> Result<SrtConnection, String> {
-    // SRT 连接建立是同步阻塞（epoll 等待），用 spawn_blocking 避免阻塞 tokio worker
-    // 注意：SrtConfig 是 Clone，必须克隆进闭包（spawn_blocking 要求 'static）
-    let cfg = srt_cfg.clone();
-    tokio::task::spawn_blocking(move || SrtConnection::connect(&cfg))
-        .await
-        .map_err(|e| format!("连接任务异常: {e}"))?
-        .map_err(|e| format!("SRT 连接失败: {e}"))
+/// 建立单次 SRT 连接池（B 方案 2026-08-20：并行建 POOL_SIZE 条连接）
+///
+/// 并行建连（spawn_blocking 各自独立），全部成功返回 Vec，任一失败返回 Err
+/// （由调用方按 reconnect 配置重试整个池）。
+async fn connect_pool_once(srt_cfg: &SrtConfig) -> Result<Vec<SrtConnection>, String> {
+    let mut handles = Vec::with_capacity(POOL_SIZE);
+    for _ in 0..POOL_SIZE {
+        let cfg = srt_cfg.clone();
+        handles.push(tokio::task::spawn_blocking(move || SrtConnection::connect(&cfg)));
+    }
+    let mut conns = Vec::with_capacity(POOL_SIZE);
+    for h in handles {
+        conns.push(
+            h.await
+                .map_err(|e| format!("连接任务异常: {e}"))?
+                .map_err(|e| format!("SRT 连接失败: {e}"))?,
+        );
+    }
+    Ok(conns)
 }
 
 /// 隧道接收循环：SRT 消息 → 复用帧分发
@@ -387,20 +415,20 @@ fn handle_challenge(
     }
 }
 
-/// 带重连的 SRT 连接（设计决策：5s 心跳 + 客户端自动重连）
+/// 带重连的 SRT 连接池（设计决策：5s 心跳 + 客户端自动重连，B 方案 2026-08-20）
 ///
 /// 2026-08-19 审查修复（B3）：
 /// - SRT 连接建立是同步阻塞（内部 epoll 等待最多 5s + 200ms 就绪 sleep），
-///   改走 spawn_blocking（connect_once），避免阻塞 tokio worker 线程。
-async fn connect_with_retry(cfg: &SrtConfig, app_cfg: &Config) -> Result<SrtConnection, String> {
+///   改走 spawn_blocking（connect_pool_once），避免阻塞 tokio worker 线程。
+async fn connect_pool_with_retry(cfg: &SrtConfig, app_cfg: &Config) -> Result<Vec<SrtConnection>, String> {
     let interval = app_cfg.reconnect.as_ref().map(|r| r.interval_secs).unwrap_or(5);
     let max_retries = app_cfg.reconnect.as_ref().map(|r| r.max_retries).unwrap_or(10);
     let mut attempt = 0u64;
     loop {
-        match connect_once(cfg).await {
-            Ok(conn) => {
-                tracing::info!(attempt, "SRT 连接建立成功");
-                return Ok(conn);
+        match connect_pool_once(cfg).await {
+            Ok(conns) => {
+                tracing::info!(attempt, conns = conns.len(), "SRT 连接池建立成功");
+                return Ok(conns);
             }
             Err(e) => {
                 attempt += 1;

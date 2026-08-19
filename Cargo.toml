@@ -1,6 +1,6 @@
 [package]
 name = "srt-vpn"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "基于 SRT 直播流协议的 VPN 隧道（伪装为 MPEG-TS 直播流）"
 license = "MIT"

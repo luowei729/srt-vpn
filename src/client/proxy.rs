@@ -17,9 +17,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::srt::connection::SrtConnection;
-use crate::tunnel::dispatch::{SessionEvent, SessionRegistry, TunnelSession};
-use crate::tunnel::multiplex::MuxEncoder;
+use crate::tunnel::dispatch::{SessionEvent, TunnelSession};
 use crate::tunnel::FrameType;
 
 /// 协议类型常量（Open 帧载荷）
@@ -37,13 +35,11 @@ pub async fn start_tcp_forward(
     client: TcpStream,
     dst: String,
     dst_port: u16,
-    conn: Arc<SrtConnection>,
-    mux_enc: Arc<MuxEncoder>,
-    registry: SessionRegistry,
+    pool: Arc<crate::client::pool::TunnelPool>,
 ) -> Result<(), String> {
     // SOCKS5 成功回复（绑定地址为本地地址）
     let reply = vec![0x05, super::socks5::REP_SUCCESS, 0x00, 0x01, 127, 0, 0, 1, 0, 0];
-    start_forward_with_reply(client, dst, dst_port, conn, mux_enc, registry, &reply, &[]).await
+    start_forward_with_reply(client, dst, dst_port, pool, &reply, &[]).await
 }
 
 /// 建立隧道会话 + 双向透传（SOCKS5 与 HTTP 代理共用，2026-08-19 新增）
@@ -57,18 +53,16 @@ pub async fn start_forward_with_reply(
     mut client: TcpStream,
     dst: String,
     dst_port: u16,
-    conn: Arc<SrtConnection>,
-    mux_enc: Arc<MuxEncoder>,
-    registry: SessionRegistry,
+    pool: Arc<crate::client::pool::TunnelPool>,
     reply: &[u8],
     prepend: &[u8],
 ) -> Result<(), String> {
-    // 1. 分配会话 ID + 接收通道
+    // 1. 从连接池轮询分配会话（B 方案：会话分散到多条 SRT 连接，各自独立 FileCC 窗口）
     //    2026-08-19 审查修复（F4）：allocate 增加会话上限，失败时返回 None
-    let (session_id, rx) = registry
+    let (tconn, session_id, rx) = pool
         .allocate()
         .ok_or("隧道会话数已达上限，拒绝打开")?;
-    let mut session = TunnelSession::new(session_id, rx, conn.clone(), mux_enc.clone(), registry.clone());
+    let mut session = TunnelSession::new(session_id, rx, tconn.conn, tconn.mux_enc, tconn.registry);
 
     tracing::info!(session = session_id, dst = %format!("{dst}:{dst_port}"), "分配隧道会话");
 
