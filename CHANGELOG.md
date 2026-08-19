@@ -2,6 +2,39 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-20 05:30] - 对时握手（认证时钟无关）+ 内核缓冲调优 + 公网对照实验结论
+
+### 改动前总结
+软路由更新 0.2.1 二进制后隧道全断：服务端刷 `挑战-应答校验失败`。排查发现软路由系统时间快 ~51 秒（超出 ±30s 时间窗），且 NTP 流量走隧道 -> 隧道断 -> NTP 也断 -> 时间纠不回的**死循环**（手动 `ntpd -q` 直连校时后 4 实例全部恢复）。另：上传带宽瓶颈排查中发现新加坡服务器内核 `net.core.rmem_max` 仅 208KB，钳制了 `SRTO_UDP_RCVBUF=16MB` 的设置（33 次/秒缓冲溢出丢包 -> SRT 误判网络丢包重传风暴）。
+
+### 改动后总结
+1. **对时握手（v0.2.2，认证与客户端本地时钟完全无关）**：
+   - CHALLENGE 帧携带服务端时间戳 `ts`（`nonce=<hex>,ts=<unix秒>`），客户端用它计算 HMAC 应答
+   - 服务端 `verify_response_dual` 双路径校验：新客户端按 server_ts 比对（陈旧性校验防重放）；旧客户端按 90s 窗口兜底（时间窗 30->90s，nonce 连接级一次性保证防重放不降级）
+   - 服务端认证失败日志输出时钟偏差方向与秒数（替代模糊的"时间窗或 HMAC 不匹配"）；认证通过日志带 `client_clock_delta_s` 诊断
+   - 客户端解析 `ts` 字段优先使用（`clock_src=server`），无则回退本地时间（旧服务端兼容）
+   - **四象限兼容**：新旧客户端 × 新旧服务端任意组合都能认证
+   - 新增 5 个对时单测（时钟漂移 10 万秒仍通过/旧客户端窗口内兜底/超窗拒绝/陈旧 CHALLENGE 拒绝/错误密钥拒绝），共 30 测试全过
+2. **新加坡内核 UDP 缓冲调优**（运维，已写入服务器 /etc/sysctl.conf 持久化）：
+   - `net.core.rmem_max/wmem_max` 212KB -> 32MB；`rmem_default/wmem_default` -> 8MB
+   - 效果：缓冲溢出从 33 次/秒归零；公网上传从 ~0 恢复 17.7 MB/s；内核缓冲钳制经验教训（应用层 setsockopt 会被 rmem_max 静默钳制）
+3. **公网对照实验（探针 srt_probe_mc 改造为远程双模式）**：
+   - 探针支持 `server <port> <msgs>`（接收端，部署新加坡 aarch64 本地编译）与 `client <remote> <base_port> <conn> <msgs>`（多连接并发发起）
+   - **实验结论（决定性数据）**：纯 libsrt 公网单连接上传 89.49 MB/s，4 连接并发 151.68 MB/s（**+70%**）-> 证明单 SRT 连接共享 FileCC 拥塞窗口是并发瓶颈，多连接各自独立窗口收益显著
+   - 方向决策：**用户选择学 QUIC 的 A 方案**（单连接 + 复用层每会话公平调度/流控），保持单 UDP 流伪装；多连接池（B 方案）作为备选已存档
+
+### 部署
+- Release `v0.2.2`（Latest）：amd64/arm64 静态二进制 + 组件更新元数据（passwall 可检测 0.2.1 < 0.2.2）
+- 新加坡 srtvpn-sg 容器：`ghcr.io/luowei729/srt-vpn:0.2.2`
+- 软路由 passwall 已更新 0.2.2（4 实例，其中 2 个为 haproxy 后端 + 2 个 SOCKS 入口，属 passwall 正常行为）
+
+### 涉及文件
+- src/auth/challenge.rs（时间窗 90s + verify_response_dual + 5 单测）
+- src/server/listener.rs（CHALLENGE 带 ts + 双路径校验 + 时钟偏差诊断）
+- src/client/mod.rs（解析 ts 优先使用 + 重连失败提示检查 NTP）
+- examples/srt_probe_mc.rs（远程双模式多连接探针）
+- Cargo.toml（0.2.2）
+
 ## [2026-08-20 03:25] - 版本号 0.2.1 发布（修复 passwall 检测不到更新）
 
 ### 改动前总结

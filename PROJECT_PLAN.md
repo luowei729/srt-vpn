@@ -249,6 +249,13 @@ srt-vpn/
 > - L 级：删冗余依赖/死模块（session.rs）、过时注释全面修正、重复函数收敛
 > - 测试 25 通过，release 零警告；端到端 TCP/UDP 四类目标/断线重连 4 轮/退出安全全验证
 
+> 修复扩展 2026-08-20（会话讣告 + 对时握手 + 内核调优，详见 CHANGELOG 03:05/03:25/05:30 条目）：
+> - **会话死亡讣告**：任何会话退出路径统一发 Close/Rst（handle_open_with_rx 外层兜底 + 无法路由回 Rst），修复 WebRTC 多线程上传带宽暴跌（僵尸会话灌数据占满隧道）
+> - **对时握手 v0.2.2**：CHALLENGE 携带服务端 ts，客户端用它算 HMAC（认证与本地时钟无关，根治软路由时钟漂移死循环）；时间窗 30->90s；双路径四象限兼容
+> - **内核 UDP 缓冲**：部署服务器必须调 net.core.rmem_max≥32MB（默认 208KB 会钳制 SRTO_UDP_RCVBUF 导致缓冲溢出丢包重传风暴）
+> - **公网对照实验结论**：单 SRT 连接 89 MB/s vs 4 连接并发 151 MB/s（+70%）-> 单连接共享 FileCC 窗口是并发瓶颈
+> - **P1.5 方向确认（用户拍板）**：走 A 方案（学 QUIC：单连接 + 复用层每会话公平调度/流控，保单 UDP 流伪装）；多连接池（B 方案）存档备选
+
 > 对接扩展 2026-08-19（passwall 集成，详见 CHANGELOG 17:55 条目）：
 > - **静态二进制发布**：release.yml 新增 build-binaries（Alpine/musl 全静态 amd64/arm64）+ release（上传 Release assets）+ push v* tag 触发
 > - **客户端域名支持**：resolve_addr（lookup_host 取 IPv4），passwall 节点地址可为域名
