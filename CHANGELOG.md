@@ -2,6 +2,38 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-19 16:05] - M1 并行 accept 两版 bug 修复 + fix4 部署（新加坡/本地 1080）
+
+### 改动前总结
+15:00 修复的 M1（accept 并行化）部署到新加坡后**实测暴露两版连锁 bug**：
+- 第一版 bug：每连接任务重建监听 socket（bind->listen->accept(1)->close），并行化后多任务同时 bind 同一端口 -> "Another socket is already listening on the same port" 无限报错
+- 第二版 bug（修完第一版部署又发现）：主循环预 spawn 无限 accept 任务 -> 1500+ 任务同时阻塞在 srt_accept 排队 -> max_clients 名额被预占任务瞬间耗尽（active=1513 冻结），主循环永远卡在"已达最大客户端数"，真实客户端永远进不来
+- CI merge job 也有 bug：无 checkout 步骤，git describe 失败 fallback latest，与 build 实际推送的 <sha>-arch tag 不一致 -> "latest-amd64 not found" 合并失败
+
+### 改动后总结
+- **监听 socket 常驻化**（connection.rs）：拆分 `bind_listener`（一次 bind+listen，常驻 `SrtListener`，Drop 关闭）+ `accept_one`（并发安全，srt_accept 由 libsrt 内部排队）；废弃旧 `SrtConnection::accept` 每连接重建模型
+- **accept 循环最终模型**（listener.rs）：主循环**串行 accept**（名额精确可控，一次只占 1 个）-> accept 到连接**立即 spawn「认证+处理」任务**（认证不阻塞下一个 accept，M1 多客户端并行目标保留）+ accept 失败 500ms 退避
+- **CI 修复**（release.yml）：build job 输出 TAG（outputs.tag），merge job 复用（单一事实来源），不再各自计算
+- 教训记录：并行化改造必须先想清楚"哪些资源是全局唯一"（监听 socket）与"任务生命周期与名额占用的对应关系"（预 spawn 无限任务 = 名额风暴）
+
+### 验证（本地回环 + 公网生产）
+- ✅ 本地：3 客户端并发接入 0 端口冲突 + 名额正常 + 3/3 转发 + 第 4 个后续客户端正常接入；25 单测全过 release 零警告
+- ✅ 新加坡 fix4 部署：静置 30 秒日志仅 2 行（无告警刷屏、无名额冻结）
+- ✅ 公网端到端：本地 1080 -> 新加坡 -> 百度 HTTP/HTTPS 均 200（0.19s/0.89s）
+- ✅ UDP：经隧道 DNS 解析 8.8.8.8（baidu.com 4 条 A 记录）
+- ✅ 断线重连：docker restart 服务端 -> 客户端自动重连 -> 35 秒恢复 HTTP 200
+
+### 部署信息
+- 镜像：`ghcr.io/luowei729/srt-vpn:fix4-20260819`（含 15:00 全部修复 + 本轮 3 项修复）
+- 新加坡：容器 `srtvpn-sg`（fix4-20260819，--net=host，SRT_LISTEN=0.0.0.0:9000）
+- 本地：原生二进制客户端（PID 881486，SOCKS5 0.0.0.0:1080 -> 129.150.44.117:9000）
+
+### 涉及文件
+- src/srt/connection.rs（bind_listener/SrtListener/accept_from_listener）
+- src/server/listener.rs（串行 accept + 并行认证处理）
+- .github/workflows/release.yml（TAG 单一来源）
+- README.md（多用户语义与端口冲突章节）、CHANGELOG.md、PROJECT_PLAN.md
+
 ## [2026-08-19 15:30] - 文档维护（多用户语义）+ 修复版部署（新加坡/本地 1080）
 
 ### 改动前总结
