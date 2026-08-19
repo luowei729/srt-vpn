@@ -49,7 +49,15 @@ pub async fn accept_loop(srt_cfg: &SrtConfig, app_cfg: &Config) -> Result<(), St
     let listener = Arc::new(listener);
 
     loop {
-        // 达到最大客户端数时等待（P1 简单：拒绝新连接）
+        // 2026-08-19 M1 最终修正（吸取两版教训）：
+        // - 第一版（串行全流程）：认证阻塞 accept，多客户端接入串行化
+        // - 第二版（预 spawn 无限 accept 任务）：1500+ 任务同时阻塞在
+        //   srt_accept 排队，名额瞬间被预占耗尽，主循环永远卡在
+        //   "已达最大客户端数" -> 真实客户端永远进不来（新加坡部署实测）
+        // - 本版（正确模型）：主循环串行 accept（一次一个，名额可控），
+        //   accept 到连接后立即 spawn「认证+处理」任务（认证不再阻塞
+        //   下一个 accept，多客户端并行接入的 M1 目标仍达成）
+        // 达到最大客户端数时等待（此时挂起的 accept 任务为 0，名额语义精确）
         let cur = client_count.load(std::sync::atomic::Ordering::Relaxed);
         if cur >= app_cfg.max_clients {
             tracing::warn!(max = app_cfg.max_clients, active = cur, "已达最大客户端数，暂停接受新连接");
@@ -57,33 +65,32 @@ pub async fn accept_loop(srt_cfg: &SrtConfig, app_cfg: &Config) -> Result<(), St
             continue;
         }
 
-        // 2026-08-19 M1 修复：accept 是同步阻塞（内部阻塞等新连接 + 300ms 握手等待），
-        // 移入 spawn_blocking；每客户端的「accept + 认证 + 处理」整体独立任务并行化。
-        // 名额预占：spawn 前 +1（防并发 accept 超卖），认证失败时 -1 回退。
+        // 名额预占（accept 期间占住 1 个，防并发超卖）
+        client_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // 串行 accept（阻塞等下一个客户端；spawn_blocking 不占 tokio worker）
+        let listener_c = listener.clone();
+        let conn = match tokio::task::spawn_blocking(move || listener_c.accept_one()).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "accept 失败");
+                client_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                // accept 失败退避（防异常时 CPU 空转）
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "accept 任务异常");
+                client_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+        };
+
+        // accept 到连接：spawn「认证 + 处理」任务（并行化，不阻塞下一个 accept）
+        // 名额已预占，由任务结束/认证失败时释放
         let cfg_c = app_cfg.clone();
         let count_c = client_count.clone();
-        let listener_c = listener.clone();
         tokio::spawn(async move {
-            // 名额预占（B1 原子计数；认证失败/accept 失败时回退）
-            count_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-            // 阻塞 accept 放 spawn_blocking（M1：不占 tokio worker）
-            // 监听 socket 常驻复用（M1 配套修复：不再每连接 bind）
-            let conn = match tokio::task::spawn_blocking(move || listener_c.accept_one())
-                .await
-            {
-                Ok(Ok(c)) => c,
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "accept 失败");
-                    count_c.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "accept 任务异常");
-                    count_c.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    return;
-                }
-            };
 
             // 检查客户端来源（日志）
             if let Some(sid) = conn.get_streamid() {
