@@ -2,6 +2,22 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-20 03:25] - 版本号 0.2.1 发布（修复 passwall 检测不到更新）
+
+### 改动前总结
+用户报告 passwall 点"检查更新"检测不到新版本。排查 api.lua 的 `compare_versions`：按 `[%.%-]` 切分转数字比较。此前发布的 tag `vrst-notify-20260820` 去掉 v 后为 `rst-notify-20260820`，切分得 `rst/notify/20260820` -> tonumber 失败全变 0 -> 与本地 `0.2.0` 比较为 `0.2.0 < 0.0.20260820`，第 2 段 2>0 不成立 -> `has_update=false`。**根因：发布 tag 用了描述性名字，破坏 passwall 语义版本比较**。
+
+### 改动后总结
+- Cargo.toml 版本 `0.1.0` -> `0.2.1`（`-V` 输出 `srt-vpn 0.2.1`，与 release tag 对齐）
+- 发布 Release `v0.2.1`（Latest）：含 amd64/arm64 静态二进制 + 组件更新元数据 JSON
+- 新加坡 srtvpn-sg 容器同步升级 `ghcr.io/luowei729/srt-vpn:0.2.1`（与服务端对齐）
+- **规范固化：今后发布 tag 必须纯语义版本号（vX.Y.Z），描述信息写 release body，不进 tag**
+
+### 验证
+- ✅ 元数据 JSON：tag_name=v0.2.1，assets 含两个二进制
+- ✅ 版本比较链路（本地 0.2.0 < 远端 0.2.1 成立，passwall 应能检测到）
+- 🔄 待用户软路由实测点更新
+
 ## [2026-08-20 03:05] - 会话死亡讣告机制（修复 WebRTC 多线程上传带宽暴跌）
 
 ### 改动前总结
