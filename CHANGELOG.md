@@ -2,6 +2,20 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-19 19:57] - 文档：Docker 日志限制参数（--log-opt）
+
+### 改动前总结
+用户询问 Docker 容器 / CLI 日志是否有大小限制与回收机制。核查结论：程序不写日志文件，JSON 日志一律输出 stdout；CLI 无轮转无限制（取决于终端/journald）；Docker 默认 json-file 驱动无上限且不回收，长跑会无限膨胀。用户要求把 `--log-opt` 参数写进文档示例。
+
+### 改动后总结
+- **README.md**：服务端/客户端两个 `docker run` 示例均新增 `--log-driver json-file --log-opt max-size=10m --log-opt max-file=3`（总上限约 30MB），并附注释说明用途与 DOCKER.md 章节索引
+- **DOCKER.md**：四个 `docker run` 示例（服务端环境变量/配置文件、客户端环境变量/配置文件）统一加日志限制参数；新增 **六、日志管理** 章节：默认 json-file 无上限的隐患、推荐参数含义、`--log-opt` 仅创建时生效需删重建、`--log-driver none`/daemon.json 全局限制/手动清理三种可选方案、原生+systemd(journald) 场景说明、日志量评估
+- 纯文档修改，无代码变更，无需测试
+
+### 涉及文件
+- README.md（2 处 docker run 示例）
+- DOCKER.md（4 处 docker run 示例 + 新增第六章）
+
 ## [2026-08-19 17:55] - passwall 对接：静态二进制发布 + 域名解析 + SOCKS5 认证修复
 
 ### 改动前总结

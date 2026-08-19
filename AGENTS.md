@@ -10,6 +10,7 @@
 
 ---
 开发提示如下：
+- [2026-08-19 19:57] **Docker 日志管理（--log-opt）**：srt-vpn 程序不写日志文件，JSON 日志全部输出 stdout（logging.rs），容器日志大小由 Docker 驱动决定。**Docker 默认 json-file 驱动无上限且不回收**，长跑会无限膨胀（几个月可达几十 GB）。所有 `docker run` 示例已统一加 `--log-driver json-file --log-opt max-size=10m --log-opt max-file=3`（总上限约 30MB，详见 DOCKER.md 第六章）。要点：⚠️ `--log-opt` 只在**创建容器时**生效，已存在容器需删重建；可选 `--log-driver none` 完全丢弃；daemon.json `log-opts` 可全局限制；systemd 部署走 journald 自动轮转（SystemMaxUse≈4G，`journalctl --vacuum-size` 手动清）；默认 INFO 级别日志量很小（只心跳/建连/断连），DEBUG/TRACE 才高频。
 - [2026-08-18 10:30] 项目正式启动：SRT-VPN（基于 SRT 协议的 VPN）。libsrt 1.5.6 源码在 srt-1.5.6/（静态编译+FFI），Rust 项目在根目录。完整 24 项架构决策见 PROJECT_PLAN.md 第二节，任何后续开发先查该表避免偏离共识。
 - [2026-08-18 10:30] 隧道协议要点：单 SRT 连接 + 多路复用层（帧头 v1，u16 会话 ID，256 上限）；单层可靠模型（重传交给 SRT，复用层只做分帧/调度/窗口流控）；所有帧（含 ACK）统一封装为 188B MPEG-TS 包保持伪装一致；-m 服务端配置 UDP 可靠/尽力而为，握手协商。
 - [2026-08-18 10:30] 认证要点：SRT passphrase 原生加密（aes-128 默认）+ streamid 静态令牌 + 双 HMAC 挑战-应答（30s 时间窗防重放）。认证失败 P1 断开+告警，P2 加黑名单。

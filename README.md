@@ -20,8 +20,12 @@
 SRT_MODE=server SRT_PASSPHRASE=你的强密码 SRT_LISTEN=0.0.0.0:9000 ./target/release/srt-vpn
 
 # Docker（--net=host 暴露 SRT UDP；-e 环境变量指定参数，无需挂载配置文件）
+# 日志限制：--log-opt max-size=10m max-file=3 防止 json-file 日志无限增长（详见 DOCKER.md 六、日志管理）
 docker run -d --name srt-vpn-server --restart=unless-stopped \
   --network=host \
+  --log-driver json-file \
+  --log-opt max-size=10m \
+  --log-opt max-file=3 \
   -e SRT_MODE=server \
   -e SRT_PASSPHRASE=你的强密码 \
   -e SRT_LISTEN=0.0.0.0:9000 \
@@ -39,8 +43,12 @@ SRT_MODE=client SRT_PASSPHRASE=你的强密码 SRT_SERVER=服务器IP:9000 \
   ./target/release/srt-vpn
 
 # Docker（映射 SOCKS5 端口；-e 环境变量指定参数）
+# 日志限制：--log-opt max-size=10m max-file=3 防止 json-file 日志无限增长（详见 DOCKER.md 六、日志管理）
 docker run -d --name srt-vpn-client --restart=unless-stopped \
   -p 1080:1080 \
+  --log-driver json-file \
+  --log-opt max-size=10m \
+  --log-opt max-file=3 \
   -e SRT_MODE=client \
   -e SRT_PASSPHRASE=你的强密码 \
   -e SRT_SERVER=服务器IP:9000 \
