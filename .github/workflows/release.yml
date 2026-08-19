@@ -173,11 +173,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: 下载所有架构二进制
+      - name: 下载二进制备件
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+          # 只下载两个静态二进制 artifact（避免混入 docker build 的
+          # dockerbuild 合成 artifact——其 blob 节点故障会导致 "download failed after 5 retries"）
+          pattern: srt-vpn-linux-*
 
       - name: 确定 Release tag
         id: reltag
