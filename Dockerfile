@@ -18,10 +18,13 @@ FROM rust:1.97-alpine AS builder
 # libsrt 是 C++，需要 g++；Rust 链接 libstdc++
 # linux-headers：libsrt 源码 srtcore/socketconfig.h 包含 <linux/if.h>，
 #                缺省会报 "linux/if.h: No such file or directory"（2026-08-19 CI 踩坑）
+# openssl-libs-static：Rust musl 默认 -Wl,-Bstatic 链接 OpenSSL，必须用静态库；
+#                只有 openssl-dev（.so stub）会报 "cannot find -lcrypto"（2026-08-19 CI 踩坑）
 RUN apk add --no-cache \
     build-base \
     cmake \
     openssl-dev \
+    openssl-libs-static \
     linux-headers \
     pkgconfig
 

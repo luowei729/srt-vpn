@@ -59,7 +59,9 @@ fn main() {
     println!("cargo:rustc-link-lib=stdc++");
     // OpenSSL 库路径：Alpine/musl 下 ld 默认搜索路径不含 /usr/lib，
     // 必须显式给出 -L 路径，否则链接报 "cannot find -lcrypto/-lssl"（2026-08-19 CI 踩坑）
-    for dir in openssl_lib_dirs() {
+    let openssl_dirs = openssl_lib_dirs();
+    eprintln!("[build.rs] openssl_lib_dirs = {:?}", openssl_dirs);
+    for dir in &openssl_dirs {
         println!("cargo:rustc-link-search=native={}", dir.display());
     }
     println!("cargo:rustc-link-lib=crypto");
@@ -79,7 +81,8 @@ fn main() {
 ///
 /// 优先级：
 /// 1. pkg-config --variable=libdir openssl（最可靠，Alpine/Debian 均支持）
-/// 2. 常见默认路径回退（/usr/lib、发行版多架构目录、/usr/local/lib）
+/// 2. 常见默认路径（/usr/lib 无条件加入——Alpine 的 openssl-dev 库就在 /usr/lib，
+///    且 ld 在 musl 下默认不搜 /usr/lib，必须显式 -L）
 ///
 /// 设计原因：不同 Linux 发行版/容器环境中 libcrypto.so 位置不同：
 /// - Ubuntu/Debian：/usr/lib/x86_64-linux-gnu（或 aarch64-linux-gnu）
@@ -102,7 +105,8 @@ fn openssl_lib_dirs() -> Vec<std::path::PathBuf> {
         }
     }
 
-    // 2. 常见路径回退（验证目录下确实有 libcrypto 才加入，避免无效 -L）
+    // 2. 常见路径（无条件加入 /usr/lib：Alpine/musl 下 ld 不默认搜它，
+    //    且 openssl-dev 的 .so stub 就在这里。加 -L 即使目录无目标库也无害）
     const CANDIDATES: [&str; 6] = [
         "/usr/lib",
         "/usr/lib/x86_64-linux-gnu",
@@ -113,9 +117,7 @@ fn openssl_lib_dirs() -> Vec<std::path::PathBuf> {
     ];
     for c in CANDIDATES {
         let p = std::path::PathBuf::from(c);
-        if (p.join("libcrypto.so").exists() || p.join("libcrypto.a").exists())
-            && !dirs.contains(&p)
-        {
+        if !dirs.contains(&p) {
             dirs.push(p);
         }
     }
