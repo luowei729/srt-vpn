@@ -40,4 +40,5 @@
   - 阿里云 47.102.196.219：srv_cn 服务端(9100) + 上传接收(9800) 已停（保留编译产物 /root/srt-vpn-src）
   - Docker 测试流程：`docker build -t srt-vpn:local .` 后 `--net=host -v <config>:/app/configs/x.conf:ro -c /app/configs/x.conf`
   - 云端 Docker 镜像：GitHub Actions 手动触发 push GHCR 后拉取运行
-- [2026-08-19 22:30] **P1 完成 + UDP 代理 + 稳定性加固**：① SOCKS5 UDP ASSOCIATE 已实现（socks5.rs start_udp_associate：中继 socket + 首包定目标 + Open(proto=1)），服务器端 start_udp_forward（UDP socket 双向）；单 UDP ASSOCIATE 固定首个目标（DNS/QUIC 场景），多目标后续扩展；② 服务器稳定性加固：TcpStream::connect 10s 超时 + 转发空闲 300s 看门狗（防此前卡死/泄漏根因）；③ PROJECT_PLAN P1 全部标记完成。UDP 隧道回环已验证（发/收 ECHO 双向正常）。
+- [2026-08-19 22:30] **P1 完成 + UDP 代理 + 稳定性加固**：① SOCKS5 UDP ASSOCIATE 已实现（socks5.rs start_udp_associate：中继 socket + 首包定目标 + Open(proto=1)），服务器端 start_udp_forward（UDP socket 双向）；② 服务器稳定性加固：TcpStream::connect 10s 超时 + 转发空闲 300s 看门狗（防此前卡死/泄漏根因）；③ PROJECT_PLAN P1 全部标记完成。UDP 隧道回环已验证（发/收 ECHO 双向正常）。
+- [2026-08-19 22:45] **UDP 代理多目标版**：单隧道会话 + 每帧内嵌地址头 `[host_len(1B)+host+port(2B BE)][payload]`；服务器共享 UdpSocket 按帧内目标 send_to、recv_from 源地址回传；客户端每数据报解析 SOCKS5 UDP 头目标封装地址头发送、响应解析源回传。约束 payload+头≤1301B。验证多目标(9900/9901)各自正确响应。**多目标 UDP 协议要点**：UDP Data 帧负载=地址头+UDP payload（区别于 TCP 纯 payload）。

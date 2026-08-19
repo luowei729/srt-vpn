@@ -2,6 +2,34 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-19 22:45] - UDP 代理升级为多目标（数据报内嵌地址头）
+
+### 改动前总结
+UDP ASSOCIATE 固定单目标（Open 确定目标后所有数据报发同目标），无法支持
+DNS/QUIC/游戏等多目标并发场景（每个数据报不同目标端口）。
+
+### 改动后总结
+**设计：单隧道会话 + 每帧内嵌目标地址头**
+- 隧道 UDP Data 帧负载格式：`[host_len(1B) + host + port(2B BE)][UDP payload]`
+- **forward.rs** `start_udp_forward` 改为多目标：
+  - 共享 UdpSocket（不 connect），按帧内地址头 `send_to` 各目标
+  - `recv_from` 得到源地址 → 封装 `[源地址头][payload]` 回传
+  - 新增 `parse_udp_addr_header` / `encode_udp_addr_header` 编解码
+- **socks5.rs** `start_udp_associate` 单会话多目标：
+  - 每客户端 UDP 数据报（SOCKS5 UDP 头）解析目标 → 封装地址头 → 隧道
+  - 隧道响应解析源地址头 → 构造 SOCKS5 UDP 数据报（ATYP 视 IPv4/域名）→ 回客户端中继
+
+**约束**：UDP payload + 地址头 ≤ FRAME_DATA_MAX(1301B)。大 UDP 数据报重组为后续扩展。
+
+### 验证
+- ✅ 同一 UDP ASSOCIATE 下多目标（9900/9901）各自独立收到正确响应
+- ✅ 单测 11 通过、release 编译零警告
+- 移除未使用的 tun2 依赖（暂不开发 TUN）
+
+### 涉及文件
+- src/server/forward.rs
+- src/client/socks5.rs
+
 ## [2026-08-19 22:30] - UDP 代理实现 + 服务器稳定性加固 + P1 完成标记
 
 ### 改动前总结
