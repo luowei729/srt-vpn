@@ -62,7 +62,8 @@ RUN mkdir -p /app/configs && chown -R srtvpn:srtvpn /app
 
 USER srtvpn
 
-# 默认入口：查看帮助；实际使用用 -e SRT_* 环境变量配置（无需挂载配置文件）
+# 默认入口：无参数直接运行（纯环境变量配置，见下方示例）
+# 查看帮助：docker run srt-vpn:latest -h
 # 示例（服务端）：
 #   docker run -d --net=host \
 #     -e SRT_MODE=server \
@@ -77,4 +78,5 @@ USER srtvpn
 #     -e SRT_SOCKS5_LISTEN=0.0.0.0:1080 \
 #     srt-vpn:latest
 ENTRYPOINT ["/usr/local/bin/srt-vpn"]
-CMD ["--help"]
+# CMD 为空：docker run 不带命令时直接跑主程序（纯环境变量启动）
+CMD []
