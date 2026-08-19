@@ -1,5 +1,12 @@
 # ============================================================
-# 手动发布版本：workflow_dispatch 触发 → 编译 amd64/arm64 镜像 → 推送 GHCR
+# 手动发布版本：workflow_dispatch 触发 → 并行编译 amd64/arm64 镜像 → 推送 GHCR
+#
+# 并行策略（2026-08-19 优化）：
+# - amd64：ubuntu-latest（x86_64 原生编译）
+# - arm64：ubuntu-24.04-arm（GitHub 原生 ARM runner，无需 QEMU 交叉模拟）
+#   → 两个 job 并行原生编译各自架构，比 buildx 单 job 双架构（QEMU 模拟）
+#     快数倍（libsrt C++ 源码编译量大，QEMU 模拟 arm64 极慢）
+# - 最后 merge job 用 docker buildx imagetools create 合并多架构 manifest
 #
 # 用法：GitHub 仓库 Actions 页面 → "Build & Publish Docker Image" →
 #       Run workflow（可填版本号 tag）
@@ -15,9 +22,20 @@ on:
         default: ''
 
 jobs:
-  build-and-publish:
-    name: Build & Publish (amd64 + arm64)
-    runs-on: ubuntu-latest
+  # 双架构并行构建（各用原生 runner，互不阻塞）
+  build:
+    name: Build ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm   # GitHub 原生 ARM runner（公开仓库可用）
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
@@ -40,7 +58,7 @@ jobs:
             echo "TAG=$(git describe --tags --always 2>/dev/null || echo latest)" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 设置 Docker Buildx（支持多架构）
+      - name: 设置 Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: 登录 GHCR
@@ -50,16 +68,60 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 构建并推送镜像（amd64 + arm64）
+      - name: 构建并推送单架构镜像（原生编译）
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          # 各 job 只构建自己的架构（原生 runner 直接编译，无 QEMU 模拟）
+          platforms: ${{ matrix.platform }}
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.TAG }}
-            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.TAG }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.version.outputs.TAG }}
             org.opencontainers.image.description=SRT-VPN - 基于 SRT 直播流协议的 VPN 隧道
+
+  # 合并多架构 manifest（等两个单架构 job 都成功后）
+  merge:
+    name: Merge Multi-Arch Manifest
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: 设置 Docker Buildx（imagetools 需要）
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 确定版本号（与 build job 保持一致）
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "TAG=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "TAG=$(git describe --tags --always 2>/dev/null || echo latest)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 合并多架构 manifest 并打 latest
+        run: |
+          IMAGE="ghcr.io/${{ github.repository }}"
+          TAG="${{ steps.version.outputs.TAG }}"
+          # 用 imagetools 把两个单架构镜像合并为多架构 manifest（无需本地拉取）
+          docker buildx imagetools create \
+            -t "$IMAGE:$TAG" \
+            "$IMAGE:$TAG-amd64" \
+            "$IMAGE:$TAG-arm64"
+          # latest 也指向多架构
+          docker buildx imagetools create \
+            -t "$IMAGE:latest" \
+            "$IMAGE:$TAG-amd64" \
+            "$IMAGE:$TAG-arm64"

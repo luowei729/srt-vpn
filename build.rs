@@ -57,6 +57,11 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", build_dir.display());
     println!("cargo:rustc-link-lib=static=srt");
     println!("cargo:rustc-link-lib=stdc++");
+    // OpenSSL 库路径：Alpine/musl 下 ld 默认搜索路径不含 /usr/lib，
+    // 必须显式给出 -L 路径，否则链接报 "cannot find -lcrypto/-lssl"（2026-08-19 CI 踩坑）
+    for dir in openssl_lib_dirs() {
+        println!("cargo:rustc-link-search=native={}", dir.display());
+    }
     println!("cargo:rustc-link-lib=crypto");
     println!("cargo:rustc-link-lib=ssl");
     // 注意：Alpine/musl 中 pthread 是 libc 内置，无需（也不能）单独链接；
@@ -68,6 +73,53 @@ fn main() {
 
     // 6. 让 cargo 感知源码变化（源码改动时自动触发重编译）
     println!("cargo:rerun-if-changed={}", srt_src.display());
+}
+
+/// 定位 OpenSSL 库目录（libcrypto/libssl 所在），返回所有可能目录
+///
+/// 优先级：
+/// 1. pkg-config --variable=libdir openssl（最可靠，Alpine/Debian 均支持）
+/// 2. 常见默认路径回退（/usr/lib、发行版多架构目录、/usr/local/lib）
+///
+/// 设计原因：不同 Linux 发行版/容器环境中 libcrypto.so 位置不同：
+/// - Ubuntu/Debian：/usr/lib/x86_64-linux-gnu（或 aarch64-linux-gnu）
+/// - Alpine：/usr/lib
+/// - 手动安装：/usr/local/lib
+/// 统一探测保证跨环境可链接。
+fn openssl_lib_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+
+    // 1. pkg-config 精确路径（优先）
+    if let Ok(out) = Command::new("pkg-config")
+        .args(["--variable=libdir", "openssl"])
+        .output()
+    {
+        if out.status.success() {
+            let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !dir.is_empty() {
+                dirs.push(std::path::PathBuf::from(dir));
+            }
+        }
+    }
+
+    // 2. 常见路径回退（验证目录下确实有 libcrypto 才加入，避免无效 -L）
+    const CANDIDATES: [&str; 6] = [
+        "/usr/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+        "/usr/local/lib",
+        "/usr/lib64",
+        "/lib",
+    ];
+    for c in CANDIDATES {
+        let p = std::path::PathBuf::from(c);
+        if (p.join("libcrypto.so").exists() || p.join("libcrypto.a").exists())
+            && !dirs.contains(&p)
+        {
+            dirs.push(p);
+        }
+    }
+    dirs
 }
 
 /// 判断当前编译目标是否需要显式链接 libpthread
