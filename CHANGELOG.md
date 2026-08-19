@@ -2,6 +2,38 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-20 03:05] - 会话死亡讣告机制（修复 WebRTC 多线程上传带宽暴跌）
+
+### 改动前总结
+用户报告：speedtest.net 多线程上传带宽极低，单线程正常；仅 Windows Chrome 开 WebRTC 时复现（本机 Ubuntu 正常）；换 hy1 协议无此问题 -> 锁定 srt-vpn 隧道实现。
+
+**新加坡日志实锤根因**（故障时段 UTC 18:30-18:37，每分钟 61-176 个 TCP 会话建立）：
+- `数据帧无法路由（转发会话不存在）` 刷 2039 次/分钟，`session=157` 单会话被灌 1297 帧（≈1.7MB）
+- 同期大量 `Connection reset by peer`（测速服务器 RST 短连接）
+
+**故障链**：WebRTC 高并发短连接 -> 测速服务器对部分连接 RST -> 服务端转发任务遇错 `return Err` **不发 Close 帧** -> 客户端不知会话已死，继续向僵尸会话灌上传数据 -> 帧全被丢且仍占满 SRT 隧道带宽 -> 真实上传被挤占 -> 带宽暴跌。**下载不受影响**：服务端任务死了就没有下行流量产生（推送方决定流量）；本机 Ubuntu 正常是 Chrome WebRTC 不可用回退 HTTP 上传。
+
+### 改动后总结
+双向讣告 + 快速收敛（4 文件）：
+1. **forward.rs**：`handle_open_with_rx` 外层统一兜底发 Close 帧（新增 `notify_session_closed`，覆盖 Open 解析失败/连接失败/读失败/RST/看门狗**全部**退出路径）；子函数内正常路径的重复发送删除
+2. **listener.rs**：`无法路由` 分支向客户端**回发 Rst 帧**（客户端收到立即停止发送并释放会话）
+3. **dispatch.rs**：`dispatch_frame` 新增 Rst 帧处理（投递 Close 事件到会话通道）+ `DispatchAction::Rst`；两端 recv 循环匹配；TunnelSession 新增 `conn_ref()`
+4. **proxy.rs**：客户端转发循环抽取 `forward_loop`，讣告在调用方统一收口（对称修复：客户端异常退出也通知服务端，不再空挂 300s）
+
+### 验证
+- ✅ RST 高并发复现（8 worker 灌向被 RST 的目标）：7/8 被 Rst 提前掐断，仅单批 in-flight 损失（823 帧同一毫秒到达，属 send_data_batch 32KB 批量分片的已排队帧，不可避免），毫秒级收敛；修复前为分钟级持续灌送
+- ✅ 回归：8 并发 × 8MB 正常上传 8/8 md5 一致（无讣告逻辑误伤）
+- ✅ 25 单测全过，release 零警告
+- 🔄 待公网实测：Windows Chrome 开 WebRTC 跑 speedtest 多线程上传（用户配合）
+
+### 部署
+- Docker 镜像：`ghcr.io/luowei729/srt-vpn:rst-notify-20260820`（新加坡 srtvpn-sg 已部署，含日志轮转 --log-opt）
+- **passwall 组件二进制已同步发布**：Release `vrst-notify-20260820`（Latest）含 `srt-vpn-linux-amd64/arm64`（10.9/9.8MB 纯静态）+ `srt-vpn-release-api.json` 元数据 -> 软路由 passwall 可直接点更新
+- 注意：release tag 带 `v` 前缀（version 入参规范化规则），passwall 组件版本比对读 latest tag_name，无影响
+
+### 涉及文件
+- src/server/forward.rs、src/server/listener.rs、src/tunnel/dispatch.rs、src/client/proxy.rs、src/client/mod.rs
+
 ## [2026-08-19 19:57] - 文档：Docker 日志限制参数（--log-opt）
 
 ### 改动前总结
