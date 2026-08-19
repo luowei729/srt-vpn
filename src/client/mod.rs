@@ -88,7 +88,12 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
             // 断线重连：按 reconnect 配置重试上限
             attempt += 1;
             if max_retries >= 0 && attempt > max_retries as u64 {
-                return Err(format!("SRT 连接失败（已达最大重试 {max_retries} 次）"));
+                // 2026-08-20：认证类失败重试耗尽时提示检查系统时间
+                // （软路由时钟快 51s 实测案例：SRT 握手正常但挑战-应答永远失败，
+                //  且 NTP 走隧道时形成死循环，用户无从定位）
+                return Err(format!(
+                    "SRT 连接失败（已达最大重试 {max_retries} 次）。若服务端日志报\"时钟\"，请先校准本机系统时间（NTP）再启动"
+                ));
             }
             tracing::warn!(attempt, interval, "隧道断开，准备重连");
             tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
@@ -326,27 +331,45 @@ async fn run_recv_inner(
 
 /// 处理挑战-应答：解析服务器下发的 nonce，生成并发送 RESPONSE
 ///
-/// 服务器 CHALLENGE 载荷格式：`nonce=<hex>`
+/// 服务器 CHALLENGE 载荷格式：`nonce=<hex>,ts=<unix秒>`（ts 为 2026-08-20 对时握手新增，
+/// 旧服务端无 ts 字段）
 /// 客户端 RESPONSE 载荷格式：`timestamp=<unix秒>,resp=<hex hmac>`
+///
+/// 2026-08-20 对时握手：优先用**服务端下发的 ts** 计算 HMAC（本地时钟任意漂移
+/// 都不影响认证）；旧服务端（无 ts）回退本地时间戳（90s 窗口兜底）。
 fn handle_challenge(
     conn: &SrtConnection,
     mux_enc: &MuxEncoder,
     frame: &crate::tunnel::multiplex::Frame,
     passphrase: &str,
 ) {
-    // 1. 解析 nonce（载荷格式：nonce=<hex>）
+    // 1. 解析载荷字段（nonce 必有；ts 为新服务端可选字段）
     let payload_str = String::from_utf8_lossy(&frame.payload);
-    let nonce = payload_str.strip_prefix("nonce=").map(|s| s.to_string());
+    let mut nonce: Option<String> = None;
+    let mut server_ts: Option<i64> = None;
+    for part in payload_str.split(',') {
+        if let Some(v) = part.strip_prefix("nonce=") {
+            if !v.is_empty() {
+                nonce = Some(v.to_string());
+            }
+        } else if let Some(v) = part.strip_prefix("ts=") {
+            server_ts = v.parse().ok();
+        }
+    }
     let nonce = match nonce {
-        Some(n) if !n.is_empty() => n,
-        _ => {
+        Some(n) => n,
+        None => {
             tracing::warn!(payload = %payload_str, "CHALLENGE 载荷格式无效");
             return;
         }
     };
 
-    // 2. 生成应答（时间戳 + HMAC-SHA256(passphrase, nonce + 时间戳)）
-    let timestamp = crate::auth::challenge::current_timestamp();
+    // 2. 生成应答：时间戳来源优先级 = 服务端 ts（对时握手）> 本地时间（旧服务端兼容）
+    //    用服务端 ts 时本地时钟完全无关紧要（根治软路由时钟漂移 51s 类故障）
+    let (timestamp, clock_src) = match server_ts {
+        Some(ts) => (ts, "server"),
+        None => (crate::auth::challenge::current_timestamp(), "local"),
+    };
     let resp = crate::auth::challenge::compute_response(passphrase, &nonce, timestamp);
 
     // 3. 构造 RESPONSE 帧并直接发送（无 TS 壳，直接作为 SRT 消息）
@@ -360,7 +383,7 @@ fn handle_challenge(
     if let Err(e) = conn.send(frame) {
         tracing::warn!(error = %e, "发送 RESPONSE 失败");
     } else {
-        tracing::info!("挑战-应答 RESPONSE 已发送");
+        tracing::info!(clock_src = clock_src, "挑战-应答 RESPONSE 已发送");
     }
 }
 

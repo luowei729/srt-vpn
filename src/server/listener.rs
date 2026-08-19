@@ -153,13 +153,18 @@ async fn authenticate(
     tracing::info!("streamid 静态令牌校验通过");
 
     // 2. 生成 nonce 并下发 CHALLENGE 帧
+    // 2026-08-20 对时握手（根治客户端时钟漂移）：CHALLENGE 附带服务端时间戳 ts，
+    // 客户端（v0.2.2+）直接用它计算 HMAC 应答 -- 应答校验与客户端本地时钟完全无关。
+    // 背景：软路由时钟快 51s 导致全体认证失败，且 NTP 走隧道时形成死循环。
+    // 旧客户端（<0.2.2）仍回本地时间戳，服务端走兼容路径（90s 窗口兜底）。
     let nonce = crate::auth::challenge::generate_nonce();
-    let challenge_payload = format!("nonce={nonce}");
+    let server_ts = crate::auth::challenge::now_unix_secs();
+    let challenge_payload = format!("nonce={nonce},ts={server_ts}");
     let mux = MuxEncoder::new(true);
     let frame = mux.encode_frame(FrameType::Challenge, 0, 0, challenge_payload.as_bytes());
     // 2026-08-19：移除 TS 壳，直接作为 SRT 消息发送
     conn.send(frame).map_err(|e| format!("发送 CHALLENGE 失败: {e}"))?;
-    tracing::debug!("CHALLENGE 已下发");
+    tracing::debug!(ts = server_ts, "CHALLENGE 已下发（含服务端时间戳）");
 
     // 3. 等待 RESPONSE（带超时 10s）
     // S3 修复（2026-08-19）：非 Response 帧（Open/Data 等客户端提前发来的业务帧）
@@ -214,13 +219,27 @@ async fn authenticate(
         _ => return Err("RESPONSE 格式无效".to_string()),
     };
 
-    // 4. 校验应答（HMAC + 时间窗 30s）
-    let ok = crate::auth::challenge::verify_response(passphrase, &nonce, ts, &resp)
-        .map_err(|e| format!("校验 RESPONSE 失败: {e}"))?;
+    // 4. 校验应答（2026-08-20 对时握手：双路径兼容）
+    // 路径 A（新客户端，v0.2.2+）：客户端用 CHALLENGE 里我们下发的 server_ts 计算
+    //        HMAC，直接按该 ts 重算比对（与客户端本地时钟无关，往返耗时秒级通过）。
+    // 路径 B（旧客户端）：应答带客户端本地时间戳，按 90s 窗口校验（兼容兜底）。
+    let (ok, clock_delta) = crate::auth::challenge::verify_response_dual(
+        passphrase, &nonce, server_ts, ts, &resp,
+    )
+    .map_err(|e| format!("校验 RESPONSE 失败: {e}"))?;
     if !ok {
-        return Err("挑战-应答校验失败（时间窗或 HMAC 不匹配）".to_string());
+        if clock_delta.abs() > crate::auth::challenge::AUTH_TIME_WINDOW_SECS {
+            let direction = if clock_delta > 0 { "慢" } else { "快" };
+            return Err(format!(
+                "挑战-应答校验失败：客户端时钟{direction} {}s（超出 ±{}s 窗口），请校准系统时间（NTP）或升级客户端到 v0.2.2+",
+                clock_delta.abs(),
+                crate::auth::challenge::AUTH_TIME_WINDOW_SECS
+            ));
+        }
+        return Err("挑战-应答校验失败（HMAC 不匹配，passphrase 两端不一致？）".to_string());
     }
-    tracing::info!(buffered = buffered_frames.len(), "挑战-应答认证通过");
+    // 认证通过时顺带输出客户端时钟偏差（对时诊断，路径 A 恒为 ±往返耗时）
+    tracing::info!(buffered = buffered_frames.len(), client_clock_delta_s = clock_delta, "挑战-应答认证通过");
     Ok(buffered_frames)
 }
 
