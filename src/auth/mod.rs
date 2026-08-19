@@ -24,17 +24,17 @@ pub fn hash_password(plain: &str) -> Result<String, String> {
 }
 
 /// 校验明文密码是否匹配 argon2 哈希
+/// 返回 Ok(true)=匹配 / Ok(false)=不匹配 / Err=哈希格式解析失败等错误
 /// （P1 后半段接入 SOCKS5 多用户认证时启用）
+/// 2026-08-19 审查修复：原实现 .map_err 链混乱，校验不匹配被误包装成 Err(false 字符串)。
 #[allow(dead_code)]
 pub fn verify_password(plain: &str, hash: &str) -> Result<bool, String> {
     let parsed = PasswordHash::new(hash).map_err(|e| format!("解析哈希失败: {e}"))?;
-    Argon2::default()
-        .verify_password(plain.as_bytes(), &parsed)
-        .map(|_| true)
-        .map_err(|_| false)
-        .map_err(|e| e.to_string())
-        .map(|v| v)
-        .map_err(|e| format!("argon2 校验失败: {e}"))
+    // Argon2 校验：Ok=匹配，Err(PasswordError)=不匹配（这是预期结果，不是系统错误）
+    match Argon2::default().verify_password(plain.as_bytes(), &parsed) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false), // 密码不匹配 → 返回 Ok(false)，由调用方决定是否拒绝
+    }
 }
 
 /// 从 passphrase 派生 streamid 静态令牌

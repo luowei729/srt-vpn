@@ -22,6 +22,19 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
     // 解析服务器地址（host:port）
     let peer_addr = parse_addr(&server_addr)?;
 
+    // 0. 启动指标服务（如果配置了端口）
+    // 2026-08-19 审查修复（F1）：此前只有服务端启动了 metrics HTTP，
+    // 客户端 metrics_port 配置被静默忽略。
+    if let Some(port) = cfg.metrics_port {
+        let m = crate::metrics::metrics();
+        m.active_connections.store(0, std::sync::atomic::Ordering::Relaxed);
+        tokio::spawn(async move {
+            if let Err(e) = crate::metrics::Metrics::serve_http(port).await {
+                tracing::warn!(error = %e, "指标服务异常");
+            }
+        });
+    }
+
     // 1. 构建 SRT 连接配置（客户端：连接模式 + streamid 令牌）
     // streamid 设计（决策 Q11）：
     // - 配置里的 streamid 是"资源名"部分（如 live/srtvpn）
@@ -39,7 +52,7 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
     let srt_cfg = SrtConfig {
         peer_addr,
         passphrase: cfg.passphrase.clone(),
-        pbkeylen: crypto_to_pbkeylen(&cfg.crypto),
+        pbkeylen: crate::config::crypto_to_pbkeylen(&cfg.crypto),
         streamid: Some(streamid),
         rcv_latency: 1000,
         reliable: true, // 客户端跟随服务端协商，默认可靠
@@ -48,32 +61,129 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
         is_server: false,
     };
 
-    // 2. 建立 SRT 连接（含自动重连逻辑）
-    tracing::info!(server = %server_addr, "客户端启动，正在连接服务器...");
-    let conn = connect_with_retry(&srt_cfg, cfg).await?;
+    // 2. 重连循环：建立连接 → 起 SOCKS5 服务 + 接收循环 + 心跳 → 断开后按配置重试
+    // 2026-08-19 审查修复（B3 整链自动重连）：
+    // 此前 connect_with_retry 只在"初始建连失败"时重试；运行中 SRT 断开后 recv_loop
+    // 退出、主流程返回错误、进程退出，违背设计决策 Q16"5s 心跳 + 客户端自动重连"。
+    // 现把"建连 + SOCKS5 服务 + 接收循环 + 主动心跳"整体放入重连循环：
+    // 任一环节（尤其运行中断线）触发重建整个隧道。
+    let interval = cfg.reconnect.as_ref().map(|r| r.interval_secs).unwrap_or(5);
+    let max_retries = cfg.reconnect.as_ref().map(|r| r.max_retries).unwrap_or(10);
+    let mut attempt = 0u64;
+    let mut first_connect = true;
 
-    // 3. 构建隧道组件（复用编码器 + 会话注册表）
-    let mux_enc = Arc::new(MuxEncoder::new(true));
-    let registry = crate::tunnel::dispatch::SessionRegistry::new();
-
-    // 4. 启动 SOCKS5 服务（监听 + 认证 + 会话处理）
+    // SOCKS5 监听地址与凭据（每次重连复用同一监听端口）
     let socks5_cfg = cfg.socks5.clone().unwrap_or_default();
     let listen_addr = args
         .socks5_listen
         .clone()
         .unwrap_or(socks5_cfg.listen.clone());
-    tracing::info!(listen = %listen_addr, "SOCKS5 服务启动");
 
-    // 5. 启动隧道读循环（SRT 收 → 分发到会话）
-    let recv_conn = Arc::new(conn);
-    let passphrase = cfg.passphrase.clone();
-    let recv_registry = registry.clone();
-    let recv_task = tokio::spawn(recv_loop(recv_conn.clone(), mux_enc.clone(), passphrase, recv_registry));
+    loop {
+        let conn = if first_connect {
+            // 首次建连：调用 connect_with_retry（内部会按 reconnect 配置重试直到成功或达上限）
+            first_connect = false;
+            connect_with_retry(&srt_cfg, cfg).await?
+        } else {
+            // 断线重连：按 reconnect 配置重试上限
+            attempt += 1;
+            if max_retries >= 0 && attempt > max_retries as u64 {
+                return Err(format!("SRT 连接失败（已达最大重试 {max_retries} 次）"));
+            }
+            tracing::warn!(attempt, interval, "隧道断开，准备重连");
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            match connect_once(&srt_cfg).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "重连 SRT 失败");
+                    continue;
+                }
+            }
+        };
 
-    // 6. 启动 SOCKS5 监听（阻塞直到退出）
-    let result = socks5::serve(&listen_addr, recv_conn, mux_enc, registry, socks5_cfg).await;
-    let _ = recv_task.await;
-    result
+        // S4 修复（2026-08-19）：连接成功进入服务态后清零重连计数。
+        // 旧实现 attempt 是"累计断线次数"，长期运行的客户端累计达 max_retries
+        // 后直接退出进程（瞬时抖动 10 次也不该退），违背 Q16 自动重连意图。
+        // 语义改为"连续失败次数"：成功即清零。
+        attempt = 0;
+        tracing::info!("SRT 连接建立成功");
+        let conn = Arc::new(conn);
+
+        // 重建隧道组件（每次重连都是全新连接，编码器/注册表一并重建）
+        let mux_enc = Arc::new(MuxEncoder::new(true));
+        let registry = crate::tunnel::dispatch::SessionRegistry::new();
+        let passphrase = cfg.passphrase.clone();
+
+        // 注册指标连接数（客户端侧也统计活跃连接）
+        let m = crate::metrics::metrics();
+        m.active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        m.total_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // 启动隧道接收循环（SRT 收 → 分发到会话）
+        // 断开信号：recv_loop 退出时置位 → serve 停止 accept → 重连循环接管（B3）
+        let (tunnel_closed_tx, tunnel_closed_rx) = tokio::sync::watch::channel(false);
+        let recv_conn = conn.clone();
+        let recv_mux = mux_enc.clone();
+        let recv_reg = registry.clone();
+        let recv_task = tokio::spawn(recv_loop(recv_conn, recv_mux, passphrase, recv_reg, tunnel_closed_tx));
+
+        // 启动主动心跳定时器（B4：按 heartbeat_secs 周期主动发心跳帧保活）
+        let hb_conn = conn.clone();
+        let hb_mux = mux_enc.clone();
+        let heartbeat_secs = cfg.heartbeat_secs.max(1);
+        let hb_task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(heartbeat_secs)).await;
+                let hb = hb_mux.encode_heartbeat();
+                if let Err(e) = hb_conn.send(hb) {
+                    tracing::warn!(error = %e, "心跳发送失败");
+                    break; // 连接不可用，退出心跳任务（由重连循环重建）
+                }
+            }
+        });
+
+        // 启动 SOCKS5 服务；运行中断开（serve 返回 Err）或监听失败 -> 按错误类型分流
+        // S2 修复（2026-08-19）：监听失败（"listen:" 前缀）= 致命配置错误，
+        // 重连一万次也解决不了端口被占 -> 直接退出进程让运维感知；
+        // 其余 Err（隧道断开/accept 失败）-> 走重连循环。
+        let serve_result = socks5::serve(&listen_addr, conn.clone(), mux_enc, registry, socks5_cfg.clone(), tunnel_closed_rx).await;
+        // 心跳任务收尾（连接已失效，abort 防泄漏）
+        hb_task.abort();
+        // 释放连接指标
+        m.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+        // S2：recv_task 不再无条件 await（旧实现监听失败时 recv_loop 不会退出，
+        // await 永久挂起卡死客户端）。abort 让其随连接失效终止；
+        // 断线场景下 recv_loop 本就即将退出，abort 无副作用。
+        recv_task.abort();
+
+        match serve_result {
+            Ok(()) => {
+                // SOCKS5 监听正常退出（理论上不会发生，防御处理）
+                return Ok(());
+            }
+            Err(e) => {
+                if e.starts_with("listen:") {
+                    // S2：监听失败 = 致命错误，直接退出（重连无意义）
+                    return Err(e);
+                }
+                // 运行中断开/accept 失败 -> 走重连（B3 整链自动重连）
+                tracing::warn!(error = %e, "SOCKS5 服务退出，进入重连");
+                continue;
+            }
+        }
+    }
+}
+
+/// 建立单次 SRT 连接（重连循环与初始建连共用）
+async fn connect_once(srt_cfg: &SrtConfig) -> Result<SrtConnection, String> {
+    // SRT 连接建立是同步阻塞（epoll 等待），用 spawn_blocking 避免阻塞 tokio worker
+    // 注意：SrtConfig 是 Clone，必须克隆进闭包（spawn_blocking 要求 'static）
+    let cfg = srt_cfg.clone();
+    tokio::task::spawn_blocking(move || SrtConnection::connect(&cfg))
+        .await
+        .map_err(|e| format!("连接任务异常: {e}"))?
+        .map_err(|e| format!("SRT 连接失败: {e}"))
 }
 
 /// 隧道接收循环：SRT 消息 → 复用帧分发
@@ -88,6 +198,22 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
 /// - 改用批量接收（recv_batch_async），一次处理多条消息，
 ///   避免逐帧 spawn_blocking 的高频调度开销
 async fn recv_loop(
+    conn: Arc<SrtConnection>,
+    mux_enc_local: Arc<MuxEncoder>,
+    passphrase: String,
+    registry: crate::tunnel::dispatch::SessionRegistry,
+    tunnel_closed_tx: tokio::sync::watch::Sender<bool>,
+) {
+    // 任务退出（隧道断开/异常）时置位断开信号，通知 SOCKS5 serve 停止 accept，
+    // 让重连循环接管（B3 重连缺陷修复）。
+    let result = run_recv_inner(conn, mux_enc_local, passphrase, registry).await;
+    tracing::info!("隧道接收循环退出，通知 SOCKS5 服务停止");
+    let _ = tunnel_closed_tx.send(true);
+    result
+}
+
+/// recv_loop 的实际处理体（分离信号通知，便于退出时统一置位）
+async fn run_recv_inner(
     conn: Arc<SrtConnection>,
     mux_enc_local: Arc<MuxEncoder>,
     passphrase: String,
@@ -113,12 +239,13 @@ async fn recv_loop(
                                 tracing::warn!(session = sid, "数据帧无法路由（会话不存在）");
                             }
                             crate::tunnel::dispatch::DispatchAction::Fin(sid) => {
-                                tracing::debug!(session = sid, "对端 FIN（半关闭），关闭会话");
-                                registry.remove(sid);
+                                // 对端 FIN（半关闭）：事件已投递到会话通道，
+                                // 转发任务收到 SessionEvent::Fin 后处理半关闭（shutdown 本地写侧）
+                                tracing::debug!(session = sid, "对端 FIN（半关闭）");
                             }
                             crate::tunnel::dispatch::DispatchAction::Closed(sid) => {
+                                // 对端 Close：事件已投递到会话通道，转发任务清理退出
                                 tracing::debug!(session = sid, "对端关闭会话");
-                                registry.remove(sid);
                             }
                             crate::tunnel::dispatch::DispatchAction::Open(_sid, _payload) => {
                                 tracing::warn!("客户端收到意外的 Open 帧");
@@ -129,10 +256,38 @@ async fn recv_loop(
                                         handle_challenge(&conn, &mux_enc_local, &frame, &passphrase);
                                     }
                                     crate::tunnel::FrameType::Heartbeat => {
-                                        tracing::trace!("收到心跳帧，回发");
-                                        let hb = mux_enc_local.encode_heartbeat();
-                                        if let Err(e) = conn.send(hb) {
-                                            tracing::warn!(error = %e, "回发心跳失败");
+                                        // M8 RTT 测量（2026-08-19）：对端回发的心跳载荷
+                                        // 带的是**本端**此前发出的时间戳（pong 语义），
+                                        // now - ts 即 RTT；若时间戳异常（时钟跳变/非本端
+                                        // 发起），视为对端主动心跳，回发 pong（保留对端
+                                        // 时间戳供对端测 RTT）。
+                                        let ts = crate::tunnel::multiplex::heartbeat_timestamp(&frame.payload);
+                                        let now_ms = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_millis() as i64)
+                                            .unwrap_or(0);
+                                        let mut is_pong = false;
+                                        if let Some(ts) = ts {
+                                            let rtt = now_ms - ts;
+                                            // RTT 合理性过滤：0~60s 内视为 pong（防时钟跳变误报）
+                                            if (0..60_000).contains(&rtt) {
+                                                tracing::debug!(rtt_ms = rtt, "心跳 pong（RTT）");
+                                                let m = crate::metrics::metrics();
+                                                m.last_rtt_ms.store(rtt.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
+                                                is_pong = true;
+                                            }
+                                        }
+                                        if !is_pong {
+                                            // 对端主动心跳：原样回发载荷（pong，保留对端时间戳）
+                                            let pong = mux_enc_local.encode_frame(
+                                                crate::tunnel::FrameType::Heartbeat,
+                                                0,
+                                                0,
+                                                &frame.payload,
+                                            );
+                                            if let Err(e) = conn.send(pong) {
+                                                tracing::warn!(error = %e, "回发心跳失败");
+                                            }
                                         }
                                     }
                                     crate::tunnel::FrameType::Ack => {
@@ -154,6 +309,13 @@ async fn recv_loop(
                 break;
             }
         }
+    }
+    // S3 配套修复（2026-08-19）：隧道断开时清空会话注册表（close_all drop 全部
+    // 通道 Sender），让所有本地转发任务 recv_event() 得到 None 自然退出。
+    // 旧实现只退出接收循环，转发任务永久挂在 recv_event 上（任务+会话 ID 泄漏）。
+    let closed = registry.close_all();
+    if closed > 0 {
+        tracing::info!(sessions = closed, "隧道断开，关闭全部本地会话任务");
     }
 }
 
@@ -198,12 +360,16 @@ fn handle_challenge(
 }
 
 /// 带重连的 SRT 连接（设计决策：5s 心跳 + 客户端自动重连）
+///
+/// 2026-08-19 审查修复（B3）：
+/// - SRT 连接建立是同步阻塞（内部 epoll 等待最多 5s + 200ms 就绪 sleep），
+///   改走 spawn_blocking（connect_once），避免阻塞 tokio worker 线程。
 async fn connect_with_retry(cfg: &SrtConfig, app_cfg: &Config) -> Result<SrtConnection, String> {
     let interval = app_cfg.reconnect.as_ref().map(|r| r.interval_secs).unwrap_or(5);
     let max_retries = app_cfg.reconnect.as_ref().map(|r| r.max_retries).unwrap_or(10);
     let mut attempt = 0u64;
     loop {
-        match SrtConnection::connect(cfg) {
+        match connect_once(cfg).await {
             Ok(conn) => {
                 tracing::info!(attempt, "SRT 连接建立成功");
                 return Ok(conn);
@@ -225,13 +391,4 @@ pub fn parse_addr(addr: &str) -> Result<std::net::SocketAddr, String> {
     addr.parse()
         .map_err(|_| format!("地址格式无效: {addr}（应为 host:port）"))
 }
-
-/// 加密强度字符串 → pbkeylen 字节数
-pub fn crypto_to_pbkeylen(crypto: &str) -> i32 {
-    match crypto {
-        "aes-128" => 16,
-        "aes-192" => 24,
-        "aes-256" => 32,
-        _ => 16,
-    }
-}
+// L 级清理（2026-08-19）：crypto_to_pbkeylen 重复实现移除，统一用 config::crypto_to_pbkeylen

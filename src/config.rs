@@ -87,12 +87,16 @@ pub struct Socks5Config {
     /// 监听地址（默认 127.0.0.1:1080，仅回环安全）
     #[serde(default = "default_socks5_listen")]
     pub listen: String,
-    /// 用户名（本地认证，可空）
+    /// 用户名（本地认证，可空；单用户模式）
     #[serde(default)]
     pub username: Option<String>,
-    /// 密码（本地认证，可空）
+    /// 密码（本地认证，可空；单用户模式）
     #[serde(default)]
     pub password: Option<String>,
+    /// 多用户表（H3 2026-08-19：多用户 argon2 认证，优先生效于单用户）
+    /// 条目：{username, password_hash}（password_hash 为 argon2 PHC 格式）
+    #[serde(default)]
+    pub users: Vec<crate::client::socks5::Socks5UserEntry>,
 }
 
 impl Default for Socks5Config {
@@ -101,6 +105,7 @@ impl Default for Socks5Config {
             listen: default_socks5_listen(),
             username: None,
             password: None,
+            users: Vec::new(),
         }
     }
 }
@@ -114,6 +119,19 @@ pub struct ReconnectConfig {
     /// 最大重试次数（默认 10，-1 无限）
     #[serde(default = "default_reconnect_max")]
     pub max_retries: i64,
+}
+
+// ===== 通用辅助 =====
+
+/// 加密强度字符串 -> pbkeylen 字节数（16/24/32 = aes-128/192/256）
+/// L 级修复（2026-08-19）：统一到 config.rs（此前 client/mod.rs 与
+/// server/mod.rs 各有一份重复实现，两处维护易分叉）
+pub fn crypto_to_pbkeylen(crypto: &str) -> i32 {
+    match crypto {
+        "aes-192" => 24,
+        "aes-256" => 32,
+        _ => 16, // aes-128（默认，未知值回退）
+    }
 }
 
 // ===== 默认值函数 =====
@@ -233,15 +251,22 @@ fn build_socks5_from_env() -> Result<Option<Socks5Config>, String> {
     let listen = std::env::var("SRT_SOCKS5_LISTEN").unwrap_or_else(|_| default_socks5_listen());
     let username = std::env::var("SRT_SOCKS5_USER").ok();
     let password = std::env::var("SRT_SOCKS5_PASS").ok();
+    // H3：多用户表（与单用户并存；users 非空时优先校验）
+    let users = parse_env_socks5_users()?.into_iter().map(|u| crate::client::socks5::Socks5UserEntry {
+        username: u.username,
+        password_hash: u.password_hash,
+    }).collect::<Vec<_>>();
     // 只要设置了任一 SRT_SOCKS5_* 就返回 Some（否则 None=用默认/文件值）
     let any_set = std::env::var("SRT_SOCKS5_LISTEN").is_ok()
         || username.is_some()
-        || password.is_some();
+        || password.is_some()
+        || !users.is_empty();
     if any_set {
         Ok(Some(Socks5Config {
             listen,
             username,
             password,
+            users,
         }))
     } else {
         Ok(None)
@@ -360,6 +385,7 @@ impl Config {
                     listen,
                     username: None,
                     password: None,
+                    users: Vec::new(),
                 }),
             }
         }
@@ -376,7 +402,26 @@ impl Config {
                         listen: default_socks5_listen(),
                         username: user,
                         password: pass,
+                        users: Vec::new(),
                     });
+                }
+            }
+        }
+        // H3：环境变量多用户表覆盖（SRT_SOCKS5_USERS 转入客户端 SOCKS5 入口用户表）
+        if let Ok(users) = parse_env_socks5_users() {
+            if !users.is_empty() {
+                let entries = users.into_iter().map(|u| crate::client::socks5::Socks5UserEntry {
+                    username: u.username,
+                    password_hash: u.password_hash,
+                }).collect::<Vec<_>>();
+                match &mut self.socks5 {
+                    Some(s5) => s5.users = entries,
+                    None => self.socks5 = Some(Socks5Config {
+                        listen: default_socks5_listen(),
+                        username: None,
+                        password: None,
+                        users: entries,
+                    }),
                 }
             }
         }
@@ -392,6 +437,11 @@ impl Config {
         // passphrase 必填（SRT 原生加密 + 挑战-应答都需要）
         if self.passphrase.len() < 10 || self.passphrase.len() > 79 {
             return Err("passphrase 长度必须为 10-79 字符（SRT 协议要求）".to_string());
+        }
+        // M6 修复（2026-08-19）：max_clients 必须至少为 1。
+        // 旧实现 0 可通过校验 -> 服务端永久拒绝所有连接且无限循环告警（无法提供服务）。
+        if self.max_clients < 1 {
+            return Err("max_clients 必须至少为 1".to_string());
         }
         // 加密强度校验
         match self.crypto.as_str() {
@@ -437,6 +487,7 @@ impl Config {
                         listen: listen.clone(),
                         username: None,
                         password: None,
+                        users: Vec::new(),
                     });
                 }
             }
@@ -458,19 +509,32 @@ impl Config {
                         listen: default_socks5_listen(),
                         username: user,
                         password: pass,
+                        users: Vec::new(),
                     });
                 }
             }
         }
-        // --socks5-users 追加服务端多用户（格式 user:pass，纯文本，测试用）
+        // --socks5-users 追加多用户（格式 user:pass，明文转 argon2，测试用；H3）
         for entry in &args.socks5_users {
             if let Some((u, p)) = entry.split_once(':') {
                 // 测试用途：明文密码转 argon2 哈希存储
                 if let Ok(hash) = crate::auth::hash_password(p) {
-                    self.socks5_users.push(Socks5User {
+                    let entry = crate::client::socks5::Socks5UserEntry {
                         username: u.to_string(),
                         password_hash: hash,
-                    });
+                    };
+                    // 写入客户端 SOCKS5 入口用户表（H3：多用户认证实际消费方）
+                    match &mut self.socks5 {
+                        Some(s5) => s5.users.push(entry),
+                        None => {
+                            self.socks5 = Some(crate::config::Socks5Config {
+                                listen: default_socks5_listen(),
+                                username: None,
+                                password: None,
+                                users: vec![entry],
+                            });
+                        }
+                    }
                 }
             }
         }

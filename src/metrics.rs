@@ -28,6 +28,8 @@ pub struct Metrics {
     pub auth_failures: AtomicU64,
     /// 心跳超时次数
     pub heartbeat_timeouts: AtomicU64,
+    /// 最近一次心跳 RTT（毫秒，M8 2026-08-19 新增：pong 时间戳差值）
+    pub last_rtt_ms: AtomicU64,
 }
 
 /// 全局指标实例（OnceLock 懒初始化）
@@ -80,6 +82,7 @@ fn render_metrics_json() -> String {
         "rx_bytes": m.rx_bytes.load(Ordering::Relaxed),
         "auth_failures": m.auth_failures.load(Ordering::Relaxed),
         "heartbeat_timeouts": m.heartbeat_timeouts.load(Ordering::Relaxed),
+        "last_rtt_ms": m.last_rtt_ms.load(Ordering::Relaxed),
     })
     .to_string()
 }

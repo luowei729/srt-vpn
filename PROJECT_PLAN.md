@@ -234,6 +234,20 @@ srt-vpn/
 > - 部署验证：新加坡 129.150.44.117（systemd contribs）、国内 47.102.196.219
 > - Docker + CI 就绪（.github/workflows/release.yml 手动触发）
 
+> 审查修复 2026-08-19（详见 CHANGELOG 12:00 条目）：
+> - max_clients 计数泄漏修复（原子计数，任务结束释放）
+> - 半关闭语义修复（会话通道改事件型 SessionEvent，Fin 投递不删会话）
+> - 客户端整链自动重连（含 SOCKS5 serve 断开信号，缺此重连永不触发）
+> - 主动心跳 + 死连接检测（此前 heartbeat_secs 配置未使用）
+> - 客户端指标服务启动 + 指标字段接入（含 register_specific 计数一致性）
+> - UDP 转发空闲看门狗、会话上限校验、会话 ID 分配边界修复
+> - 测试 19 → 26 通过，release 零警告
+> 审查修复 2026-08-19 15:00（第二轮，详见 CHANGELOG 15:00 条目）：
+> - S 级 6 项：连接关闭链路重构（CAS 幂等+eid 归接收线程）、**断线状态值判断错误修复（SRTS_BROKEN=6，历史 CPU 79% 卡死真凶）**、退出段错误修复（atexit srt_cleanup + join 线程 + runtime 级联清理）、SOCKS5 监听失败死锁、认证窗口帧缓存回放（消除首个请求黑洞）、重连计数成功清零
+> - H 级 5 项：UDP ASSOCIATE 泄漏（TCP 断开检测+看门狗）、UDP 域名/IPv6 目标全支持（服务端双栈 socket）、多用户 argon2 认证落地（users 表）、Open 冲突不再踢现有会话、rx_bytes 全路径计数
+> - M 级 8 项：多客户端并行接入、nonce 一次性语义、重组器过期清理、日志优先级修正、UDP 回包来源锁定、max_clients 校验、可靠性协商标注 P2、心跳 RTT 指标（last_rtt_ms）
+> - L 级：删冗余依赖/死模块（session.rs）、过时注释全面修正、重复函数收敛
+> - 测试 25 通过，release 零警告；端到端 TCP/UDP 四类目标/断线重连 4 轮/退出安全全验证
 ### P2（规划）：TUN 模式 + iptables NAT + 动态 PID + 黑名单
 
 ### P3（规划）：性能 → 拟真 → 安全 → 跨平台打磨

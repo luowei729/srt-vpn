@@ -2,6 +2,173 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-19 15:30] - 文档维护（多用户语义）+ 修复版部署（新加坡/本地 1080）
+
+### 改动前总结
+用户确认 streamid 默认值多用户不冲突后，要求：① README 补多用户语义与端口冲突说明（部署者易困惑点）；② 提交推送全部修复代码（15:00 条目的 23 个文件未入库）；③ CI 编译新镜像；④ 部署新加坡服务端 + 本地 1080 客户端供验证。
+
+### 改动后总结
+- README.md：环境变量表 `SRT_SOCKS5_USERS` 角色修正（H3 后已接入客户端多用户表，arg2 存储，优先于单用户）；新增"多用户语义与端口冲突说明"章节（streamid=passphrase 令牌载体非用户标识 / 三层认证语义表 / 同机多进程唯一冲突点=SOCKS5 监听端口+metrics 端口 / 服务端级真多用户属 P2 协议扩展）
+- 部署：CI 构建新 tag 镜像 -> 新加坡 129.150.44.117 容器 srtvpn-sg 滚动更新（含 S1-S6 全部修复：CPU 卡死真凶 S5 + 退出段错误 S6）-> 本地客户端重建（含 S1-S6 修复）
+- 部署验证结果见本条目下方追加记录
+
+### 涉及文件
+- README.md（多用户语义章节）
+- 部署：ghcr.io/luowei729/srt-vpn:<新tag>（新加坡）、本地原生二进制（1080）
+
+## [2026-08-19 15:00] - 第二轮审查全部修复（S1-S6 + H1-H5 + M1-M8 + L 级）
+
+### 改动前总结
+按 12:35 审查报告逐项修复全部问题。修复过程中**追加发现 2 个 S 级问题**：
+- S5 `srt_getsockstate` 返回值判断错误：代码判 `state==2||state==3`（实际是 SRTS_OPENED/SRTS_LISTENING 健康态），真正的断开状态是 SRTS_BROKEN=6/SRTS_CLOSED=8 -> **断线后收发线程永不退出 + 100µs 忙等重试**（此前"服务端 CPU 79% 卡死"的真凶）
+- S6 退出段错误（exit 139，gdb 定位 `CRcvQueue::worker` 崩溃）：每个连接各调一次 `srt_startup` 但进程退出从不调 `srt_cleanup`，且 `process::exit` 跳过 runtime Drop -> atexit 前收发线程仍在跑，与 libsrt 静态析构（停 GC 线程）竞态
+
+### 改动后总结
+
+**S 级（6 项全部修复）**：
+- **S1 连接关闭链路重构**（connection.rs）：`closed` 改 `AtomicBool` CAS 幂等；`send_tx` 改 `Mutex<Option<Sender>>`，close 时锁内 take+drop -> 发送线程 recv() Err 自然退出；close 直接 `srt_close`（幂等）让接收线程感知断开退出；**eid 生命周期归接收线程**（退出时唯一释放，消除跨线程释放 UB + 认证失败路径与 Drop 的双重释放）；发送线程忽略空消息（旧"空消息哨兵"从未生效）
+- **S5 断线状态判断**（bindings.rs + connection.rs）：新增 `SRTS_BROKEN=6/CLOSING=7/CLOSED=8/NONEXIST=9` 常量与 `srt_state_unavailable()` 统一判断函数，收发两处循环全部改用（附 srt.h 行号考证注释）
+- **S6 退出段错误**（connection.rs + main.rs）：全局 `srt_global_init()`（Once + atexit 注册 `srt_cleanup`）；close() join 收发线程（保存 JoinHandle）；main 手工构建 runtime，失败不再 `process::exit`（改为 EXIT_CODE 原子传递，runtime Drop 级联清理连接后再退出）
+- **S2 监听失败死锁**（socks5.rs + client/mod.rs）：serve 监听失败返回 `"listen:"` 前缀错误；run() 按前缀分流--监听失败直接退出（重连无意义），隧道断开才走重连；`recv_task` 改 abort 不再无条件 await
+- **S3 认证窗口丢帧**（listener.rs + 两端）：authenticate 缓存窗口期 Open/Data/Fin/Close 帧认证通过后**回放**（抽 `dispatch_one_frame` 与主循环共用）；两端隧道断开时 `registry.close_all()` drop 全部会话通道让转发任务感知退出；客户端 TCP 转发加 300s 空闲看门狗（防会话 ID 泄漏）
+- **S4 重连计数**（client/mod.rs）：连接成功进入服务态后 `attempt = 0`（连续失败语义，瞬时抖动不再累计退出）
+
+**H 级（5 项全部修复）**：
+- **H1 UDP ASSOCIATE 泄漏**（socks5.rs）：select 增加 TCP 控制连接断开检测分支（read 0/Err/意外数据即结束）+ 300s 空闲看门狗
+- **H2 UDP 域名/IPv6 目标**（socks5.rs + forward.rs）：`parse_udp_datagram` 支持 ATYP=0x04（IPv6）；地址头改 `encode_udp_addr_header_host`（host 字符串直传，服务端 lookup_host 解析域名/IPv6 字面量）；回包 IPv6 源用 ATYP=0x04；服务端 UDP 转发 socket 改 **IPv4+IPv6 双栈**（旧 `0.0.0.0:0` 是 IPv4-only，v6 目标 send_to 必败）
+- **H3 多用户 argon2 认证落地**（socks5.rs + config.rs）：Socks5Config 增加 `users` 表（与 Socks5User 同 schema），`validate_credential` 优先查多用户表（`verify_password` argon2 校验）；CLI `--socks5-users` 与环境变量 `SRT_SOCKS5_USERS` 均接入该表
+- **H4 Open 冲突踢会话**（listener.rs）：ID 占用时不再 `registry.remove(sid)`（旧逻辑踢掉现有会话），改为回 Close 帧拒绝且不影响现有会话
+- **H5 rx_bytes 失真**（dispatch.rs）：计数统一移入 `recv_event()` 的 Data 分支（TCP/UDP 全路径覆盖），`recv()` 复用不双计
+
+**M 级（8 项全部修复）**：M1 accept+认证 spawn 化并行接入（spawn_blocking + 每连接独立任务）；M2 nonce 连接级一次性（authenticate 单次执行语义注释固化）；M3 UdpReassembler 增加 `cleanup_expired`（30s 过期，转发循环每 64 包顺带清理）；M4 logging 不再读 RUST_LOG（显式构造 EnvFilter，兑现 CLI 优先级）；M5 UDP 中继锁定首个发包包源回包；M6 max_clients≥1 校验；M7 Q8 可靠性协商确认为 P2 协议级（udp_mode 现仅控制服务端 socket 参数，注释标明）；M8 心跳 pong 保留发起方时间戳 + 客户端算 RTT 写入新增指标 `last_rtt_ms`
+
+**L 级（6 项全部修复）**：删 chrono/byteorder 冗余依赖（全项目零引用）；tunnel/mod.rs、multiplex.rs 头注释与 169B 旧值全部更新为 1301B 现状；删 session.rs 死模块（SessionTable 零引用，与 SessionRegistry 两套并存易误导）；crypto_to_pbkeylen 统一到 config.rs；listeners 重复代码收敛；CHANGELOG 顺序修正（新条目置顶）
+
+### 验证
+- ✅ 单元测试 25 个全部通过（session.rs 死模块 4 个测试随模块删除），release 编译零警告零错误
+- ✅ 端到端回环：TCP 下载 4MB md5 一致；UDP IPv4 小包 / 3000B 分片大包 / 域名目标 / **IPv6 目标（双栈 socket）** 全部回显一致
+- ✅ S2：端口占用启动客户端 -> **exit 1 优雅退出**（修复前 139 段错误）
+- ✅ S3：认证窗口内首个 SOCKS5 CONNECT 正常回显（缓存回放生效）
+- ✅ S4：kill 服务端 4 轮（超过 max_retries=3）-> 客户端 4/4 轮自动恢复且进程存活，恢复后 md5 一致
+- ✅ S6：所有退出路径无段错误（gdb 复核确认）
+
+### 涉及文件
+- src/srt/bindings.rs（SRT 状态常量 + 统一判断函数）
+- src/srt/connection.rs（S1/S5/S6：关闭语义重构 + 状态修复 + 全局 init/join）
+- src/main.rs（S6：runtime 手工管理 + EXIT_CODE）
+- src/tunnel/dispatch.rs（H5 + close_all）
+- src/tunnel/multiplex.rs（注释修正 + heartbeat_timestamp）
+- src/server/listener.rs（M1/M2/S3/H4 + dispatch_one_frame 抽取 + M8 pong）
+- src/server/forward.rs（H2 双栈 + M3 过期清理 + encode_udp_addr_header_host）
+- src/client/mod.rs（S2/S4 + S3 配套 close_all + M8 RTT）
+- src/client/proxy.rs（S3 客户端看门狗）
+- src/client/socks5.rs（S2 前缀 + H1/H2/M5/H3）
+- src/config.rs（H3 users 表 + M6 + crypto_to_pbkeylen 统一）
+- src/logging.rs（M4）
+- src/metrics.rs（last_rtt_ms）
+- Cargo.toml（删冗余依赖）；删除 src/tunnel/session.rs
+
+## [2026-08-19 12:35] - 第二轮全面审查（仅审查记录，未改动代码）
+
+### 改动前总结
+用户要求完整审查项目 bug 与功能缺失。本轮通读全部源码（srt/tunnel/auth/client/server/config/cli/main/metrics/logging）与全部 md 文档，聚焦上一轮（12:00）修复后的遗留问题。**本轮纯审查，无代码改动**。
+
+### 审查结论（待修复清单）
+
+**S 级（挂死/泄漏/丢数据，建议立即修复）**：
+- S1 `SrtConnection::close()` 语义失效：close 发空 Vec 但 `run_send_loop` 不检查空消息，发送线程永不退出 → socket 永不关闭（重连后服务端名额延迟 15s 释放、本机每次重连泄漏 2 线程+socket+epoll）；`srt_epoll_release` 在接收线程 uwait 期间跨线程释放（UB 风险）；认证失败路径显式 close + Drop 再 close → **epoll 双重释放**（listener.rs 认证失败分支）
+- S2 SOCKS5 监听失败（端口被占）时 `recv_task.await` 永久挂起：客户端不重连不退出直接卡死（client/mod.rs 重连循环）
+- S3 认证窗口期丢帧：authenticate 等 RESPONSE 循环丢弃非 Response 帧（Open/Data 被丢）→ 客户端请求黑洞；且客户端转发无看门狗 → 会话 ID 泄漏直至 255 耗尽
+- S4 重连 `attempt` 连接成功后不清零：累计断线达 max_retries 后进程退出，违背自动重连意图
+
+**H 级（功能错误/资源泄漏）**：
+- H1 客户端 UDP ASSOCIATE 无 TCP 断开检测、无空闲超时 → 任务/会话 ID/UDP socket 永久泄漏
+- H2 UDP 代理丢目标：域名目标降级为 0.0.0.0、IPv6（ATYP=0x04）整包丢弃（协议层本已支持域名，封装层丢失）
+- H3 服务端 `socks5_users` 死配置：全代码无消费点，多用户 argon2 认证（Q10/README 承诺）未实现，客户端实际仅单用户明文
+- H4 Open 帧 ID 冲突时 `registry.remove(sid)` 逻辑写反：踢掉现有会话而非拒绝新请求（可被恶意利用踢会话）
+- H5 `rx_bytes` 指标失真：TCP 转发全走 `recv_event()`（不计指标），仅 UDP 的 `recv()` 计数
+
+**M 级**：accept 阻塞占用 tokio worker + 多客户端接入串行化（300ms 握手 sleep + 10s 认证超时叠加）；nonce 不防重放（同一 nonce 有效 RESPONSE 30s 窗口内可重放）；UdpReassembler 无过期清理；RUST_LOG 静默覆盖 -v（违背优先级承诺）；UDP 中继未校验回包来源 IP；max_clients=0 无校验；Q8 可靠性协商未实现（FLAG_RELIABLE 无人消费）；心跳 RTT 测量未实现。
+
+**L 级**：冗余依赖（chrono/byteorder 零引用）；tunnel/mod.rs、multiplex.rs、connection.rs 注释仍描述 TS 188B 伪装（已移除）与 169B 旧值；PROJECT_PLAN 决策表/架构图/交付物未随 TS 移除更新（scripts/ 空）；session.rs 与 dispatch.rs 两套会话管理并存；crypto_to_pbkeylen 重复两份；CHANGELOG 时间顺序颠倒。
+
+### 涉及文件
+- 无代码改动；仅本审查记录 + AGENTS.md 开发提示
+
+## [2026-08-19 12:00] - 完整代码审查修复（8 项 bug/缺失 + 自审补漏）
+
+### 改动前总结
+完整审查发现 4 个确凿 bug（B1-B4）与 5 项功能缺失（F1-F5），详见当次审查报告：
+- B1 max_clients 计数只增不减 → 断线后名额永久占满，最终拒绝所有新连接
+- B2 半关闭语义被破坏：收到 Fin 帧 dispatch 直接删会话，尾部响应数据被丢弃
+- B3 客户端仅在"初始建连失败"时重试，运行中断线直接退出（违背 Q16 自动重连）
+- B4 心跳仅"收到即回发"，无主动定时发送/死连接检测；heartbeat_secs 配置从未使用
+- F1 客户端 metrics_port 配置静默忽略（仅服务端启动了指标服务）
+- F2 指标多个字段（active_sessions/total_sessions/tx_bytes/rx_bytes/heartbeat_timeouts）定义+渲染但从不更新
+- F3 服务器 UDP 转发无空闲看门狗 → 客户端静默时会话永久占资源（泄漏隐患）
+- F4/F5 会话无上限可无限分配；SessionRegistry::allocate 的 id&0xFF 在 id=256 时产生 0（保留控制通道 ID 被占用）
+- 次要：CLI -v 2 无法显式覆盖配置 log_level；verify_password 校验不匹配被误包装为 Err
+
+### 改动后总结
+**全部修复（含自审追加补漏）**：
+
+**B1 max_clients 计数泄漏**：client_count 改 `Arc<AtomicUsize>`，客户端任务结束（JoinHandle await 后）`fetch_sub(1)` 释放名额。
+
+**B2 半关闭语义**：会话接收通道从 `mpsc::UnboundedReceiver<Vec<u8>>` 升级为事件类型 `SessionEvent { Data, Fin, Close }`：
+- `dispatch_frame` 的 Fin/Close 不再直接 `registry.remove(sid)`，而是投递事件到会话通道
+- `proxy.rs::start_forward_with_reply` / `forward.rs::start_tcp_forward` 改为 `recv_event()`：
+  收到对端 Fin → `shutdown()` 本地写侧（半关闭传播）；双向 Fin 或 Close → 结束会话
+- 会话由任务 Drop 时 `remove`（不再由接收循环删），保证尾部数据不丢
+- forward.rs UDP 转发与 socks5.rs UDP associate 侧分别用 recv_event / recv 适配
+
+**B3 客户端整链自动重连**（含自审发现的关键缺陷）：
+- `client::run` 重构为「建连 + SOCKS5 服务 + 接收循环 + 主动心跳」整体重连循环
+- **自审追加**：`socks5::serve` 原先只在 accept 阻塞，隧道断开时毫无感知 → 重连永不触发。
+  新增 `tokio::sync::watch<bool>` 断开信号：接收循环退出时置位，serve 用 select 监听，
+  收到信号返回 Err 让重连循环接管
+- `connect_once` 走 spawn_blocking（SRT 建连是同步阻塞，避免卡 tokio worker）
+
+**B4 主动心跳 + 死连接检测**：
+- 客户端：run 内 spawn 主动心跳定时器，按 heartbeat_secs 周期发心跳帧（Send 失败自动退出，由重连循环重建）
+- 服务端：handle_client 用 `tokio::select!` 合并接收批量与心跳周期定时器，定时主动发心跳；
+  连续 3 个周期对端无任何数据 → 判定死连接断开，累加 metrics.heartbeat_timeouts
+
+**F1 客户端指标服务**：`client::run` 按 metrics_port 启动 `Metrics::serve_http`（与服务端一致）。
+
+**F2 指标接入**：
+- allocation/remove/register_specific 更新 active_sessions/total_sessions（**自审修复**：register_specific 也需计入，
+  否则服务端会话 remove 时 fetch_sub 下溢成负数）
+- send_data / send_data_batch 计 tx_bytes；recv 计 rx_bytes
+- 心跳超时计 heartbeat_timeouts（B4）
+
+**F3 UDP 空闲看门狗**：`start_udp_forward` 增加 300s 双向空闲看门狗（与 TCP 转发一致），超时关闭会话清理注册表。
+
+**F4/F5 会话上限与 ID 边界**：
+- `SessionRegistry::allocate` / `register_specific` 增加 `MAX_SESSIONS-1` 上限校验，超限返回 None
+- ID 分配改为 u32 递增 + `% MAX_SESSIONS` 显式映射 1..=255（0 保留控制通道），满时返回 None 不再死循环
+- proxy.rs / socks5.rs 处理 allocate 返回 None（返回错误拒绝）
+
+**次要修复**：
+- cli.rs `verbose` 改 `Option<u8>`：区分"未指定"（用配置/默认）与"显式 -v 2"（覆盖配置），兑现 CLI>配置 优先级
+- auth/mod.rs `verify_password`：校验不匹配返回 Ok(false) 而非 Err(false 字符串)
+- main.rs 日志级别解析适配 Option
+
+### 验证
+- ✅ 单元测试 19 → **26 个全部通过**（新增 dispatch 7 个：事件路由 / Fin 不删会话 / Close 投递 / 会话上限 / ID 边界 / register_specific 拒绝非法 / remove 后路由失败），release 编译零警告
+- ✅ 回环端到端：HTTP 200 + 8 并发下载 2MB 文件 md5 全部一致（半关闭无回归）
+- ✅ 断线重连端到端：kill 服务端 → 客户端 `SRT 连接断开` → `隧道接收循环退出` → `SOCKS5 服务退出，进入重连` → 1s 间隔重试 6 次进程持续存活 → 重启服务端后**自动重连成功**，恢复后下载 md5 一致
+
+### 涉及文件
+- src/tunnel/dispatch.rs（SessionEvent / 会话上限 / ID 修复 / 指标接入 / 新增测试）
+- src/server/listener.rs（max_clients 原子计数 / 服务端主动心跳+死连接检测 / Fin 不删会话）
+- src/client/mod.rs（整链重连 + 断开信号 / 主动心跳 / 客户端指标 / connect_once spawn_blocking）
+- src/client/proxy.rs（半关闭传播 / allocate None 处理）
+- src/client/socks5.rs（serve 增加 tunnel_closed 信号 / allocate None 处理）
+- src/server/forward.rs（TCP/UDP 半关闭传播 / UDP 空闲看门狗 / 事件接收）
+- src/cli.rs（verbose 改 Option<u8>）
+- src/main.rs（日志级别解析适配）
+- src/auth/mod.rs（verify_password 修复）
+
 ## [2026-08-20 02:10] - Docker CMD 修复 + 环境变量方式生产部署（新加坡/本地 1080）
 
 ### 改动前总结

@@ -18,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::srt::connection::SrtConnection;
-use crate::tunnel::dispatch::{SessionRegistry, TunnelSession};
+use crate::tunnel::dispatch::{SessionEvent, SessionRegistry, TunnelSession};
 use crate::tunnel::multiplex::MuxEncoder;
 use crate::tunnel::FrameType;
 
@@ -64,7 +64,10 @@ pub async fn start_forward_with_reply(
     prepend: &[u8],
 ) -> Result<(), String> {
     // 1. 分配会话 ID + 接收通道
-    let (session_id, rx) = registry.allocate();
+    //    2026-08-19 审查修复（F4）：allocate 增加会话上限，失败时返回 None
+    let (session_id, rx) = registry
+        .allocate()
+        .ok_or("隧道会话数已达上限，拒绝打开")?;
     let mut session = TunnelSession::new(session_id, rx, conn, mux_enc, registry.clone());
 
     tracing::info!(session = session_id, dst = %format!("{dst}:{dst_port}"), "分配隧道会话");
@@ -93,32 +96,50 @@ pub async fn start_forward_with_reply(
     //    用 tokio::select! 同时监听两个方向
     //    缓冲 32KB（原 4KB）：一次读更多数据，减少高频小包（169B 分片）的调度开销，
     //    并让 send_data_batch 一次编码更多分片后批量投递（带宽优化 2026-08-19）
+    //
+    //    2026-08-19 审查修复（B2 半关闭传播）：
+    //    - 客户端 EOF → send_fin()（单向 FIN：告知对端不再发数据，本端仍收）
+    //    - 收到对端 SessionEvent::Fin → shutdown 客户端写侧（对端不再发，本端仍可发）
+    //    - 双向 FIN 或收到 Close → 结束会话
+    //    - 不再用固定 false 的 session_eof 变量（此前对端 Fin 从未真正传播）
     let mut client_buf = [0u8; 32768];
-    let mut client_eof = false; // 客户端是否已 EOF（半关闭标记）
-    let session_eof = false; // 对端是否已 FIN（半关闭标记）
+    let mut client_eof = false;  // 客户端是否已 EOF（本端发送侧关闭标记）
+    let mut peer_fin = false;    // 对端是否已 Fin（对端发送侧关闭标记）
     let tx_total = std::sync::atomic::AtomicU64::new(0); // 客户端→隧道 累计
     let rx_total = std::sync::atomic::AtomicU64::new(0); // 隧道→客户端 累计
 
+    // S3 修复（2026-08-19）：客户端侧空闲看门狗（与服务端 300s 一致）。
+    // 背景：若对端（服务端转发）因异常从未回帧（如 Open 丢失），本任务永久挂在
+    // recv_event 上 -> 会话 ID 泄漏（255 耗尽后整个客户端拒绝新连接）。
+    // 看门狗兜底：双向 300s 无活动即回收会话。
+    const IDLE_TIMEOUT_SECS: u64 = 300;
+    let idle_duration = std::time::Duration::from_secs(IDLE_TIMEOUT_SECS);
+    let mut idle_watchdog = std::pin::pin!(tokio::time::sleep(idle_duration));
+
     loop {
         tokio::select! {
+            // S3：看门狗分支（空闲超时回收会话）
+            _ = &mut idle_watchdog => {
+                tracing::warn!(session = session_id, idle_secs = IDLE_TIMEOUT_SECS, "客户端转发会话空闲超时，关闭");
+                break;
+            }
             // 方向 1：客户端 → 隧道
             read_result = client.read(&mut client_buf), if !client_eof => {
                 match read_result {
                     Ok(0) => {
                         // 客户端 EOF：发送 Fin 帧（半关闭），停止读客户端
-                        let _ = tx_total.load(std::sync::atomic::Ordering::Relaxed);
                         tracing::debug!(session = session_id, "客户端 EOF，发送 Fin");
                         session.send_fin().await?;
                         client_eof = true;
                         // 若对端也已 FIN，则关闭会话
-                        if session_eof {
+                        if peer_fin {
                             break;
                         }
                     }
                     Ok(n) => {
                         // 客户端数据 → 隧道 Data 帧（批量编码 + 批量投递）
-                        tx_total.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-
+                        tx_total.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);                        // S3：有活动重置看门狗
+                        idle_watchdog.as_mut().reset(tokio::time::Instant::now() + idle_duration);
                         session.send_data_batch(&client_buf[..n]).await?;
                     }
                     Err(e) => {
@@ -127,17 +148,32 @@ pub async fn start_forward_with_reply(
                 }
             }
             // 方向 2：隧道 → 客户端
-            recv_result = session.recv(), if !session_eof => {
+            recv_result = session.recv_event(), if !peer_fin => {
                 match recv_result {
-                    Some(data) => {
+                    Some(SessionEvent::Data(data)) => {
                         // 隧道数据 → 客户端
-                        rx_total.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                        tracing::trace!(session = session_id, len = data.len(), "客户端写隧道数据到本地连接");
+                        rx_total.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);                        // S3：有活动重置看门狗
+                        idle_watchdog.as_mut().reset(tokio::time::Instant::now() + idle_duration);                        tracing::trace!(session = session_id, len = data.len(), "客户端写隧道数据到本地连接");
                         client.write_all(&data).await
                             .map_err(|e| format!("写客户端数据失败: {e}"))?;
                     }
+                    Some(SessionEvent::Fin) => {
+                        // 对端半关闭：不再有数据来，shutdown 客户端写侧（本端仍可发）
+                        tracing::debug!(session = session_id, "对端 FIN，shutdown 客户端写侧");
+                        let _ = client.shutdown().await;
+                        peer_fin = true;
+                        // 若本端也已 EOF，则关闭会话
+                        if client_eof {
+                            break;
+                        }
+                    }
+                    Some(SessionEvent::Close) => {
+                        // 对端完全关闭会话
+                        tracing::debug!(session = session_id, "对端关闭会话");
+                        break;
+                    }
                     None => {
-                        // 隧道会话关闭（对端已关闭会话）
+                        // 隧道会话通道关闭（连接断开）
                         tracing::debug!(session = session_id, "隧道会话关闭");
                         break;
                     }

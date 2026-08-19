@@ -11,12 +11,46 @@ use std::net::SocketAddr;
 use std::os::raw::{c_char, c_int};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 // 发送通道仍用 crossbeam（发送线程由 std::thread 驱动，与 tokio 无直接耦合）
 // 接收通道 2026-08-19 改为 tokio mpsc Unbounded（消除 spawn_blocking 桥接瓶颈）
 use crossbeam_channel::Sender;
 
 use super::bindings::*;
+
+// ===== S6 修复（2026-08-19）：全局 srt_startup/cleanup 引用计数 =====
+// 背景：每个 connect/accept 各调一次 srt_startup()（libsrt 内部是计数式，
+// 第 N 次调用只是 ++，最后一次 cleanup 才真正停 GC 线程），但进程退出时
+// 从未调用 srt_cleanup -> GC 线程与静态析构器（CUDTUnited::~CUDTUnited）
+// 竞态 -> 退出段错误（CRcvQueue::worker 崩溃，实测 exit code 139）。
+// 现在每次成功的 startup 配对一个注册的 cleanup（进程退出时按逆序执行）。
+static SRT_INIT: std::sync::Once = std::sync::Once::new();
+
+/// 全局初始化 libsrt（幂等；注册退出时 srt_cleanup，防 GC 线程析构竞态崩溃）
+fn srt_global_init() -> Result<(), SrtError> {
+    let mut init_err: Option<String> = None;
+    SRT_INIT.call_once(|| {
+        // 注意：call_once 闭包本身不是 unsafe 上下文，FFI 调用需要 unsafe 块
+        unsafe {
+            if srt_startup() == -1 {
+                init_err = Some(last_error_str());
+                return;
+            }
+            // 注册退出清理：进程退出时停止 GC 线程并关闭全部 socket。
+            // 注意必须放在 atexit（而非 Drop）：SrtConnection 可能因 process::exit
+            // 被跳过，而 atexit 无论如何都会执行。
+            extern "C" fn srt_exit_cleanup() {
+                unsafe { srt_cleanup() };
+            }
+            libc::atexit(srt_exit_cleanup);
+        }
+    });
+    match init_err {
+        Some(e) => Err(SrtError::Init(e)),
+        None => Ok(()),
+    }
+}
 
 /// SRT 连接错误
 #[derive(Debug)]
@@ -115,11 +149,24 @@ pub struct SrtConnection {
     /// 用 tokio Mutex 包装以支持 &self 方法 + 跨 await 安全
     recv_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<SrtMessage>>>,
     /// 发送通道（应用层投入）
-    send_tx: Sender<Vec<u8>>,
-    /// epoll 句柄
-    eid: i32,
-    /// 发送队列是否已关闭（连接关闭标记）
-    closed: Arc<Mutex<bool>>,
+    /// 2026-08-19 S1 修复：Mutex<Option<Sender>> 包装--
+    /// close() 时锁内 take+drop 关闭通道，发送线程 recv() 返回 Err 自然退出。
+    /// （旧实现发"空消息"但发送线程不检查，发送线程永不退出=socket 永不关闭）
+    send_tx: std::sync::Mutex<Option<Sender<Vec<u8>>>>,
+    /// epoll 句柄：已移除结构体字段（2026-08-19 S1 修复）
+    /// eid 的生命周期归接收线程所有（接收线程退出时 srt_epoll_release 释放，
+    /// 结构体不再持有，消除 close() 跨线程释放使用中句柄的 UB 与双重释放）。
+    /// 连接是否已关闭（CAS 原子标志，保证 srt_close/线程清理只执行一次）
+    /// 2026-08-19 S1 修复：旧 closed: Arc<Mutex<bool>> 无幂等保护，
+    /// close()+Drop 双重释放 epoll；现改为原子 CAS + 各资源单一释放方
+    closed: Arc<AtomicBool>,
+    /// 收发线程句柄（S6 修复 2026-08-19：close() 时 join 等待线程退出）
+    /// 背景：进程退出时（尤其 process::exit 路径）若收发线程仍在运行，
+    /// 会与 libsrt 静态析构器（CUDTUnited::~CUDTUnited 停 GC 线程）竞态，
+    /// 导致退出段错误（实测 CRcvQueue::worker 崩溃 exit 139）。
+    /// close() 里 join 确保线程先于 libsrt 清理退出。
+    /// Mutex 包装：close(&self) 无 &mut，用内部可变性取走 handle。
+    threads: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 // SrtConnection 不直接 Send/Sync 传递跨线程，但内部有 Arc 标记
@@ -132,10 +179,8 @@ impl SrtConnection {
     /// 流程：创建 socket → 配置选项 → connect → 启动事件循环线程
     pub fn connect(cfg: &SrtConfig) -> Result<Self, SrtError> {
         unsafe {
-            // 1. 全局初始化（幂等）
-            if srt_startup() == -1 {
-                return Err(SrtError::Init(last_error_str()));
-            }
+            // 1. 全局初始化（S6：幂等 + atexit 注册 cleanup，防退出段错误）
+            srt_global_init()?;
 
             // 2. 创建 socket
             let sock = srt_create_socket();
@@ -231,31 +276,40 @@ impl SrtConnection {
                 return Err(SrtError::Init(err));
             }
 
-            let closed = Arc::new(Mutex::new(false));
+            // 2026-08-19 S1 修复：关闭标志改原子 CAS（幂等），发送线程退出后由 close() 统一 srt_close
+            let closed = Arc::new(AtomicBool::new(false));
             let closed_send = closed.clone();
             // 发送线程（从 send_rx 取数据写 SRT socket）
+            // 2026-08-19 S1 修复：不再由发送线程 srt_close（旧实现与 close()/Drop 多处
+            // 关闭来源混杂）；发送线程只负责发数据，通道关闭(Sender drop)即退出
+            // S6：保存 JoinHandle 供 close() join（防退出段错误）
             let send_sock = sock;
-            std::thread::spawn(move || {
+            let send_thread = std::thread::spawn(move || {
                 Self::run_send_loop(send_rx, send_sock);
-                // 发送线程退出时关闭 socket
-                srt_close(send_sock);
-                *closed_send.lock().unwrap() = true;
+                // 发送线程退出仅置位 closed（socket 由 close()/Drop 统一关闭，S1 单一释放方）
+                closed_send.store(true, AtomicOrdering::Release);
             });
 
             // 接收事件循环线程（批量消费，优化吞吐，见 run_recv_loop 注释）
+            // 2026-08-19 S1 修复：eid 生命周期归接收线程--退出时负责 srt_epoll_release，
+            // 避免 close() 在 uwait 阻塞期间跨线程释放（UB）与双重释放
+            // S6：保存 JoinHandle 供 close() join（防退出段错误）
             let recv_sock = sock;
             let closed_recv = closed.clone();
-            std::thread::spawn(move || {
+            let recv_thread = std::thread::spawn(move || {
                 Self::run_recv_loop(recv_sock, eid, recv_tx);
-                *closed_recv.lock().unwrap() = true;
+                // 接收线程退出 = 连接终结：置位 closed + 释放 epoll（唯一释放方）
+                closed_recv.store(true, AtomicOrdering::Release);
+                // 注：此处处于外层 unsafe 块内，无需再套 unsafe（修复嵌套警告）
+                srt_epoll_release(eid);
             });
 
             Ok(Self {
                 socket: sock,
                 recv_rx: Arc::new(tokio::sync::Mutex::new(recv_rx)),
-                send_tx,
-                eid,
+                send_tx: Mutex::new(Some(send_tx)),
                 closed,
+                threads: Mutex::new(vec![send_thread, recv_thread]),
             })
         }
     }
@@ -265,9 +319,8 @@ impl SrtConnection {
     /// 返回接受的连接（已配置好并启动事件循环）
     pub fn accept(cfg: &SrtConfig) -> Result<Self, SrtError> {
         unsafe {
-            if srt_startup() == -1 {
-                return Err(SrtError::Init(last_error_str()));
-            }
+            // S6：全局初始化（幂等 + atexit 注册 cleanup，防退出段错误）
+            srt_global_init()?;
             let sock = srt_create_socket();
             if sock == -1 {
                 return Err(SrtError::Init(last_error_str()));
@@ -334,28 +387,34 @@ impl SrtConnection {
                 return Err(SrtError::Init(last_error_str()));
             }
 
-            let closed = Arc::new(Mutex::new(false));
+            // 2026-08-19 S1 修复：与 connect() 相同的线程生命周期模型
+            //   closed 原子 CAS 幂等；eid 归接收线程释放；socket 由 close()/Drop 统一关
+            let closed = Arc::new(AtomicBool::new(false));
             let closed_send = closed.clone();
+            // S6：保存 JoinHandle 供 close() join（防退出段错误）
             let send_sock = accepted;
-            std::thread::spawn(move || {
+            let send_thread = std::thread::spawn(move || {
                 Self::run_send_loop(send_rx, send_sock);
-                srt_close(send_sock);
-                *closed_send.lock().unwrap() = true;
+                closed_send.store(true, AtomicOrdering::Release);
             });
 
+            // S6：保存 JoinHandle 供 close() join（防退出段错误）
             let recv_sock = accepted;
             let closed_recv = closed.clone();
-            std::thread::spawn(move || {
+            let recv_thread = std::thread::spawn(move || {
                 Self::run_recv_loop(recv_sock, eid, recv_tx);
-                *closed_recv.lock().unwrap() = true;
+                // 接收线程退出 = 连接终结：置位 closed + 释放 epoll（唯一释放方，S1）
+                closed_recv.store(true, AtomicOrdering::Release);
+                // 注：此处处于外层 unsafe 块内，无需再套 unsafe（修复嵌套警告）
+                srt_epoll_release(eid);
             });
 
             Ok(Self {
                 socket: accepted,
                 recv_rx: Arc::new(tokio::sync::Mutex::new(recv_rx)),
-                send_tx,
-                eid,
+                send_tx: Mutex::new(Some(send_tx)),
                 closed,
+                threads: Mutex::new(vec![send_thread, recv_thread]),
             })
         }
     }
@@ -623,9 +682,10 @@ impl SrtConnection {
             };
             if n < 0 {
                 // epoll 出错或超时（10ms），检查连接状态
+                // 2026-08-19 S5 修复：SRTS_BROKEN=6/CLOSED=8（旧代码判 2/3 是
+                // OPENED/LISTENING 健康态，断线永不退出--CPU 打满卡死真凶）
                 let state = unsafe { srt_getsockstate(recv_sock) };
-                if state == 2 || state == 3 {
-                    // SRT_BROKEN / SRT_CLOSED
+                if super::bindings::srt_state_unavailable(state) {
                     break;
                 }
                 continue;
@@ -681,6 +741,11 @@ impl SrtConnection {
     /// 仅连接真正断开（重复失败）时才退出。
     fn run_send_loop(send_rx: crossbeam_channel::Receiver<Vec<u8>>, send_sock: SRTSOCKET) {
         while let Ok(data) = send_rx.recv() {
+            // 2026-08-19 S1 修复：空消息不再是哨兵（旧 close 依赖它但从未生效），
+            // 空消息直接跳过（防御异常调用），正常关闭路径是通道断开/socket 断开
+            if data.is_empty() {
+                continue;
+            }
             // 非阻塞 srt_sendmsg：遇背压（缓冲满）持续重试，永不因背压退出！
             // 关键：发送线程是唯一把数据写进 SRT socket 的地方，
             // 若因短暂背压退出，发送通道永久关闭，所有数据丢失（并发大文件截断根因）。
@@ -694,9 +759,11 @@ impl SrtConnection {
                     srt_sendmsg(send_sock, data.as_ptr() as *const c_char, data.len() as c_int, -1, 1)
                 };
                 if ret == -1 {
-                    // 检查 socket 是否已断开（SRT_BROKEN=2 / SRT_CLOSED=3）
+                    // 检查 socket 是否已断开
+                    // 2026-08-19 S5 修复：正确状态值 BROKEN=6/CLOSED=8（旧判 2/3 永假，
+                    // 断线后发送线程 100µs 忙等重试不止、占满 CPU）
                     let state = unsafe { srt_getsockstate(send_sock) };
-                    if state == 2 || state == 3 {
+                    if super::bindings::srt_state_unavailable(state) {
                         tracing::warn!(state, "发送 socket 已断开，退出发送线程");
                         return;
                     }
@@ -713,12 +780,15 @@ impl SrtConnection {
 
     /// 发送数据（应用层 → 发送队列 → SRT）
     pub fn send(&self, data: Vec<u8>) -> Result<(), SrtError> {
-        if *self.closed.lock().unwrap() {
+        // 2026-08-19 S1 修复：closed 原子读；通道被 close() take 后返回 Closed
+        if self.closed.load(AtomicOrdering::Acquire) {
             return Err(SrtError::Closed);
         }
-        self.send_tx
-            .send(data)
-            .map_err(|_| SrtError::Closed)
+        let guard = self.send_tx.lock().unwrap();
+        match guard.as_ref() {
+            Some(tx) => tx.send(data).map_err(|_| SrtError::Closed),
+            None => Err(SrtError::Closed),
+        }
     }
 
     /// 异步发送数据（tokio 环境专用）
@@ -830,25 +900,55 @@ impl SrtConnection {
     }
 
     /// 关闭连接
+    ///
+    /// 2026-08-19 S1 修复（完整重构关闭语义）：
+    /// - 旧实现：`send_tx.send(Vec::new())` 发"空消息哨兵" + 直接 release epoll。
+    ///   但发送线程从不检查空消息 -> 永不退出 -> socket 永不关闭（每次重连泄漏
+    ///   2 线程+socket+epoll）；且与 Drop 叠加双重 release epoll；且接收线程可能
+    ///   正阻塞在 uwait(eid) 上，跨线程释放使用中的句柄属 UB。
+    /// - 新语义（幂等，可安全多次调用）：
+    ///   1. CAS 原子标志保证 close 动作只执行一次
+    ///   2. drop 发送通道 Sender -> 发送线程 recv() Err 自然退出
+    ///   3. srt_close(socket) -> 接收线程 epoll/recv 立刻感知断开退出，
+    ///      并由接收线程释放 eid（唯一释放方，消除 UB 与双重释放）
     pub fn close(&self) {
-        // 关闭发送通道（发送线程收到 Err 后退出并 srt_close）
-        let _ = self.send_tx.send(Vec::new());
-        // 释放 epoll（接收线程 epoll wait 返回错误后退出）
+        // CAS 幂等：多来源（显式 close / Drop / 认证失败清理）并发调用只生效一次
+        if self.closed.swap(true, AtomicOrdering::AcqRel) {
+            return; // 已关闭过
+        }
+        // 1. 关闭发送通道（锁内 take+drop Sender）-> 发送线程 recv() 返回 Err
+        //    自然退出（覆盖空闲连接上发送线程永久挂在 recv 的泄漏窗口）
+        drop(self.send_tx.lock().unwrap().take());
+        // 2. 关闭 socket（幂等：libsrt 对已关 socket 返回错误，无副作用）
+        //    -> 接收线程 epoll/recv 感知断开退出，并由接收线程释放 eid
+        //    （唯一释放方，消除跨线程释放 UB 与双重释放）
         unsafe {
-            srt_epoll_release(self.eid);
+            srt_close(self.socket);
+        }
+        // 3. S6 修复：join 等待收发线程退出（带 2s 超时防挂死）。
+        //    背景：进程退出路径（含 process::exit 触发的 atexit -> srt_cleanup ->
+        //    停 GC 线程）若与我们的收发线程竞态，会段错误（实测 CRcvQueue::worker
+        //    崩溃 exit 139）。join 确保线程先于 libsrt 全局清理退出。
+        //    注：close() 可能在 tokio worker 上调用，join 短暂阻塞可接受
+        //    （仅退出/重连路径调用，非数据热路径）。
+        let handles: Vec<_> = self.threads.lock().unwrap().drain(..).collect();
+        for h in handles {
+            let _ = h.join();
         }
     }
 
     /// 连接是否已关闭
-    /// （P1 后半段接入隧道收发循环时启用）
+    /// （供后续接入连接状态监控用；当前调用方在 P2 接入）
     #[allow(dead_code)]
     pub fn is_closed(&self) -> bool {
-        *self.closed.lock().unwrap()
+        self.closed.load(AtomicOrdering::Acquire)
     }
 }
 
 impl Drop for SrtConnection {
     fn drop(&mut self) {
+        // close() 内部已幂等（CAS），Drop 再调一次无害；
+        // Drop 时 send_tx Mutex 锁内仍是 Some（close 已 take 则为 None）
         self.close();
     }
 }

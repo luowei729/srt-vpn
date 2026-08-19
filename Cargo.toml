@@ -26,12 +26,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 # libc（sockaddr 等系统类型，SRT FFI 依赖）
 libc = "0.2"
-# 时间/系统
-chrono = "0.4"
-# 字节序处理（TS 帧头、复用层帧头）
-byteorder = "1"
 # 十六进制编码（令牌/校验）
 hex = "0.4"
+# 2026-08-19 L 级清理：移除 chrono/byteorder（全项目零引用：
+# 时间戳用 SystemTime，字节序用 to_be_bytes/from_be_bytes），减少编译依赖
 
 [build-dependencies]
 cc = "1"

@@ -2,13 +2,13 @@
 //!
 //! 设计决策（Q7/Q14）：
 //! - 单 SRT 连接 + 多路复用层：所有会话共享一条 SRT 隧道
-//! - 单层可靠模型：可靠传输完全交给 SRT 层（-m 可靠/尽力而为）
+//! - 单层可靠模型：可靠传输完全交给 SRT 层（udp_mode 配置 socket 参数）
 //!   复用层只做：分帧（会话 ID 路由）+ 调度（公平排队）+ 窗口流控
-//! - 所有帧（含 ACK）统一封装为 188B TS 包（伪装一致性）
+//! - （2026-08-19 更新）TS 伪装层已移除，隧道帧直接作为 SRT 消息发送
 //! - 帧头 v1（15 字节）：Magic + Version + Type + SessionID + Len + Seq + Flags
 //!
-//! 帧大小约束：TS 单包 payload = 184 字节，帧头 15 字节，
-//! 所以单帧数据 payload ≤ 169 字节；大数据分片为多帧。
+//! 帧大小约束：帧头 15 字节 + payload ≤ 1316（SRT 消息上限），
+//! 单帧数据 payload ≤ 1301 字节；大数据分片为多帧。
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -62,11 +62,11 @@ impl MuxEncoder {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// 编码一帧（输出为 TS 帧载荷，由调用方封装成 TS 包）
+    /// 编码一帧（输出直接作为 SRT 消息发送，2026-08-19 移除 TS 壳）
     ///
-    /// payload 长度必须 ≤ FRAME_DATA_MAX（169）
+    /// payload 长度必须 ≤ FRAME_DATA_MAX（1301）
     pub fn encode_frame(&self, ftype: FrameType, session_id: u16, flags: u8, payload: &[u8]) -> Vec<u8> {
-        assert!(payload.len() <= FRAME_DATA_MAX, "帧 payload 超长: {} > 169", payload.len());
+        assert!(payload.len() <= FRAME_DATA_MAX, "帧 payload 超长: {} > 1301", payload.len());
         let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
         // Magic
         frame.extend_from_slice(&TUNNEL_MAGIC);
@@ -102,8 +102,12 @@ impl MuxEncoder {
     }
 
     /// 编码心跳帧
+    ///
+    /// 2026-08-19 审查补全（M8 RTT 测量）：
+    /// 心跳载荷 = 发起方时间戳（8 字节 LE 毫秒）。
+    /// 应答方原样回发同一载荷（pong），发起方收到后用 now - ts 即得 RTT。
     pub fn encode_heartbeat(&self) -> Vec<u8> {
-        // 心跳带时间戳（8 字节 LE），对端可测 RTT
+        // 心跳带时间戳（8 字节 LE），对端回发同载荷可测 RTT
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -111,6 +115,15 @@ impl MuxEncoder {
         let payload = ts.to_le_bytes();
         self.encode_frame(FrameType::Heartbeat, 0, 0, &payload)
     }
+}
+
+/// 从心跳帧载荷解析发起方时间戳（毫秒，M8 RTT 计算用）
+/// 返回 None 表示载荷非法（非 8 字节）
+pub fn heartbeat_timestamp(payload: &[u8]) -> Option<i64> {
+    if payload.len() != 8 {
+        return None;
+    }
+    Some(i64::from_le_bytes(payload.try_into().ok()?))
 }
 
 /// 多路复用解码器（接收方向）
@@ -287,5 +300,23 @@ mod tests {
         assert_eq!(out.ftype, FrameType::Heartbeat);
         assert_eq!(out.session_id, 0);
         assert_eq!(out.payload.len(), 8, "心跳携带 8 字节时间戳");
+    }
+
+    #[test]
+    /// M8 修复验证：心跳载荷时间戳可解析（pong RTT 计算的前置条件）
+    fn test_heartbeat_timestamp_parse() {
+        let enc = MuxEncoder::new(true);
+        let mut dec = MuxDecoder::new();
+        let frame = enc.encode_heartbeat();
+        let out = dec.decode_frame(&frame).unwrap();
+        let ts = heartbeat_timestamp(&out.payload).expect("8 字节载荷应解析出时间戳");
+        // 时间戳应为近期时间（now ± 5s 容差）
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        assert!((now_ms - ts).abs() < 5000, "时间戳偏离当前时间过大: {ts}");
+        // 非法载荷（长度不是 8）返回 None
+        assert!(heartbeat_timestamp(&[1, 2, 3]).is_none());
     }
 }

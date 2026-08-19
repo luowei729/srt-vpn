@@ -72,7 +72,7 @@ docker run -d --name srt-vpn-client --restart=unless-stopped \
 | `SRT_LISTEN` | `listen` | server（必填） |
 | `SRT_UDP_MODE` | `udp_mode` | server |
 | `SRT_MAX_CLIENTS` | `max_clients` | server |
-| `SRT_SOCKS5_USERS` | `socks5_users` | server（`user:pass,user2:pass2`） |
+| `SRT_SOCKS5_USERS` | `socks5.users` | client（`user:pass,user2:pass2`，多用户表，argon2 存储，优先于单用户） |
 | `SRT_SERVER` | `server` | client（必填） |
 | `SRT_STREAMID` | `streamid` | client |
 | `SRT_SOCKS5_LISTEN` | `socks5.listen` | client（监听 IP+端口） |
@@ -85,6 +85,34 @@ docker run -d --name srt-vpn-client --restart=unless-stopped \
 > 配置优先级：CLI > 环境变量(SRT_*) > 配置文件 > 默认值
 > `-m` 已移除（2026-08-20）：UDP 模式直接用 `SRT_UDP_MODE` 或配置文件 `udp_mode` 指定
 > Docker 场景无需挂载配置文件，全部用 `-e SRT_*` 指定；也支持配置文件 + `-e` 覆盖混合方式
+
+### 多用户语义与端口冲突说明（2026-08-19 补充）
+
+**streamid 默认值不会冲突**：streamid 在本项目里不是用户标识，而是 passphrase 派生令牌的载体
+（`k=HMAC-SHA256(passphrase,固定盐)`，伪装部分 `r=live/srtvpn,m=video` 服务端不解析）。
+多用户共用默认 streamid = 共用同一 passphrase，认证全通过，属设计使然（单 passphrase 单信任域）。
+服务端 accept 后每客户端独立 SessionRegistry（决策 Q20），会话空间互不干扰。
+
+**当前“多用户”的真实语义**：
+
+| 层 | 认证什么 | 区分用户吗 |
+|---|---|---|
+| SRT passphrase + streamid 令牌 | 有无共享密钥（服务端单租户） | ❌ 日志只有 IP，无法审计/踢人 |
+| 挑战-应答（双 HMAC） | 同上（防重放加固） | ❌ 同上 |
+| SOCKS5 用户表（单用户或多用户表） | 谁能用本机 SOCKS5 入口（客户端本地认证） | ✅ 仅客户端入口，与服务端无关 |
+
+**同机多客户端进程时的真实冲突点**（唯一需要注意的场景）：
+
+| 参数 | 默认值 | 冲突 |
+|---|---|---|
+| `socks5.listen` | `127.0.0.1:1080` | **必冲突**（端口占用，进程会报 `listen:` 错误优雅退出，需每进程显式配不同端口） |
+| `metrics_port` | 关闭 | 仅配了相同端口才冲突，错开或不开 |
+| streamid / server / heartbeat / reconnect 等 | - | 不冲突（进程间完全独立） |
+
+> 服务端参数（listen/passphrase/crypto/udp_mode/max_clients）是单进程全局的，
+> 所有客户端必须与其一致，不存在各配各的。
+> 如需服务端级真多用户（每人独立凭证/审计/踢人），属 P2 协议扩展：
+> streamid 增加 `u=<username>` 字段 + per-user 密钥表 + 每用户连接数上限。
 
 ---
 

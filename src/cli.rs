@@ -28,8 +28,10 @@ pub struct Args {
     pub config: Option<String>,
 
     /// 日志级别（0=ERROR, 1=WARN, 2=INFO, 3=DEBUG, 4=TRACE）
-    #[arg(short = 'v', long = "verbose", default_value = "2", value_name = "LEVEL")]
-    pub verbose: u8,
+    /// 2026-08-19 审查修复：改为 Option<u8>（无默认值），以便区分
+    /// "未指定 -v"（None，采用配置/环境变量）与"显式 -v 2"（Some(2)，覆盖配置）。
+    #[arg(short = 'v', long = "verbose", value_name = "LEVEL")]
+    pub verbose: Option<u8>,
 
     /// SOCKS5 监听地址（覆盖配置，如 127.0.0.1:1080）
     #[arg(long = "socks5-listen", value_name = "ADDR")]
@@ -79,7 +81,7 @@ impl UdpMode {
 #[allow(dead_code)]
 impl Args {
     pub fn log_level_str(&self) -> &'static str {
-        match self.verbose {
+        match self.verbose.unwrap_or(2) {
             0 => "error",
             1 => "warn",
             2 => "info",

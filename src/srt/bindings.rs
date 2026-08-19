@@ -99,6 +99,25 @@ pub const SRT_EPOLL_ERR: i32 = 0x8;
 /// 连接建立事件（= SRT_EPOLL_OUT，连接成功后触发）
 pub const SRT_EPOLL_CONNECT: i32 = SRT_EPOLL_OUT;
 
+// ===== SRT socket 状态常量（对应 srt.h SRT_SOCKSTATUS，2026-08-19 S5 修复新增）=====
+// 枚举完整定义（srt-1.5.6/srtcore/srt.h:159）：
+//   SRTS_INIT=1, SRTS_OPENED=2, SRTS_LISTENING=3, SRTS_CONNECTING=4, SRTS_CONNECTED=5,
+//   SRTS_BROKEN=6, SRTS_CLOSING=7, SRTS_CLOSED=8, SRTS_NONEXIST=9
+// 历史教训：此前代码用 `state == 2 || state == 3` 判"断开"——实际是
+// OPENED/LISTENING（健康状态），BROKEN(6)/CLOSED(8) 永远不匹配，
+// 导致断线后收发线程永不退出 + 100µs 忙等（服务端 CPU 79% 卡死的真凶）。
+pub const SRTS_BROKEN: c_int = 6;
+pub const SRTS_CLOSING: c_int = 7;
+pub const SRTS_CLOSED: c_int = 8;
+pub const SRTS_NONEXIST: c_int = 9;
+
+/// 判断 socket 状态是否表示连接不可用（BROKEN/CLOSING/CLOSED/NONEXIST，S5 修复）
+/// 断线检测统一走本函数，禁止再硬编码魔法数字。
+#[inline]
+pub fn srt_state_unavailable(state: c_int) -> bool {
+    state >= SRTS_BROKEN
+}
+
 /// SRT 消息控制结构（对应 srt.h SRT_MSGCTRL）
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]

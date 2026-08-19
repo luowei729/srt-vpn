@@ -1,14 +1,17 @@
-//! tunnel/mod.rs — 隧道层（多路复用 + TS 伪装 + 会话管理）
+//! tunnel/mod.rs - 隧道层（多路复用 + 会话管理）
 //!
-//! 设计决策（Q7/Q9/Q14）：
+//! 设计决策（Q7/Q14）：
 //! - 单 SRT 连接 + 多路复用层（256 会话，u16 会话 ID，帧头版本 v1）
 //! - 单层可靠模型：可靠传输交给 SRT 层，复用层只做分帧+调度+窗口流控
-//! - 所有帧（含 ACK）统一封装为 188B MPEG-TS 包（伪装一致性）
-//! - -m 服务端配置 UDP 可靠/尽力而为，握手协商
+//! - （2026-08-19 更新）TS 伪装层已移除：SRT 加密已保证载荷不可见，
+//!   隧道帧直接作为 SRT 消息发送（原 188B MPEG-TS 壳只增 8 倍帧率开销）
+//! - udp_mode 配置服务端 SRT socket 参数（可靠性协商为 P2 协议级扩展）
 
 pub mod dispatch;
 pub mod multiplex;
-pub mod session;
+// 2026-08-19 L 级清理：移除 session.rs 死模块（SessionTable 全项目零引用，
+// 实际会话管理由 dispatch.rs 的 SessionRegistry 承担；两套并存的会话管理
+// 结构易误导后续开发。半关闭状态机已由 SessionEvent 事件模型覆盖）
 
 /// 复用层协议版本（v1）
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -76,7 +79,7 @@ pub const FLAG_RELIABLE: u8 = 0x04; // 可靠传输标记（协商后固定）
 #[allow(dead_code)]
 pub const FLAG_WINDOW: u8 = 0x08;  // 携带窗口更新
 
-/// 复用层帧头布局（12 字节）：
+/// 复用层帧头布局：
 /// [0..4)   Magic "SRTV"
 /// [4]      Version (1)
 /// [5]      Type (FrameType)
@@ -84,7 +87,8 @@ pub const FLAG_WINDOW: u8 = 0x08;  // 携带窗口更新
 /// [8..10)  Payload 长度 (u16 BE)
 /// [10..14) 序号 (u32 BE)
 /// [14]     标志位 (1B)
-/// 帧头共 15 字节，payload 最大 173 字节（188-15，TS 单包）
+/// 帧头共 15 字节，payload 上限 1301B（SRT 消息 1316 - 帧头 15，
+/// 2026-08-19 移除 TS 伪装层后的值；旧注释"173B（188-15）"已过时）
 pub const FRAME_HEADER_LEN: usize = 15;
 
 /// 会话方向（标识连接发起方）

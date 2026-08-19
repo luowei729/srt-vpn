@@ -21,7 +21,7 @@ pub async fn run(cfg: &Config) -> Result<(), String> {
     let srt_cfg = SrtConfig {
         peer_addr,
         passphrase: cfg.passphrase.clone(),
-        pbkeylen: crypto_to_pbkeylen(&cfg.crypto),
+        pbkeylen: crate::config::crypto_to_pbkeylen(&cfg.crypto),
         streamid: None,
         rcv_latency: 1000,
         reliable: match cfg.udp_mode {
@@ -55,13 +55,4 @@ pub fn parse_listen_addr(addr: &str) -> Result<std::net::SocketAddr, String> {
     addr.parse()
         .map_err(|_| format!("监听地址格式无效: {addr}（应为 host:port）"))
 }
-
-/// 加密强度字符串 → pbkeylen 字节数
-pub fn crypto_to_pbkeylen(crypto: &str) -> i32 {
-    match crypto {
-        "aes-128" => 16,
-        "aes-192" => 24,
-        "aes-256" => 32,
-        _ => 16,
-    }
-}
+// L 级清理（2026-08-19）：crypto_to_pbkeylen 重复实现移除，统一用 config::crypto_to_pbkeylen

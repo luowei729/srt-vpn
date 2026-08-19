@@ -17,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::srt::connection::SrtConnection;
-use crate::tunnel::dispatch::{SessionRegistry, TunnelSession};
+use crate::tunnel::dispatch::{SessionEvent, SessionRegistry, TunnelSession};
 use crate::tunnel::multiplex::{MuxEncoder, FRAME_DATA_MAX};
 use crate::tunnel::FrameType;
 
@@ -65,7 +65,7 @@ pub fn parse_open_payload(payload: &[u8]) -> Option<OpenRequest> {
 pub async fn handle_open_with_rx(
     session_id: u16,
     open_payload: &[u8],
-    rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<crate::tunnel::dispatch::SessionEvent>,
     conn: Arc<SrtConnection>,
     mux_enc: Arc<MuxEncoder>,
     registry: SessionRegistry,
@@ -99,7 +99,7 @@ pub async fn handle_open_with_rx(
 async fn start_udp_forward(
     session_id: u16,
     _open: &OpenRequest, // 多目标：目标在每帧地址头，忽略 Open 的固定目标
-    rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<crate::tunnel::dispatch::SessionEvent>,
     conn: Arc<SrtConnection>,
     mux_enc: Arc<MuxEncoder>,
     registry: SessionRegistry,
@@ -107,24 +107,52 @@ async fn start_udp_forward(
     tracing::info!(session = session_id, "UDP 转发会话建立（多目标）");
 
     // 1. 创建共享 UDP socket（未 connect，支持多目标 send_to）
-    let socket = std::sync::Arc::new(
+    //    H2 配套修复（2026-08-19）：按目标地址族选 socket--
+    //    IPv4 socket（bind 0.0.0.0）无法向 IPv6 目标 send_to（实测 ::1 超时根因）。
+    //    现懒创建两个 socket：首次遇到 v6 目标时补建 v6 socket；
+    //    回包来源按地址族路由到对应 socket 的 recv 分支。
+    let socket_v4 = std::sync::Arc::new(
         tokio::net::UdpSocket::bind("0.0.0.0:0")
             .await
             .map_err(|e| format!("UDP socket bind 失败: {e}"))?,
     );
+    // v6 socket 懒创建（大多数场景只有 v4 流量，避免无谓占端口/句柄）
+    let mut socket_v6: Option<std::sync::Arc<tokio::net::UdpSocket>> = None;
 
     // 2. 用已注册的接收通道建立隧道会话
     let mut session = TunnelSession::new(session_id, rx, conn, mux_enc, registry.clone());
 
     // 3. 双向转发（大包分片 + 重组）
+    //
+    // 2026-08-19 审查修复（F3 UDP 空闲看门狗 + B2 事件接收）：
+    // - 增加空闲看门狗：双向 N 秒无任何数据活动则关闭会话（此前 UDP 会话无超时，
+    //   客户端静默/异常断开时服务器侧 UDP 会话 + 注册表条目永久存在——会话泄漏隐患）
+    // - 改用 recv_event：收到 Fin/Close 事件正常结束（对端关闭时立即清理）
+    const UDP_IDLE_TIMEOUT_SECS: u64 = 300;
+    let idle_duration = std::time::Duration::from_secs(UDP_IDLE_TIMEOUT_SECS);
+    let mut idle_watchdog = std::pin::pin!(tokio::time::sleep(idle_duration));
     let mut udp_buf = [0u8; 65536];
+    // H2：v6 回包独立缓冲（select 两分支不能同时可变借用同一 buf）
+    let mut udp_buf_v6 = [0u8; 65536];
     let mut reassembler = UdpReassembler::new();
+    // M3：活动计数，每 64 次收包顺带做一次重组状态过期清理（摊薄成本）
+    let mut activity_count: u64 = 0;
     loop {
         tokio::select! {
-            // 方向 1：隧道 → UDP 目标（按帧内地址头，大包分片自动重组）
-            recv_result = session.recv() => {
+            // 看门狗：长时间无活动则退出（清理泄漏会话）
+            _ = &mut idle_watchdog => {
+                tracing::warn!(session = session_id, idle_secs = UDP_IDLE_TIMEOUT_SECS, "UDP 转发会话空闲超时，关闭");
+                break;
+            }
+            // 方向 1：隧道 -> UDP 目标（按帧内地址头，大包分片自动重组）
+            recv_result = session.recv_event() => {
                 match recv_result {
-                    Some(data) => {
+                    Some(SessionEvent::Data(data)) => {
+                        // M3：周期性清理过期的重组残留状态（防泄漏）
+                        activity_count += 1;
+                        if activity_count % 64 == 0 {
+                            reassembler.cleanup_expired();
+                        }
                         // 输入重组器：小包直接出，分片积累到重组完成才出
                         if let Some(full) = reassembler.push(&data) {
                             // 解析地址头 → (host, port, payload)
@@ -133,7 +161,30 @@ async fn start_udp_forward(
                                 match tokio::net::lookup_host((host.as_str(), port)).await {
                                     Ok(mut addrs) => {
                                         if let Some(addr) = addrs.next() {
-                                            if let Err(e) = socket.send_to(payload, addr).await {
+                                            // H2 配套修复（2026-08-19）：按目标地址族选 socket
+                                            // （v4-only socket 无法向 v6 目标 send_to，实测 ::1 超时根因）
+                                            let sock = if addr.is_ipv4() {
+                                                socket_v4.clone()
+                                            } else {
+                                                match &socket_v6 {
+                                                    Some(s) => s.clone(),
+                                                    None => {
+                                                        // 懒创建 v6 socket（首次遇到 v6 目标时补建）
+                                                        match tokio::net::UdpSocket::bind("[::]:0").await {
+                                                            Ok(s) => {
+                                                                let s = std::sync::Arc::new(s);
+                                                                socket_v6 = Some(s.clone());
+                                                                s
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::warn!(session = session_id, error = %e, "IPv6 UDP socket 创建失败（v6 目标不可达）");
+                                                                continue;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            };
+                                            if let Err(e) = sock.send_to(payload, addr).await {
                                                 tracing::debug!(session = session_id, error = %e, "UDP send_to 失败");
                                             }
                                         }
@@ -146,6 +197,17 @@ async fn start_udp_forward(
                                 tracing::debug!(session = session_id, "UDP 帧地址头无效");
                             }
                         }
+                        // 有活动：重置看门狗
+                        idle_watchdog.as_mut().reset(tokio::time::Instant::now() + idle_duration);
+                    }
+                    Some(SessionEvent::Fin) => {
+                        // 对端半关闭：UDP 无连接语义，视为结束
+                        tracing::debug!(session = session_id, "UDP 会话收到对端 FIN，结束");
+                        break;
+                    }
+                    Some(SessionEvent::Close) => {
+                        tracing::debug!(session = session_id, "UDP 会话收到对端 Close");
+                        break;
                     }
                     None => {
                         tracing::debug!(session = session_id, "UDP 会话隧道侧关闭");
@@ -154,7 +216,8 @@ async fn start_udp_forward(
                 }
             }
             // 方向 2：UDP 目标响应 → 隧道（带源地址头；大包自动分片）
-            recv_from = socket.recv_from(&mut udp_buf) => {
+            // H2 配套（2026-08-19）：v4 socket 恒监听；v6 socket 存在时并入监听
+            recv_from = socket_v4.recv_from(&mut udp_buf) => {
                 match recv_from {
                     Ok((len, src)) => {
                         // 封装 [源地址头][payload]
@@ -168,9 +231,38 @@ async fn start_udp_forward(
                                 break;
                             }
                         }
+                        // 有活动：重置看门狗
+                        idle_watchdog.as_mut().reset(tokio::time::Instant::now() + idle_duration);
                     }
                     Err(e) => {
                         tracing::debug!(session = session_id, error = %e, "UDP recv 失败");
+                        break;
+                    }
+                }
+            }
+            // H2：v6 socket 回包分支（socket_v6 未创建时该 future 永久 pending，不触发）
+            recv_from_v6 = async {
+                match socket_v6.as_ref() {
+                    Some(s) => s.recv_from(&mut udp_buf_v6).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match recv_from_v6 {
+                    Ok((len, src)) => {
+                        // v6 源回包：同 v4 路径封装回传
+                        let mut header = Vec::with_capacity(64);
+                        encode_udp_addr_header(&src, &mut header);
+                        let frames = split_udp_frames(&header, &udp_buf_v6[..len]);
+                        for frame in frames {
+                            if let Err(e) = session.send_data(&frame).await {
+                                tracing::debug!(session = session_id, error = %e, "UDP 回传失败（v6）");
+                                break;
+                            }
+                        }
+                        idle_watchdog.as_mut().reset(tokio::time::Instant::now() + idle_duration);
+                    }
+                    Err(e) => {
+                        tracing::debug!(session = session_id, error = %e, "UDP recv 失败（v6）");
                         break;
                     }
                 }
@@ -186,6 +278,7 @@ async fn start_udp_forward(
 
 /// 解析 UDP 地址头：`[host_len(1B) + host + port(2B BE)][payload]`
 /// 返回 (host, port, payload)
+/// host 是字符串形式（IPv4 / IPv6 / 域名均可，H2 修复后支持全类型）
 pub fn parse_udp_addr_header(data: &[u8]) -> Option<(String, u16, &[u8])> {
     if data.len() < 3 {
         return None;
@@ -200,13 +293,19 @@ pub fn parse_udp_addr_header(data: &[u8]) -> Option<(String, u16, &[u8])> {
     Some((host, port, payload))
 }
 
-/// 编码 UDP 地址头（追加到 out）：`[host_len(1B) + host(IP字符串) + port(2B BE)]`
-pub fn encode_udp_addr_header(addr: &std::net::SocketAddr, out: &mut Vec<u8>) {
-    let host = addr.ip().to_string();
+/// 编码 UDP 地址头（追加到 out）：`[host_len(1B) + host字符串 + port(2B BE)]`
+/// H2 修复（2026-08-19）：host 直接按字符串编码（IPv4/IPv6/域名统一支持）。
+/// 旧版只接受 SocketAddr（IPv4/IPv6），域名目标在客户端侧被丢成 0.0.0.0。
+pub fn encode_udp_addr_header_host(host: &str, port: u16, out: &mut Vec<u8>) {
     let host_bytes = host.as_bytes();
     out.push(host_bytes.len() as u8);
     out.extend_from_slice(host_bytes);
-    out.extend_from_slice(&addr.port().to_be_bytes());
+    out.extend_from_slice(&port.to_be_bytes());
+}
+
+/// 编码 UDP 地址头（SocketAddr 便捷版，内部转字符串）
+pub fn encode_udp_addr_header(addr: &std::net::SocketAddr, out: &mut Vec<u8>) {
+    encode_udp_addr_header_host(&addr.ip().to_string(), addr.port(), out);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -286,7 +385,13 @@ pub fn split_udp_frames(addr_header: &[u8], payload: &[u8]) -> Vec<Vec<u8>> {
 pub struct UdpReassembler {
     /// 进行中的重组缓冲区：目标 key → 重组状态
     pending: std::collections::HashMap<(String, u16), ReasmState>,
+    /// 每个重组状态的创建时间（用于过期清理，M3 修复 2026-08-19）
+    /// 与 pending 同 key 同生命周期（entry/remove 同步维护）
+    created_at: std::collections::HashMap<(String, u16), std::time::Instant>,
 }
+
+/// 不完整重组状态的保留时长（M3：对端发一半崩溃时，残留状态过期清理防泄漏）
+const REASM_EXPIRY_SECS: u64 = 30;
 
 /// 单个进行中重组的完整状态
 struct ReasmState {
@@ -307,7 +412,28 @@ impl UdpReassembler {
     pub fn new() -> Self {
         Self {
             pending: std::collections::HashMap::new(),
+            created_at: std::collections::HashMap::new(),
         }
+    }
+
+    /// 过期清理（M3 修复 2026-08-19）：
+    /// 移除超过 REASM_EXPIRY_SECS 仍未重组完成的状态。
+    /// 由转发循环周期调用（看门狗重置时机顺带清理即可），防止对端
+    /// 发送一半崩溃时残留状态缓慢泄漏。返回清理的数量。
+    pub fn cleanup_expired(&mut self) -> usize {
+        let now = std::time::Instant::now();
+        let expired: Vec<(String, u16)> = self
+            .created_at
+            .iter()
+            .filter(|(_, t)| now.duration_since(**t) > std::time::Duration::from_secs(REASM_EXPIRY_SECS))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let n = expired.len();
+        for k in &expired {
+            self.pending.remove(k);
+            self.created_at.remove(k);
+        }
+        n
     }
 
     /// 输入一个隧道 Data 帧负载，返回可投递的完整 UDP 数据报（含地址头）
@@ -344,12 +470,16 @@ impl UdpReassembler {
 
         // 关键路径（index=0 或首次）：初始化重组状态
         let key = (host.clone(), port);
-        let state = self.pending.entry(key.clone()).or_insert_with(|| ReasmState {
-            total_len,
-            total_parts: total as u8,
-            parts: vec![None; total],
-            received: 0,
-            addr_header: Vec::new(),
+        let state = self.pending.entry(key.clone()).or_insert_with(|| {
+            // 新建重组状态时记录创建时间（M3 过期清理用）
+            self.created_at.insert(key.clone(), std::time::Instant::now());
+            ReasmState {
+                total_len,
+                total_parts: total as u8,
+                parts: vec![None; total],
+                received: 0,
+                addr_header: Vec::new(),
+            }
         });
 
         // 防御：同一 key 的新分片组（total_len/total 变化）→ 重置
@@ -381,6 +511,7 @@ impl UdpReassembler {
                 full.extend_from_slice(p);
             }
             self.pending.remove(&key);
+            self.created_at.remove(&key); // 同步清理时间记录（M3）
             Some(full)
         } else {
             None
@@ -398,7 +529,7 @@ impl UdpReassembler {
 pub async fn start_tcp_forward(
     session_id: u16,
     open: &OpenRequest,
-    rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<crate::tunnel::dispatch::SessionEvent>,
     conn: Arc<SrtConnection>,
     mux_enc: Arc<MuxEncoder>,
     registry: SessionRegistry,
@@ -424,9 +555,14 @@ pub async fn start_tcp_forward(
     //    - 隧道收 → 目标写
     //    缓冲 32KB（原 4KB）：一次读更多数据，让 send_data_batch 一次编码更多分片
     //    后批量投递，减少高频小包（169B 分片)的调度开销（带宽优化 2026-08-19）
+    //
+    //    2026-08-19 审查修复（B2 半关闭传播）：
+    //    - 目标 EOF → send_fin()（单向 FIN：告知对端不再发数据，本端仍收）
+    //    - 收到对端 SessionEvent::Fin → shutdown 目标写侧（对端不再发，本端仍可发）
+    //    - 双向 FIN 或收到 Close → 结束会话
     let mut target_buf = [0u8; 32768];
-    let mut target_eof = false; // 目标 EOF（半关闭标记）
-    let session_eof = false; // 对端 FIN（半关闭标记）
+    let mut target_eof = false; // 目标 EOF（本端发送侧关闭标记）
+    let mut peer_fin = false;   // 对端 Fin（对端发送侧关闭标记）
     let mut rx_bytes: u64 = 0; // 隧道→目标 累计字节（诊断）
     let mut tx_bytes: u64 = 0; // 目标→隧道 累计字节（诊断）
 
@@ -453,15 +589,13 @@ pub async fn start_tcp_forward(
                         tracing::debug!(session = session_id, tx_total = tx_bytes, "目标 EOF，发送 Fin");
                         session.send_fin().await?;
                         target_eof = true;
-                        if session_eof {
+                        if peer_fin {
                             break;
                         }
                     }
                     Ok(n) => {
                         // 目标数据 → 隧道 Data 帧（批量编码 + 批量投递）
                         tx_bytes += n as u64;
-                        if cfg!(debug_assertions) {
-                        }
                         if tx_bytes % 262144 < 4096 {
                             tracing::debug!(session = session_id, tx_total = tx_bytes, "目标→隧道 进度");
                         }
@@ -475,9 +609,9 @@ pub async fn start_tcp_forward(
                 }
             }
             // 方向 2：隧道 → 目标
-            recv_result = session.recv(), if !session_eof => {
+            recv_result = session.recv_event(), if !peer_fin => {
                 match recv_result {
-                    Some(data) => {
+                    Some(SessionEvent::Data(data)) => {
                         // 隧道数据 → 目标
                         rx_bytes += data.len() as u64;
                         if rx_bytes % 262144 < 4096 {
@@ -488,8 +622,23 @@ pub async fn start_tcp_forward(
                         // 有活动：重置看门狗
                         idle_watchdog.as_mut().reset(tokio::time::Instant::now() + idle_duration);
                     }
+                    Some(SessionEvent::Fin) => {
+                        // 对端半关闭：不再有数据来，shutdown 目标写侧（本端仍可发）
+                        tracing::debug!(session = session_id, "对端 FIN，shutdown 目标写侧");
+                        let _ = stream.shutdown().await;
+                        peer_fin = true;
+                        // 若本端也已 EOF，则关闭会话
+                        if target_eof {
+                            break;
+                        }
+                    }
+                    Some(SessionEvent::Close) => {
+                        // 对端完全关闭会话
+                        tracing::debug!(session = session_id, "对端关闭会话");
+                        break;
+                    }
                     None => {
-                        // 隧道会话关闭（客户端关闭）
+                        // 隧道会话通道关闭（客户端连接断开）
                         tracing::debug!(session = session_id, rx_total = rx_bytes, "隧道会话关闭");
                         break;
                     }
@@ -673,5 +822,48 @@ mod tests {
         encoded2.extend_from_slice(b"data");
         let (_, _, payload) = parse_udp_addr_header(&encoded2).unwrap();
         assert_eq!(payload, b"data");
+    }
+
+    #[test]
+    /// H2 修复验证：域名/IPv6 目标的地址头编解码往返
+    /// （旧版 encode 只接受 SocketAddr，域名目标在客户端被丢成 0.0.0.0）
+    fn test_addr_header_domain_and_ipv6() {
+        // 域名目标
+        let mut out = Vec::new();
+        encode_udp_addr_header_host("dns.example.com", 53, &mut out);
+        let (host, port, payload) = parse_udp_addr_header(&out).unwrap();
+        assert_eq!(host, "dns.example.com");
+        assert_eq!(port, 53);
+        assert!(payload.is_empty());
+
+        // IPv6 目标（字符串形式进地址头）
+        let mut out6 = Vec::new();
+        encode_udp_addr_header_host("::1", 5353, &mut out6);
+        let (host6, port6, _) = parse_udp_addr_header(&out6).unwrap();
+        assert_eq!(host6, "::1");
+        assert_eq!(port6, 5353);
+    }
+
+    #[test]
+    /// M3 修复验证：过期重组状态被清理
+    fn test_reassembler_cleanup_expired() {
+        let header = mk_header("127.0.0.1", 9900);
+        let payload = vec![0xABu8; 2000];
+        let frames = split_udp_frames(&header, &payload);
+        let mut reasm = UdpReassembler::new();
+        // 只投第一片（模拟对端发一半崩溃），pending 里留下残缺状态
+        reasm.push(&frames[0]);
+        assert_eq!(reasm.pending.len(), 1);
+        // 立即清理：未超时（30s），状态保留
+        assert_eq!(reasm.cleanup_expired(), 0);
+        assert_eq!(reasm.pending.len(), 1);
+        // 人为把创建时间回拨 31s -> 再清理应移除
+        let stale = std::time::Instant::now() - std::time::Duration::from_secs(31);
+        for v in reasm.created_at.values_mut() {
+            *v = stale;
+        }
+        assert_eq!(reasm.cleanup_expired(), 1);
+        assert!(reasm.pending.is_empty());
+        assert!(reasm.created_at.is_empty());
     }
 }
