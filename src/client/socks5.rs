@@ -343,17 +343,17 @@ fn validate_credential(username: &str, password: &str, cfg: &Socks5Config) -> bo
     diff == 0
 }
 
-/// UDP ASSOCIATE 处理（SOCKS5 UDP 代理，2026-08-19 实现）
+/// UDP ASSOCIATE 处理（SOCKS5 UDP 代理，2026-08-19 实现，多目标+大包分片）
 ///
 /// 流程：
 /// 1. 创建 UDP 中继 Socket（随机本地端口），回复 SOCKS5 绑定地址+端口
 /// 2. 客户端 UDP 数据报（RSV+FRAG+ATYP+ADDR+PORT+DATA）发到中继
 ///    → 首包解析目标 → Open 隧道 UDP 会话（proto=1，与服务器 start_udp_forward 对应）
-///    → 后续 payload 发往该会话
-/// 3. 隧道 UDP 响应 → 封装 SOCKS5 UDP 数据报 → 发回客户端（中继 peer 地址）
+///    → 后续 payload 发往该会话（>1301B 自动分片）
+/// 3. 隧道 UDP 响应 → 重组（分片时）→ 封装 SOCKS5 UDP 数据报 → 发回客户端中继
 ///
-/// 设计约定：单 UDP ASSOCIATE 会话固定首个目标（覆盖 DNS/QUIC/在线游戏等常见
-/// 单目标 UDP 场景）；多目标（不同目的端口并发）为后续扩展项。
+/// 设计约定：单 UDP ASSOCIATE 会话支持多目标（每数据报内嵌地址头动态路由）；
+/// 大 UDP 数据报（>1301B）自动分片传输，接收端重组（协议见 forward.rs split_udp_frames）。
 async fn start_udp_associate(
     stream: TcpStream,
     peer: std::net::SocketAddr,
@@ -433,11 +433,13 @@ async fn start_udp_associate(
     session.send_open(1, "0.0.0.0", 0).await?;
     tracing::info!(session = sid, client = %peer, "UDP ASSOCIATE 隧道会话建立（多目标）");
 
-    // 4. 双向转发（多目标）：
+    // 4. 双向转发（多目标 + 大包分片）：
     //    - 客户端 UDP 数据报 → 解析 SOCKS5 UDP 头目标 → 封装 [地址头][payload] → 隧道
-    //    - 隧道响应 [地址头][payload] → 解析源目标 → 封装 SOCKS5 UDP 数据报 → 客户端中继
+    //      （>1301B 自动分片为多个隧道帧）
+    //    - 隧道响应 → 重组（分片时）→ 解析源目标 → 封装 SOCKS5 UDP 数据报 → 客户端中继
     let mut buf = [0u8; 65536];
     let mut client_addr_opt: Option<std::net::SocketAddr> = None;
+    let mut reassembler = crate::server::forward::UdpReassembler::new();
     loop {
         tokio::select! {
             // 方向 1：客户端 UDP → 隧道
@@ -446,19 +448,26 @@ async fn start_udp_associate(
                     Ok((len, src)) => {
                         client_addr_opt = Some(src);
                         if let Some((host, port, payload)) = parse_udp_datagram(&buf[..len]) {
-                            // 封装 [地址头][payload] → 隧道（多目标单会话）
-                            let mut framed = Vec::with_capacity(len + 40);
+                            // 构造地址头：目标 IP（IPv4 直接解析，域名/IPv6 暂不支持多目标用占位）
+                            // 注：SOCKS5 UDP 数据报 ATYP 已支持 IPv4/域名，这里目标 IP 解析失败时
+                            //     用 0.0.0.0 占位（域名目标由服务器 lookup_host 解析——但地址头
+                            //     只带 IP 字符串，故域名场景需要客户端自行解析，此处先按 IPv4 处理）
                             let target_ip = host.parse::<std::net::Ipv4Addr>()
                                 .map(std::net::IpAddr::V4)
                                 .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                            // 封装 [地址头][payload]（多目标单会话）
+                            let mut addr_header = Vec::with_capacity(40);
                             crate::server::forward::encode_udp_addr_header(
                                 &std::net::SocketAddr::new(target_ip, port),
-                                &mut framed,
+                                &mut addr_header,
                             );
-                            framed.extend_from_slice(payload);
-                            if let Err(e) = session.send_data(&framed).await {
-                                tracing::debug!(error = %e, "UDP 隧道发送失败");
-                                break;
+                            // 大包自动分片，小包单帧原样
+                            let frames = crate::server::forward::split_udp_frames(&addr_header, payload);
+                            for frame in frames {
+                                if let Err(e) = session.send_data(&frame).await {
+                                    tracing::debug!(error = %e, "UDP 隧道发送失败");
+                                    break;
+                                }
                             }
                         }
                     }
@@ -468,32 +477,35 @@ async fn start_udp_associate(
                     }
                 }
             }
-            // 方向 2：隧道 UDP 响应 → 客户端中继
+            // 方向 2：隧道 UDP 响应 → 客户端中继（重组分片）
             resp = session.recv() => {
                 match resp {
                     Some(data) => {
-                        // 解析 [地址头][payload]
-                        if let Some((host, port, payload)) = crate::server::forward::parse_udp_addr_header(&data) {
-                            // 封装 SOCKS5 UDP 数据报（ATYP 视主机决定 IPv4/域名）
-                            let mut out = Vec::with_capacity(payload.len() + 40);
-                            out.extend_from_slice(&[0, 0, 0]); // RSV2 + FRAG0
-                            if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-                                out.push(0x01);
-                                out.extend_from_slice(&ip.octets());
-                            } else {
-                                // 域名/IPv6：用域名类型（ATYP=0x03）
-                                out.push(0x03);
-                                out.push(host.len() as u8);
-                                out.extend_from_slice(host.as_bytes());
-                            }
-                            out.extend_from_slice(&port.to_be_bytes());
-                            out.extend_from_slice(payload);
-                            if let Some(addr) = client_addr_opt {
-                                if let Err(e) = relay.send_to(&out, addr).await {
-                                    tracing::debug!(error = %e, "UDP 回包失败");
+                        // 输入重组器：小包直接出，分片积累到重组完成才出
+                        if let Some(full) = reassembler.push(&data) {
+                            // 解析 [地址头][payload]
+                            if let Some((host, port, payload)) = crate::server::forward::parse_udp_addr_header(&full) {
+                                // 封装 SOCKS5 UDP 数据报（ATYP 视主机决定 IPv4/域名）
+                                let mut out = Vec::with_capacity(payload.len() + 40);
+                                out.extend_from_slice(&[0, 0, 0]); // RSV2 + FRAG0
+                                if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+                                    out.push(0x01);
+                                    out.extend_from_slice(&ip.octets());
+                                } else {
+                                    // 域名/IPv6：用域名类型（ATYP=0x03）
+                                    out.push(0x03);
+                                    out.push(host.len() as u8);
+                                    out.extend_from_slice(host.as_bytes());
                                 }
-                            } else {
-                                tracing::debug!("UDP 响应早于首个客户端包，丢弃");
+                                out.extend_from_slice(&port.to_be_bytes());
+                                out.extend_from_slice(payload);
+                                if let Some(addr) = client_addr_opt {
+                                    if let Err(e) = relay.send_to(&out, addr).await {
+                                        tracing::debug!(error = %e, "UDP 回包失败");
+                                    }
+                                } else {
+                                    tracing::debug!("UDP 响应早于首个客户端包，丢弃");
+                                }
                             }
                         }
                     }

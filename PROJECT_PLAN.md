@@ -220,15 +220,17 @@ srt-vpn/
 - [x] SOCKS5 + HTTP + HTTPS 三合一代理（首字节嗅探）
 - [x] 服务器直连转发（TCP + UDP）
 - [x] SOCKS5 UDP ASSOCIATE（UDP 隧道双向）
+- [x] UDP 多目标 + 大包分片重组（>1301B 数据报支持）
 - [x] 心跳 + 自动重连
 - [x] 服务器稳定性加固（connect 超时 + 空闲看门狗）
 - [x] 带宽优化（send_data_batch 同步投递、FileCC、多线程验证）
 - [x] Docker 容器化 + GitHub Actions 手动发布（Alpine 镜像）
 
 > 进度更新 2026-08-19：P1 全部完成并验证
-> - 15 单元测试通过；本机回环下载 68MB/s、上传 76MB/s、8线程上传 92MB/s
+> - 19 单元测试通过；本机回环下载 68MB/s、上传 76MB/s、8线程上传 92MB/s
 > - 多线程上传原生支持（8/16/32 线程全成功）
 > - UDP 代理（SOCKS5 UDP ASSOCIATE + 服务器 UDP 转发）已实现并回环验证双向通过
+> - UDP 多目标 + 大包分片重组（100B/2048B/8000B 端到端回显一致）
 > - 部署验证：新加坡 129.150.44.117（systemd contribs）、国内 47.102.196.219
 > - Docker + CI 就绪（.github/workflows/release.yml 手动触发）
 

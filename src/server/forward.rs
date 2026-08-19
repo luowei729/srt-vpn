@@ -18,7 +18,7 @@ use tokio::net::TcpStream;
 
 use crate::srt::connection::SrtConnection;
 use crate::tunnel::dispatch::{SessionRegistry, TunnelSession};
-use crate::tunnel::multiplex::MuxEncoder;
+use crate::tunnel::multiplex::{MuxEncoder, FRAME_DATA_MAX};
 use crate::tunnel::FrameType;
 
 /// 协议类型常量（Open 帧载荷）
@@ -116,31 +116,35 @@ async fn start_udp_forward(
     // 2. 用已注册的接收通道建立隧道会话
     let mut session = TunnelSession::new(session_id, rx, conn, mux_enc, registry.clone());
 
-    // 3. 双向转发
+    // 3. 双向转发（大包分片 + 重组）
     let mut udp_buf = [0u8; 65536];
+    let mut reassembler = UdpReassembler::new();
     loop {
         tokio::select! {
-            // 方向 1：隧道 → UDP 目标（按帧内地址头）
+            // 方向 1：隧道 → UDP 目标（按帧内地址头，大包分片自动重组）
             recv_result = session.recv() => {
                 match recv_result {
                     Some(data) => {
-                        // 解析地址头 → (host, port, payload)
-                        if let Some((host, port, payload)) = parse_udp_addr_header(&data) {
-                            // 解析目标地址（lookup_host 接受 (host, port) 所有权，避免借用生命周期问题）
-                            match tokio::net::lookup_host((host.as_str(), port)).await {
-                                Ok(mut addrs) => {
-                                    if let Some(addr) = addrs.next() {
-                                        if let Err(e) = socket.send_to(payload, addr).await {
-                                            tracing::debug!(session = session_id, error = %e, "UDP send_to 失败");
+                        // 输入重组器：小包直接出，分片积累到重组完成才出
+                        if let Some(full) = reassembler.push(&data) {
+                            // 解析地址头 → (host, port, payload)
+                            if let Some((host, port, payload)) = parse_udp_addr_header(&full) {
+                                // 解析目标地址（lookup_host 接受 (host, port) 所有权，避免借用生命周期问题）
+                                match tokio::net::lookup_host((host.as_str(), port)).await {
+                                    Ok(mut addrs) => {
+                                        if let Some(addr) = addrs.next() {
+                                            if let Err(e) = socket.send_to(payload, addr).await {
+                                                tracing::debug!(session = session_id, error = %e, "UDP send_to 失败");
+                                            }
                                         }
                                     }
+                                    Err(e) => {
+                                        tracing::debug!(session = session_id, host = %host, port = port, error = %e, "UDP 目标解析失败");
+                                    }
                                 }
-                                Err(e) => {
-                                    tracing::debug!(session = session_id, host = %host, port = port, error = %e, "UDP 目标解析失败");
-                                }
+                            } else {
+                                tracing::debug!(session = session_id, "UDP 帧地址头无效");
                             }
-                        } else {
-                            tracing::debug!(session = session_id, "UDP 帧地址头无效");
                         }
                     }
                     None => {
@@ -149,17 +153,20 @@ async fn start_udp_forward(
                     }
                 }
             }
-            // 方向 2：UDP 目标响应 → 隧道（带源地址头）
+            // 方向 2：UDP 目标响应 → 隧道（带源地址头；大包自动分片）
             recv_from = socket.recv_from(&mut udp_buf) => {
                 match recv_from {
                     Ok((len, src)) => {
-                        // 封装 [源地址头][payload] 回传
-                        let mut out = Vec::with_capacity(len + 40);
-                        encode_udp_addr_header(&src, &mut out);
-                        out.extend_from_slice(&udp_buf[..len]);
-                        if let Err(e) = session.send_data(&out).await {
-                            tracing::debug!(session = session_id, error = %e, "UDP 回传失败");
-                            break;
+                        // 封装 [源地址头][payload]
+                        let mut header = Vec::with_capacity(40);
+                        encode_udp_addr_header(&src, &mut header);
+                        // 按大小自动分片（小包单帧原样，大包拆多帧）
+                        let frames = split_udp_frames(&header, &udp_buf[..len]);
+                        for frame in frames {
+                            if let Err(e) = session.send_data(&frame).await {
+                                tracing::debug!(session = session_id, error = %e, "UDP 回传失败");
+                                break;
+                            }
                         }
                     }
                     Err(e) => {
@@ -200,6 +207,185 @@ pub fn encode_udp_addr_header(addr: &std::net::SocketAddr, out: &mut Vec<u8>) {
     out.push(host_bytes.len() as u8);
     out.extend_from_slice(host_bytes);
     out.extend_from_slice(&addr.port().to_be_bytes());
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// UDP 大包分片协议（2026-08-19 多目标版扩展）
+//
+// 背景：单隧道帧 payload 上限 FRAME_DATA_MAX=1301B（SRT 原生 payload 1316 -
+// 复用层帧头 15B）。UDP 数据报最大 65507B，超出单帧承载时必须分片传输。
+//
+// 协议格式（Data 帧负载，区分大小包）：
+// - 小包（可单帧承载）：
+//     [host_len(1B) + host + port(2B BE)][payload]
+//   ↑ 与旧版完全兼容（无分片标记 0xFF 前缀）
+// - 大包（分片传输，**每片都带地址头**）：
+//     [地址头][0xFF][total_len(u16 BE)][idx(1B)][total(1B)][payload片段]
+//
+// 说明：
+// - 0xFF 作为"分片标记"：host_len 字段合法范围 1..=253（IP 字符串最长 45B/域名最长 253B），
+//   0xFF=255 不可能与真实 host_len 冲突，可安全用作分片标记
+// - 每片都带地址头：保证重组器能按 (host,port) 解析 key 聚合分片，无需额外分片组 ID；
+//   代价是每片多 ~12B 地址头开销，换取协议简单可靠
+// - total_len：完整 UDP 数据报的 payload 总长（不含地址头），用于重组校验
+// - idx：分片序号（0 起），total：总分片数。单帧最多 255 片，理论支持最大
+//   255*(1301-5-地址头) ≈ 数百 KB，远超 UDP 65507B 上限，够用
+// - SRT 隧道保证帧有序可靠到达（单 SRT 连接 + 消息模式），接收端只需按 idx 顺序拼接
+//
+// 兼容性：旧版（无分片支持）客户端收到 0xFF 分片标记会解析失败并丢弃该帧，
+// 不影响协议整体可用性（大包丢、小包通）。本实现同时兼容新旧。
+// ─────────────────────────────────────────────────────────────────────────
+
+/// 分片标记字节（见协议说明，与 host_len 合法范围不冲突）
+const UDP_FRAG_MARK: u8 = 0xFF;
+
+/// 分片结果：从"地址头 + 完整 UDP payload"拆分出多个单帧负载
+///
+/// 输入：地址头 + 完整 UDP payload
+/// 输出（每片都带地址头，保证重组 key 可解析）：
+/// - 小包：原样单帧返回
+/// - 大包：每片 `[地址头][0xFF][len BE][idx][total]` + payload 片段
+pub fn split_udp_frames(addr_header: &[u8], payload: &[u8]) -> Vec<Vec<u8>> {
+    // 大包判定：地址头 + 分片头 5B + 至少 1B payload 超出单帧 → 需分片
+    let header_and_frag_overhead = addr_header.len() + 5;
+    if payload.len() + header_and_frag_overhead <= FRAME_DATA_MAX {
+        // 小包：原样（地址头 + payload）单帧
+        let mut frame = Vec::with_capacity(addr_header.len() + payload.len());
+        frame.extend_from_slice(addr_header);
+        frame.extend_from_slice(payload);
+        return vec![frame];
+    }
+
+    // 大包：分片（每片容量 = 单帧 - 地址头 - 分片头 5B）
+    let per_part = FRAME_DATA_MAX - addr_header.len() - 5;
+    let total_len = payload.len();
+    debug_assert!(total_len <= u16::MAX as usize, "UDP payload 超长");
+    let total_parts = payload.len().div_ceil(per_part);
+    debug_assert!(total_parts <= u8::MAX as usize, "分片数超 255");
+
+    let mut frames = Vec::with_capacity(total_parts);
+    for idx in 0..total_parts {
+        let start = idx * per_part;
+        let end = (start + per_part).min(total_len);
+        let mut part = Vec::with_capacity(FRAME_DATA_MAX);
+        part.extend_from_slice(addr_header);
+        part.push(UDP_FRAG_MARK);
+        part.extend_from_slice(&(total_len as u16).to_be_bytes());
+        part.push(idx as u8);
+        part.push(total_parts as u8);
+        part.extend_from_slice(&payload[start..end]);
+        frames.push(part);
+    }
+    frames
+}
+
+/// UDP 分片重组器（接收方向）
+///
+/// 将多个分片帧重组为完整 UDP 数据报（含地址头）。
+/// SRT 隧道有序可靠，理论上不会乱序，但防御性实现仍支持乱序到达。
+pub struct UdpReassembler {
+    /// 进行中的重组缓冲区：目标 key → 重组状态
+    pending: std::collections::HashMap<(String, u16), ReasmState>,
+}
+
+/// 单个进行中重组的完整状态
+struct ReasmState {
+    /// 完整 UDP payload 总长（协议字段 total_len）
+    total_len: usize,
+    /// 总分片数
+    total_parts: u8,
+    /// 已收到的分片（Option 表示未到）
+    parts: Vec<Option<Vec<u8>>>,
+    /// 已收到片数
+    received: usize,
+    /// 已收集的地址头（从首片提取）
+    addr_header: Vec<u8>,
+}
+
+impl UdpReassembler {
+    /// 创建重组器
+    pub fn new() -> Self {
+        Self {
+            pending: std::collections::HashMap::new(),
+        }
+    }
+
+    /// 输入一个隧道 Data 帧负载，返回可投递的完整 UDP 数据报（含地址头）
+    ///
+    /// - 小包（无 0xFF 分片标记）：立即返回（兼容旧协议）
+    /// - 分片：返回 None（继续收片）；重组完成后返回 Some(完整数据报)
+    /// - 异常分片（非法参数/超时）：丢弃该帧返回 None
+    pub fn push(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+        // 解析地址头（首片必有；若分片标记位于地址头解析后的位置则继续）
+        let (host, port, rest) = parse_udp_addr_header(frame)?;
+        if rest.is_empty() {
+            // 无 payload：非法帧，丢弃
+            return None;
+        }
+        if rest[0] != UDP_FRAG_MARK {
+            // 小包：完整数据报（地址头 + payload）
+            return Some(frame.to_vec());
+        }
+        // 分片帧：解析分片头
+        if rest.len() < 5 {
+            return None; // 分片头不完整
+        }
+        let total_len = u16::from_be_bytes([rest[1], rest[2]]) as usize;
+        let idx = rest[3] as usize;
+        let total = rest[4] as usize;
+        if total == 0 || total > 255 || idx >= total {
+            return None; // 非法参数
+        }
+        // 分片 payload（首片含地址头后的数据，后续片为纯数据）
+        let frag_payload = &rest[5..];
+        if total_len == 0 || total_len > 65535 {
+            return None;
+        }
+
+        // 关键路径（index=0 或首次）：初始化重组状态
+        let key = (host.clone(), port);
+        let state = self.pending.entry(key.clone()).or_insert_with(|| ReasmState {
+            total_len,
+            total_parts: total as u8,
+            parts: vec![None; total],
+            received: 0,
+            addr_header: Vec::new(),
+        });
+
+        // 防御：同一 key 的新分片组（total_len/total 变化）→ 重置
+        if state.total_len != total_len || state.total_parts as usize != total {
+            state.total_len = total_len;
+            state.total_parts = total as u8;
+            state.parts = vec![None; total];
+            state.received = 0;
+            state.addr_header.clear();
+        }
+
+        // 首片提取地址头（地址头 = [host_len + host + port] 3+len 字节）
+        if idx == 0 {
+            let header_len = 1 + host.len() + 2;
+            state.addr_header = frame[..header_len].to_vec();
+        }
+
+        if state.parts[idx].is_none() {
+            state.parts[idx] = Some(frag_payload.to_vec());
+            state.received += 1;
+        }
+
+        // 重组完成检查
+        if state.received == total {
+            let mut full = Vec::with_capacity(state.total_len + state.addr_header.len());
+            full.extend_from_slice(&state.addr_header);
+            for part in &state.parts {
+                let p = part.as_ref()?;
+                full.extend_from_slice(p);
+            }
+            self.pending.remove(&key);
+            Some(full)
+        } else {
+            None
+        }
+    }
 }
 
 /// TCP 直连转发（服务器端）
@@ -320,4 +506,172 @@ pub async fn start_tcp_forward(
         .await
         .map_err(|e| format!("关闭目标连接失败: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造 IPv4 地址头（模拟 encode_udp_addr_header 输出）
+    fn mk_header(host: &str, port: u16) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.push(host.len() as u8);
+        h.extend_from_slice(host.as_bytes());
+        h.extend_from_slice(&port.to_be_bytes());
+        h
+    }
+
+    #[test]
+    fn test_split_small_packet_single_frame() {
+        // 小包（≤ 单帧承载）：原样单帧返回（兼容旧协议）
+        let header = mk_header("127.0.0.1", 9900);
+        let payload = b"hello udp";
+        let frames = split_udp_frames(&header, payload);
+        assert_eq!(frames.len(), 1);
+        // 帧 = 地址头 + payload，无分片标记
+        let mut expect = header.clone();
+        expect.extend_from_slice(payload);
+        assert_eq!(frames[0], expect);
+    }
+
+    #[test]
+    fn test_split_large_packet_multiple_frames() {
+        // 大包（2000B）：分片为多帧，且每帧 ≤ FRAME_DATA_MAX
+        let header = mk_header("127.0.0.1", 9900);
+        let payload = vec![0xABu8; 2000];
+        let frames = split_udp_frames(&header, &payload);
+        assert!(frames.len() > 1, "大包应分片");
+        for f in &frames {
+            assert!(f.len() <= FRAME_DATA_MAX, "单帧超限: {}", f.len());
+        }
+        // 每片都带地址头，分片标记在地址头之后（地址头 = 1 + 9 + 2 = 12B）
+        let header_len = 1 + 9 + 2;
+        for f in &frames {
+            assert_eq!(f[header_len], UDP_FRAG_MARK, "分片帧应有分片标记");
+            assert_eq!(&f[..header_len], &header[..], "每片应携带相同地址头");
+        }
+    }
+
+    #[test]
+    fn test_reassemble_small_packet() {
+        // 小包直接输出（不进入重组状态机）
+        let header = mk_header("127.0.0.1", 9900);
+        let payload = b"small";
+        let mut frame = header.clone();
+        frame.extend_from_slice(payload);
+        let mut reasm = UdpReassembler::new();
+        let out = reasm.push(&frame).expect("小包应直接输出");
+        assert_eq!(out, frame);
+        assert!(reasm.pending.is_empty());
+    }
+
+    #[test]
+    fn test_reassemble_large_packet() {
+        // 大包：分片 → 重组 → 完整数据报（地址头 + 全部 payload）
+        let header = mk_header("127.0.0.1", 9900);
+        let payload: Vec<u8> = (0..3000u16).map(|i| (i % 251) as u8).collect();
+        let frames = split_udp_frames(&header, &payload);
+        assert!(frames.len() > 1);
+
+        let mut reasm = UdpReassembler::new();
+        let mut result: Option<Vec<u8>> = None;
+        for f in &frames {
+            if let Some(full) = reasm.push(f) {
+                result = Some(full);
+            }
+        }
+        let full = result.expect("重组应完成");
+        // 数据报 = 地址头 + 完整 payload（顺序/内容一致）
+        assert_eq!(&full[..header.len()], &header[..]);
+        assert_eq!(&full[header.len()..], &payload[..]);
+        assert!(reasm.pending.is_empty(), "重组完成后清理");
+    }
+
+    #[test]
+    fn test_reassemble_out_of_order() {
+        // 防御性乱序重组：反序投递分片仍能正确重组
+        let header = mk_header("127.0.0.1", 9900);
+        let payload: Vec<u8> = (0..4000u16).map(|i| (i % 253) as u8).collect();
+        let mut frames = split_udp_frames(&header, &payload);
+        assert!(frames.len() > 2, "4000B 应分 ≥3 片，实际 {}", frames.len());
+        frames.reverse(); // 乱序
+
+        let mut reasm = UdpReassembler::new();
+        let mut result: Option<Vec<u8>> = None;
+        for f in &frames {
+            if let Some(full) = reasm.push(f) {
+                result = Some(full);
+            }
+        }
+        let full = result.expect("乱序重组应完成");
+        assert_eq!(&full[header.len()..], &payload[..]);
+    }
+
+    #[test]
+    fn test_multi_target_interleaved_reassembly() {
+        // 多目标交错分片：两个不同 (host,port) 的大包同时重组互不干扰
+        let h1 = mk_header("127.0.0.1", 9900);
+        let h2 = mk_header("10.0.0.2", 9901);
+        let p1: Vec<u8> = vec![1u8; 2000];
+        let p2: Vec<u8> = vec![2u8; 2100];
+
+        let f1 = split_udp_frames(&h1, &p1);
+        let f2 = split_udp_frames(&h2, &p2);
+
+        let mut reasm = UdpReassembler::new();
+        // 交错投递：f1[0], f2[0], f1[1], f2[1], ...
+        let max = f1.len().max(f2.len());
+        let mut r1: Option<Vec<u8>> = None;
+        let mut r2: Option<Vec<u8>> = None;
+        for i in 0..max {
+            if let Some(f) = f1.get(i) {
+                if let Some(full) = reasm.push(f) {
+                    r1 = Some(full);
+                }
+            }
+            if let Some(f) = f2.get(i) {
+                if let Some(full) = reasm.push(f) {
+                    r2 = Some(full);
+                }
+            }
+        }
+        let full1 = r1.expect("目标1重组");
+        let full2 = r2.expect("目标2重组");
+        assert_eq!(&full1[h1.len()..], &p1[..]);
+        assert_eq!(&full2[h2.len()..], &p2[..]);
+    }
+
+    #[test]
+    fn test_invalid_frag_dropped() {
+        // 非法分片（total=0 / idx 越界）应被丢弃，不 panic
+        let mut reasm = UdpReassembler::new();
+        // 地址头 + 分片标记 + total_len + idx=0 + total=0（非法）
+        let mut bad = mk_header("127.0.0.1", 9900);
+        bad.extend_from_slice(&[UDP_FRAG_MARK, 0x00, 0x10, 0x00, 0x00]); // total=0 非法
+        assert!(reasm.push(&bad).is_none());
+
+        // 分片头不完整（长度不足 5）
+        let mut bad2 = mk_header("127.0.0.1", 9900);
+        bad2.extend_from_slice(&[UDP_FRAG_MARK, 0x00]);
+        assert!(reasm.push(&bad2).is_none());
+    }
+
+    #[test]
+    fn test_parse_udp_addr_header_roundtrip() {
+        // 地址头编解码往返
+        let addr: std::net::SocketAddr = "127.0.0.1:9900".parse().unwrap();
+        let mut encoded = Vec::new();
+        encode_udp_addr_header(&addr, &mut encoded);
+        let (host, port, payload) = parse_udp_addr_header(&encoded).unwrap();
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 9900);
+        assert!(payload.is_empty());
+
+        // 带 payload
+        let mut encoded2 = Vec::new();
+        encode_udp_addr_header(&addr, &mut encoded2);
+        encoded2.extend_from_slice(b"data");
+        let (_, _, payload) = parse_udp_addr_header(&encoded2).unwrap();
+        assert_eq!(payload, b"data");
+    }
 }
