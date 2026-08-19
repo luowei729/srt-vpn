@@ -87,71 +87,77 @@ pub async fn handle_open_with_rx(
     }
 }
 
-/// UDP 直连转发（服务器端，2026-08-19 新增）
+/// UDP 直连转发（服务器端，2026-08-19 多目标版）
 ///
-/// 设计（对应 SOCKS5 UDP 场景，固定目标会话）：
-/// - Open 帧 proto=1 携带目标 `host:port`（客户端通过 UDP ASSOCIATE 指定）
-/// - 服务端 UdpSocket::bind 随机本地端口，作为该会话的 UDP 中继出口
-/// - 来自隧道的 Data 帧负载 = 原始 UDP payload → send_to(目标)
-/// - 目标返回的 UDP 数据报 → 封装为 Data 帧发回隧道
+/// 设计（对应 SOCKS5 UDP ASSOCIATE 多目标场景）：
+/// - Open 帧 proto=1；目标由每个 Data 帧的地址头动态指定（不是 Open 固定）
+/// - 隧道 Data 帧负载格式：`[host_len(1B) + host + port(2B BE)][UDP payload]`
+/// - 服务端单个共享 UdpSocket（未 connect），按目标 send_to；recv_from 得到源地址
+/// - 目标响应回传格式相同：`[源host_len + 源host + 源port][payload]` → Data 帧
 ///
-/// 双向用 tokio::select! 同时驱动"隧道→UDP"和"UDP→隧道"两个方向。
+/// 约束：UDP payload + 地址头 ≤ FRAME_DATA_MAX(1301B)。大 UDP 数据报的重组为后续扩展。
 async fn start_udp_forward(
     session_id: u16,
-    open: &OpenRequest,
+    _open: &OpenRequest, // 多目标：目标在每帧地址头，忽略 Open 的固定目标
     rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     conn: Arc<SrtConnection>,
     mux_enc: Arc<MuxEncoder>,
     registry: SessionRegistry,
 ) -> Result<(), String> {
-    // 1. 解析目标（DNS 解析为 socket 地址）
-    let target = format!("{}:{}", open.host, open.port);
-    // 用 tokio 解析（支持域名）
-    let target_addr = tokio::net::lookup_host(&target)
-        .await
-        .map_err(|e| format!("解析目标 {target} 失败: {e}"))?
-        .next()
-        .ok_or_else(|| format!("目标 {target} 无法解析"))?;
-    tracing::info!(session = session_id, target = %target, "UDP 转发会话建立");
+    tracing::info!(session = session_id, "UDP 转发会话建立（多目标）");
 
-    // 2. 创建 UDP socket（随机本地端口）
-    let socket = std::sync::Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await
-        .map_err(|e| format!("UDP socket bind 失败: {e}"))?);
-    socket.connect(target_addr).await
-        .map_err(|e| format!("UDP connect 失败: {e}"))?;
+    // 1. 创建共享 UDP socket（未 connect，支持多目标 send_to）
+    let socket = std::sync::Arc::new(
+        tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| format!("UDP socket bind 失败: {e}"))?,
+    );
 
-    // 3. 用已注册的接收通道建立隧道会话
+    // 2. 用已注册的接收通道建立隧道会话
     let mut session = TunnelSession::new(session_id, rx, conn, mux_enc, registry.clone());
 
-    // 4. 双向转发：
-    //    - 隧道 Data 帧 → UDP send
-    //    - UDP recv → 隧道 Data 帧
-    let mut udp_buf = [0u8; 65536]; // UDP 最大数据报
+    // 3. 双向转发
+    let mut udp_buf = [0u8; 65536];
     loop {
         tokio::select! {
-            // 方向 1：隧道 → UDP 目标
+            // 方向 1：隧道 → UDP 目标（按帧内地址头）
             recv_result = session.recv() => {
                 match recv_result {
                     Some(data) => {
-                        // 隧道数据（原始 UDP payload）→ 发给目标
-                        if let Err(e) = socket.send(&data).await {
-                            tracing::debug!(session = session_id, error = %e, "UDP send 失败");
+                        // 解析地址头 → (host, port, payload)
+                        if let Some((host, port, payload)) = parse_udp_addr_header(&data) {
+                            // 解析目标地址（lookup_host 接受 (host, port) 所有权，避免借用生命周期问题）
+                            match tokio::net::lookup_host((host.as_str(), port)).await {
+                                Ok(mut addrs) => {
+                                    if let Some(addr) = addrs.next() {
+                                        if let Err(e) = socket.send_to(payload, addr).await {
+                                            tracing::debug!(session = session_id, error = %e, "UDP send_to 失败");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!(session = session_id, host = %host, port = port, error = %e, "UDP 目标解析失败");
+                                }
+                            }
+                        } else {
+                            tracing::debug!(session = session_id, "UDP 帧地址头无效");
                         }
                     }
                     None => {
-                        // 隧道会话关闭（客户端关闭 UDP 会话）
                         tracing::debug!(session = session_id, "UDP 会话隧道侧关闭");
                         break;
                     }
                 }
             }
-            // 方向 2：UDP 目标响应 → 隧道
+            // 方向 2：UDP 目标响应 → 隧道（带源地址头）
             recv_from = socket.recv_from(&mut udp_buf) => {
                 match recv_from {
-                    Ok((len, _src)) => {
-                        // 目标响应数据报 → 封装为 Data 帧发回隧道
-                        let payload = &udp_buf[..len];
-                        if let Err(e) = session.send_data(payload).await {
+                    Ok((len, src)) => {
+                        // 封装 [源地址头][payload] 回传
+                        let mut out = Vec::with_capacity(len + 40);
+                        encode_udp_addr_header(&src, &mut out);
+                        out.extend_from_slice(&udp_buf[..len]);
+                        if let Err(e) = session.send_data(&out).await {
                             tracing::debug!(session = session_id, error = %e, "UDP 回传失败");
                             break;
                         }
@@ -165,10 +171,35 @@ async fn start_udp_forward(
         }
     }
 
-    // 5. 清理：关闭会话（发 Close 帧）
+    // 4. 清理：关闭会话（发 Close 帧）
     tracing::debug!(session = session_id, "UDP 转发会话结束");
     let _ = session.send_control(FrameType::Close, &[]).await;
     Ok(())
+}
+
+/// 解析 UDP 地址头：`[host_len(1B) + host + port(2B BE)][payload]`
+/// 返回 (host, port, payload)
+pub fn parse_udp_addr_header(data: &[u8]) -> Option<(String, u16, &[u8])> {
+    if data.len() < 3 {
+        return None;
+    }
+    let host_len = data[0] as usize;
+    if data.len() < 1 + host_len + 2 {
+        return None;
+    }
+    let host = String::from_utf8_lossy(&data[1..1 + host_len]).into_owned();
+    let port = u16::from_be_bytes([data[1 + host_len], data[2 + host_len]]);
+    let payload = &data[3 + host_len..];
+    Some((host, port, payload))
+}
+
+/// 编码 UDP 地址头（追加到 out）：`[host_len(1B) + host(IP字符串) + port(2B BE)]`
+pub fn encode_udp_addr_header(addr: &std::net::SocketAddr, out: &mut Vec<u8>) {
+    let host = addr.ip().to_string();
+    let host_bytes = host.as_bytes();
+    out.push(host_bytes.len() as u8);
+    out.extend_from_slice(host_bytes);
+    out.extend_from_slice(&addr.port().to_be_bytes());
 }
 
 /// TCP 直连转发（服务器端）

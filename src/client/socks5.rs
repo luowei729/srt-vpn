@@ -426,40 +426,41 @@ async fn start_udp_associate(
         Some((host, port, &datagram[pos..]))
     }
 
-    // 3. 等首个客户端 UDP 数据报，确定目标并建立隧道会话
-    let mut buf = [0u8; 65536];
-    let (len, client_addr) = relay
-        .recv_from(&mut buf)
-        .await
-        .map_err(|e| format!("UDP 中继首包 recv 失败: {e}"))?;
-    let (host, port, first_payload) = parse_udp_datagram(&buf[..len])
-        .ok_or_else(|| "首个 UDP 数据报格式无效".to_string())?;
-    tracing::info!(host = %host, port = port, client = %client_addr, "UDP ASSOCIATE 建立隧道会话");
-
-    // 4. 分配隧道会话并 Open（proto=1 → 服务器 UDP 转发）
+    // 3. 建立单个隧道 UDP 会话（proto=1，多目标：目标由每帧地址头动态指定）
+    //    Open 目标用占位（服务器多目标模式忽略 Open 固定目标）
     let (sid, rx) = registry.allocate();
     let mut session = TunnelSession::new(sid, rx, conn, mux_enc, registry.clone());
-    session.send_open(1, &host, port).await?;
-    // 发送首个 payload
-    session.send_data(first_payload).await?;
+    session.send_open(1, "0.0.0.0", 0).await?;
+    tracing::info!(session = sid, client = %peer, "UDP ASSOCIATE 隧道会话建立（多目标）");
 
-    // 5. 双向转发：
-    //    - 中继收客户端 UDP → 隧道 Data 帧
-    //    - 隧道 UDP 响应 → 封装 SOCKS5 UDP 头 → 发回 client_addr
+    // 4. 双向转发（多目标）：
+    //    - 客户端 UDP 数据报 → 解析 SOCKS5 UDP 头目标 → 封装 [地址头][payload] → 隧道
+    //    - 隧道响应 [地址头][payload] → 解析源目标 → 封装 SOCKS5 UDP 数据报 → 客户端中继
+    let mut buf = [0u8; 65536];
+    let mut client_addr_opt: Option<std::net::SocketAddr> = None;
     loop {
         tokio::select! {
             // 方向 1：客户端 UDP → 隧道
             r = relay.recv_from(&mut buf) => {
                 match r {
                     Ok((len, src)) => {
-                        if let Some((_h, _p, payload)) = parse_udp_datagram(&buf[..len]) {
-                            // 固定目标会话：忽略数据报内的目标（与首个一致），只发 payload
-                            if let Err(e) = session.send_data(payload).await {
+                        client_addr_opt = Some(src);
+                        if let Some((host, port, payload)) = parse_udp_datagram(&buf[..len]) {
+                            // 封装 [地址头][payload] → 隧道（多目标单会话）
+                            let mut framed = Vec::with_capacity(len + 40);
+                            let target_ip = host.parse::<std::net::Ipv4Addr>()
+                                .map(std::net::IpAddr::V4)
+                                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                            crate::server::forward::encode_udp_addr_header(
+                                &std::net::SocketAddr::new(target_ip, port),
+                                &mut framed,
+                            );
+                            framed.extend_from_slice(payload);
+                            if let Err(e) = session.send_data(&framed).await {
                                 tracing::debug!(error = %e, "UDP 隧道发送失败");
                                 break;
                             }
                         }
-                        let _ = src;
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, "UDP 中继 recv 失败");
@@ -471,17 +472,29 @@ async fn start_udp_associate(
             resp = session.recv() => {
                 match resp {
                     Some(data) => {
-                        // 封装 SOCKS5 UDP 数据报：RSV(2)+FRAG(1)+ATYP(1)+IPV4(4)+PORT(2)+DATA
-                        let mut out = vec![0, 0, 0, 0x01];
-                        if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-                            out.extend_from_slice(&ip.octets());
-                        } else {
-                            out.extend_from_slice(&[0, 0, 0, 0]);
-                        }
-                        out.extend_from_slice(&port.to_be_bytes());
-                        out.extend_from_slice(&data);
-                        if let Err(e) = relay.send_to(&out, client_addr).await {
-                            tracing::debug!(error = %e, "UDP 回包失败");
+                        // 解析 [地址头][payload]
+                        if let Some((host, port, payload)) = crate::server::forward::parse_udp_addr_header(&data) {
+                            // 封装 SOCKS5 UDP 数据报（ATYP 视主机决定 IPv4/域名）
+                            let mut out = Vec::with_capacity(payload.len() + 40);
+                            out.extend_from_slice(&[0, 0, 0]); // RSV2 + FRAG0
+                            if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+                                out.push(0x01);
+                                out.extend_from_slice(&ip.octets());
+                            } else {
+                                // 域名/IPv6：用域名类型（ATYP=0x03）
+                                out.push(0x03);
+                                out.push(host.len() as u8);
+                                out.extend_from_slice(host.as_bytes());
+                            }
+                            out.extend_from_slice(&port.to_be_bytes());
+                            out.extend_from_slice(payload);
+                            if let Some(addr) = client_addr_opt {
+                                if let Err(e) = relay.send_to(&out, addr).await {
+                                    tracing::debug!(error = %e, "UDP 回包失败");
+                                }
+                            } else {
+                                tracing::debug!("UDP 响应早于首个客户端包，丢弃");
+                            }
                         }
                     }
                     None => {
@@ -493,8 +506,8 @@ async fn start_udp_associate(
         }
     }
 
-    // 6. 清理：关闭会话（发 Close）
-    tracing::info!(peer = %peer, target = %format!("{host}:{port}"), "UDP ASSOCIATE 结束");
+    // 5. 清理：关闭会话（发 Close）
+    tracing::info!(session = sid, peer = %peer, "UDP ASSOCIATE 结束");
     let _ = session.send_control(crate::tunnel::FrameType::Close, &[]).await;
     Ok(())
 }
