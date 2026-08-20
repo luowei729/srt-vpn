@@ -181,8 +181,6 @@ impl MuxDecoder {
         let seq = u32::from_be_bytes([ts_payload[10], ts_payload[11], ts_payload[12], ts_payload[13]]);
         // 标志位
         let flags = ts_payload[14];
-        // payload
-        let payload = ts_payload[FRAME_HEADER_LEN..FRAME_HEADER_LEN + payload_len].to_vec();
 
         // 序号连续性检测（best-effort 模式丢包时告警）
         if self.have_seq && seq != self.last_seq.wrapping_add(1) {
@@ -195,6 +193,9 @@ impl MuxDecoder {
         self.last_seq = seq;
         self.have_seq = true;
 
+        // 2026-08-20 性能优化：decode_frame_view 用字节切片不复制 payload，
+        // decode_frame 保留兼容（测试用）但每帧 alloc 一次 Vec。
+        let payload = ts_payload[FRAME_HEADER_LEN..FRAME_HEADER_LEN + payload_len].to_vec();
         Some(Frame {
             ftype,
             session_id,
@@ -202,6 +203,46 @@ impl MuxDecoder {
             flags,
             payload,
         })
+    }
+
+    /// 解析帧头返回视图（不复制 payload；性能优化版）。
+    ///
+    /// 2026-08-20：每帧省一次 Vec alloc（高频路径 18000 包/s × 1301B = 23MB/s
+    /// 分配率是上传瓶颈之一）。Data 帧在 dispatch 时**一次** alloc Vec 给
+    /// SessionEvent::Data（不能避免，channel 要 owned），但避免了 Frame 中间
+    /// 持有 + dispatch_frame 内 `payload.clone()` 二次分配。
+    pub fn decode_frame_view<'a>(&mut self, ts_payload: &'a [u8]) -> Option<(FrameType, u16, u32, u8, &'a [u8])> {
+        if ts_payload.len() < FRAME_HEADER_LEN {
+            return None;
+        }
+        if ts_payload[0..4] != TUNNEL_MAGIC {
+            return None;
+        }
+        if ts_payload[4] != PROTOCOL_VERSION {
+            tracing::warn!(version = ts_payload[4], "不支持的隧道协议版本");
+            return None;
+        }
+        let ftype = FrameType::from_byte(ts_payload[5])?;
+        let session_id = u16::from_be_bytes([ts_payload[6], ts_payload[7]]);
+        let payload_len = u16::from_be_bytes([ts_payload[8], ts_payload[9]]) as usize;
+        if payload_len > ts_payload.len() - FRAME_HEADER_LEN {
+            tracing::warn!(payload_len, available = ts_payload.len() - FRAME_HEADER_LEN, "帧长度超界");
+            return None;
+        }
+        let seq = u32::from_be_bytes([ts_payload[10], ts_payload[11], ts_payload[12], ts_payload[13]]);
+        let flags = ts_payload[14];
+
+        if self.have_seq && seq != self.last_seq.wrapping_add(1) {
+            let gap = seq.wrapping_sub(self.last_seq);
+            if gap > 1 && gap < 100 {
+                tracing::debug!(from = self.last_seq, to = seq, "帧序号跳变（可能丢帧）");
+            }
+        }
+        self.last_seq = seq;
+        self.have_seq = true;
+
+        let payload = &ts_payload[FRAME_HEADER_LEN..FRAME_HEADER_LEN + payload_len];
+        Some((ftype, session_id, seq, flags, payload))
     }
 }
 
@@ -234,6 +275,15 @@ impl SessionQueue {
 /// 不再需要解 TS 壳，直接交给 MuxDecoder 解析帧头。
 pub fn decode_srt_message(msg: &[u8], mux: &mut MuxDecoder) -> Option<Frame> {
     mux.decode_frame(msg)
+}
+
+/// 解析 SRT 消息 → 帧字段 view（不 alloc payload）
+/// 2026-08-20 性能优化：高频上传路径用，避免每帧 Vec alloc（详见 decode_frame_view）
+pub fn decode_srt_message_view<'a>(
+    msg: &'a [u8],
+    mux: &mut MuxDecoder,
+) -> Option<(FrameType, u16, u32, u8, &'a [u8])> {
+    mux.decode_frame_view(msg)
 }
 
 /// 字节序辅助（调试/测试）

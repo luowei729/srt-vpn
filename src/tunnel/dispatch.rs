@@ -388,6 +388,45 @@ pub fn dispatch_frame(
     }
 }
 
+/// view 版分发（不复制 payload；Data 路由时一次性 alloc Vec）
+///
+/// 2026-08-20 性能优化：高频上传路径用，每帧避免一次 Frame 中间 alloc +
+/// dispatch_frame 内 `payload.clone()` 二次分配。Data 帧路由到 SessionEvent::Data
+/// 仍需一次 Vec alloc（channel 要 owned，无法避免）。
+pub fn dispatch_frame_view(
+    ftype: crate::tunnel::FrameType,
+    sid: u16,
+    payload: &[u8],
+    registry: &SessionRegistry,
+) -> DispatchAction {
+    match ftype {
+        FrameType::Data => {
+            // 一次性 alloc Vec 给 SessionEvent::Data（channel 要 owned）
+            if registry.route(sid, SessionEvent::Data(payload.to_vec())) {
+                DispatchAction::Routed
+            } else {
+                DispatchAction::UnknownSession(sid)
+            }
+        }
+        FrameType::Fin => {
+            registry.route(sid, SessionEvent::Fin);
+            DispatchAction::Fin(sid)
+        }
+        FrameType::Close => {
+            registry.route(sid, SessionEvent::Close);
+            DispatchAction::Closed(sid)
+        }
+        FrameType::Rst => {
+            registry.route(sid, SessionEvent::Close);
+            DispatchAction::Rst(sid)
+        }
+        // Open 帧：dispatch_frame_view 不复制 payload（外层直接用 view 处理）。
+        // 返回 Open(sid, empty Vec) 让外层匹配各自取 payload
+        FrameType::Open => DispatchAction::Open(sid, Vec::new()),
+        _ => DispatchAction::Other,
+    }
+}
+
 /// 帧分发动作结果（供接收循环匹配处理）
 #[derive(Debug)]
 pub enum DispatchAction {

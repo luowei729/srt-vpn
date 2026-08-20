@@ -17,7 +17,6 @@ use crate::config::Config;
 use crate::quic::connection::QuicConnection;
 use crate::quic::listener::QuicListener;
 use crate::tunnel::multiplex::{MuxDecoder, MuxEncoder};
-use crate::tunnel::FrameType;
 
 /// 接受连接循环（阻塞直到出错）
 ///
@@ -158,12 +157,18 @@ async fn handle_client(
         for ev in batch {
             match ev {
                 crate::quic::connection::RecvEvent::Data { data, .. } => {
-                    if let Some(frame) = crate::tunnel::multiplex::decode_srt_message(&data, &mut mux_dec) {
-                        g_rx_frames += 1;
-                        g_rx_total += frame.payload.len() as u64;
-                        dispatch_one_frame(&frame, &conn, &mux_enc_arc, &registry);
-                    } else {
-                        tracing::warn!("收到无效隧道帧");
+                    // 2026-08-20 性能优化：decode_frame_view 避免每帧 Vec alloc
+                    // （上传 18000 包/s × 1301B = 23MB/s 分配率是上传瓶颈之一）
+                    match crate::tunnel::multiplex::decode_srt_message_view(&data, &mut mux_dec) {
+                        Some((ftype, sid, seq, flags, payload)) => {
+                            g_rx_frames += 1;
+                            g_rx_total += payload.len() as u64;
+                            dispatch_frame_view(
+                                ftype, sid, seq, flags, payload,
+                                &conn, &mux_enc_arc, &registry,
+                            );
+                        }
+                        None => { tracing::warn!("收到无效隧道帧"); }
                     }
                 }
                 crate::quic::connection::RecvEvent::Fin { stream_id } => {
@@ -189,42 +194,62 @@ async fn handle_client(
 /// 单帧分发（会话路由 + Open 建立转发）
 ///
 /// 2026-08-20 重构：conn 为 QuicConnection（发送用 send_async/send 兼容 API）。
+#[allow(dead_code)]
 fn dispatch_one_frame(
     frame: &crate::tunnel::multiplex::Frame,
     conn: &Arc<QuicConnection>,
     mux_enc_arc: &Arc<MuxEncoder>,
     registry: &crate::tunnel::dispatch::SessionRegistry,
 ) {
-    match crate::tunnel::dispatch::dispatch_frame(frame, registry) {
-        crate::tunnel::dispatch::DispatchAction::Routed => {
-            tracing::trace!(session = frame.session_id, len = frame.payload.len(), "数据已路由到转发会话");
+    // 兼容旧接口（保留用于测试/其他调用方）
+    dispatch_frame_view(
+        frame.ftype, frame.session_id, frame.seq, frame.flags, &frame.payload,
+        conn, mux_enc_arc, registry,
+    )
+}
+
+/// view 版分发（不复制 payload；Data 路由时一次性 alloc Vec）
+///
+/// 每帧省一次中间 Vec alloc + dispatch_frame 内 payload.clone() 二次分配。
+/// Data 帧路由到 SessionEvent::Data(Vec) 仍需一次 alloc（channel 要 owned，
+/// 无法避免），但 Open 帧的 payload 只在 Open 分支 alloc（传到 spawn task）。
+fn dispatch_frame_view(
+    ftype: crate::tunnel::FrameType,
+    sid: u16,
+    _seq: u32,
+    _flags: u8,
+    payload: &[u8],
+    conn: &Arc<QuicConnection>,
+    mux_enc_arc: &Arc<MuxEncoder>,
+    registry: &crate::tunnel::dispatch::SessionRegistry,
+) {
+    use crate::tunnel::dispatch::DispatchAction;
+    use crate::tunnel::FrameType;
+    match crate::tunnel::dispatch::dispatch_frame_view(ftype, sid, payload, registry) {
+        DispatchAction::Routed => {
+            tracing::trace!(session = sid, len = payload.len(), "数据已路由到转发会话");
         }
-        crate::tunnel::dispatch::DispatchAction::UnknownSession(sid) => {
-            // 数据帧找不到会话 = 僵尸会话：回发 Rst 让客户端停止（2026-08-20 讣告机制）
+        DispatchAction::UnknownSession(sid) => {
             tracing::warn!(session = sid, "数据帧无法路由（转发会话不存在），回发 Rst");
             let rst = mux_enc_arc.encode_frame(FrameType::Rst, sid, 0, &[]);
             if let Err(e) = conn.send(rst) {
                 tracing::debug!(session = sid, error = %e, "发送 Rst 失败");
             }
         }
-        crate::tunnel::dispatch::DispatchAction::Fin(sid) => {
+        DispatchAction::Fin(sid) => {
             tracing::debug!(session = sid, "客户端 FIN（半关闭）");
         }
-        crate::tunnel::dispatch::DispatchAction::Closed(sid) => {
+        DispatchAction::Closed(sid) => {
             tracing::info!(session = sid, "客户端关闭会话");
         }
-        crate::tunnel::dispatch::DispatchAction::Rst(sid) => {
+        DispatchAction::Rst(sid) => {
             tracing::info!(session = sid, "客户端 Rst（会话已死），转发任务清理");
         }
-        crate::tunnel::dispatch::DispatchAction::Open(sid, payload) => {
+        DispatchAction::Open(sid, _) => {
+            // Open 帧：用外层 view 的 payload（dispatch_frame_view 不复制）
             tracing::info!(session = sid, "客户端请求打开会话");
-            // 会话 ID 复用处理：
-            // 同一 QUIC 主数据流上，客户端 Close(旧会话) 与 Open(新会话) 会相邻到达。
-            // 若旧会话的转发任务（异步 remove）尚未完成，register_specific(1) 会撞"已占用"。
-            // 正确行为：旧会会话已发 Close（客户端明确终止），可直接接管其 ID——
-            // 先移除旧注册（其转发任务收 Close 事件后自然退出），再注册新会话。
-            // H4 语义（防恶意 Open 踢现有会话）仍被保留：仅当**同一次 Open** 明确
-            // 携带该 ID 时才接管；对恶意客户端，这只影响其自己声明已结束的会话。
+            // Open 帧的 payload 需要跨 spawn 边界 owned（一次性 alloc）
+            let payload_owned = payload.to_vec();
             if registry.has(sid) {
                 tracing::debug!(session = sid, "会话 ID 复用：先移除旧注册再接受新 Open");
                 registry.remove(sid);
@@ -237,7 +262,7 @@ fn dispatch_one_frame(
                     let reg_cleanup = registry.clone();
                     tokio::spawn(async move {
                         if let Err(e) = crate::server::forward::handle_open_with_rx(
-                            sid, &payload, rx, conn_c, mux_c, reg_c,
+                            sid, &payload_owned, rx, conn_c, mux_c, reg_c,
                         ).await {
                             tracing::warn!(session = sid, error = %e, "转发会话处理结束");
                         }
@@ -245,15 +270,14 @@ fn dispatch_one_frame(
                     });
                 }
                 None => {
-                    // H4：ID 已被占用 = 客户端协议异常，不动现有会话，直接拒绝
                     tracing::warn!(session = sid, "会话 ID 已被占用，拒绝 Open");
                     let reject = mux_enc_arc.encode_frame(FrameType::Close, sid, 0, &[]);
                     let _ = conn.send(reject);
                 }
             }
         }
-        crate::tunnel::dispatch::DispatchAction::Other => {
-            tracing::debug!(ftype = ?frame.ftype, "未处理控制帧（心跳/ACK 由内核承担）");
+        DispatchAction::Other => {
+            tracing::debug!(ftype = ?ftype, "未处理控制帧（心跳/ACK 由内核承担）");
         }
     }
 }
