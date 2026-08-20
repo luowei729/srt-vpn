@@ -2,6 +2,45 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-20 13:10] - v2 传输层完整重写：区间 ACK + 块边界协议 + 四大关键 bug 修复（10MB 下载卡 16KB 根治，零告警）
+
+### 改动前总结
+v1 传输层（deepseek 生成质量不达标）经 SACK 补丁后丢包场景反复卡死，用户拍板
+完整重写。v2 设计：包号放 SRT 外壳 SEQ（真 SRT 语义，接收方直接可见）-> 区间
+ACK（RFC9000 ACK Ranges 风格，SACK 内建）-> 重传 = 删旧条目 + 新包号记账 ->
+单 ConnState Mutex -> 周期 10ms ACK。重写后小请求 20/20 通过，但 10MB 下载
+持续卡 size=16384。
+
+### 根因分析（四层叠加，全部定位修复）
+1. **PING/PONG 包号黑洞**：数据壳包（STREAM/PING/PONG/RST）都消耗包号序列，
+   旧版只记 STREAM 帧的包号 -> PING 包号成黑洞，ACK 区间语义混乱。修复：
+   `handle_datagram` 统一记账（所有数据壳包记入 received）。
+2. **take_block 后预算不足 break = 块永久丢失**（10MB 卡 16KB 直接根因）：
+   `take_block()` 已把块移出队列，慢启动 ramp 期预算残值 < 1316B 时 break，
+   块被静默丢弃且 tracker 未记账 -> 流内永久空洞 -> 接收方 delivered_offset
+   卡死（空洞恰好 10×1316）。修复：`peek_block_len()` 先窥视再取块，预算不
+   足块留在队列下轮再取。
+3. **send_msg 背压部分写入**（"帧长度超界"153 次根因）：`StreamSend::send`
+   空间不足部分写（take < data.len()），调用方重试从头写 -> 已写入前缀被重
+   复写入，offset 连续但内容错位 -> Mux 帧错位。修复：**send 原子语义**--
+   整块放不下返回 0 等待重试（帧最大 1316B vs 缓冲 1MB，等待代价毫秒级）。
+4. **RecvTracker 裁剪吞 gap 证据**：裁剪基准 largest_recv-window 会把丢包
+   位置裁掉（ACK 报不出 gap）-> 改 min_unacked 基准；`desc.truncate(1024)`
+   吞突发 gap -> 全窗口扫描。
+
+### 改动后总结
+- **文件**：src/quic/{packet,ack,stream,connection}.rs 全部重写 +
+  srt_shell/outer.rs v2 接口（encode_data_packet_v2/decode_packet_v2）。
+  单测 73 个全过、release 零警告。
+- **验证矩阵全绿**：30 次 10MB 下载 30/30；30MB 下载一致（~5-11MB/s 回环）；
+  30MB 上传 received=expected 完整；8 并发 10MB 8/8；netem 2%+20ms 丢包
+  3 轮全一致；5% 丢包 10MB 一致（3.1s）；小请求 20/20；**双端零告警**
+  （此前"帧长度超界"153 次/"收到无效隧道帧"同步消失）。
+- **吞吐说明**：原子 send 后回环 5-11MB/s（正确性优先，cwnd 4MB 满速运行），
+  公网链路远低于此不构成瓶颈。
+- **配置**：pool_size 配置化（SRT_POOL_SIZE env / 配置文件，1..=16 默认 4）。
+- **诊断日志清理**：主流帧到达计数/send_loop 诊断/多段 ACK 打印全部移除。
+
 ## [2026-08-20 11:06] - P1.5 传输层三连修：ACK 字节偏移语义 + 主流重组 + 吞吐三瓶颈（回环 1MB/s → 下载 28/上传 14 MB/s）
 
 ### 改动前总结

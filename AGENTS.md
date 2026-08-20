@@ -70,3 +70,9 @@
   - **② 主数据流必须走 offset 重组（高速数据错乱根因）**：旧实现主流"直接投递"假设到达有序，丢包重传后乱序到达即数据错位（cmp 在 byte~25 万处 differ）。**修复：主流统一走 recv_data 重组**（StreamRecv 增加 delivered 队列暂存连续块，recv_take 取走）。教训：**"发送有序=到达有序"只在无丢包时成立，凡有重传必有乱序**。
   - **③ 吞吐三瓶颈**：send_loop 每轮每流只取一块（1316B/ms≈1.3MB/s 上限，且 BBR 采样到低带宽自我实现）-> 改预算内循环取尽；内核 rmem_max=208KB 钳制（本机开发环境漏调！接收溢出->队头阻塞死锁，乱序缓冲堆积告警 9596 次）-> sysctl 调 32MB + 应用层 enlarge_socket_buffers（libc SO_RCVBUF/SO_SNDBUF 4MB，注意 std UdpSocket 无此 API）；cwnd 无上限（BBR 回环误判冲 21MB）-> cap 4MB。**send_raw EAGAIN 自旋重试**（200 次短重试防 wmem 满静默丢包）。ACK 聚合：只在 delivered_offset 推进时回 ACK（防 ACK 风暴占带宽）。
   - **遗留待办**：SACK/快速重传（公网丢包场景优化）、上传方向吞吐（14 vs 下载 28）、POOL_SIZE 配置化。
+- [2026-08-20 13:10] **v2 传输层完整重写收官（用户指令"deepseek 写的质量不行，完整重写"）--四大关键 bug 教训**：
+  - **① 块边界协议铁律**：`StreamSend::send` 必须**原子语义**（整块放不下返回 0，绝不部分写入），`send_loop` 取块必须**先 peek 再 take**（take 后发现预算不足 break = 块已移出队列未记账 = 永久丢失 = 流内空洞 = 接收方 delivered_offset 卡死，10MB 下载卡 16KB 的直接根因，空洞恰好 10×1316=慢启动 ramp 期预算残值累计）。**"每块=一条 Mux 帧"是全链路核心不变量**：部分写入/丢块/拼接（v1 曾犯）都破坏它。
+  - **② 包号序列全量记账**：所有数据壳包（STREAM/PING/PONG/RST）都消耗包号序列，必须全部记入 received（handle_datagram 统一记账），否则 PING 包号黑洞导致 ACK 区间语义混乱。
+  - **③ v2 架构**：包号放 SRT 外壳 SEQ 字段（真 SRT 语义，接收方直接可见）-> 区间 ACK（RFC9000 ACK Ranges，SACK 内建）-> 重传 = 删旧条目 + 新包号记账（标准 QUIC）-> RecvTracker 裁剪基准用 min_unacked（防吞 gap 证据）。
+  - **验证方法论**：先小请求 20/20 再大文件；`grep -c '"level":"(ERROR|WARN)"'` 扫双端日志做回归基线（"帧长度超界"= 块边界被破坏的信号灯）；netem 2%/5% 丢包 + 8 并发 + 30 次连跑是发布前门槛。测试进程残留端口冲突会造成假失败（Exit 1），启动前 `pkill -9` + `ps` 确认清零。
+  - 验证矩阵：30×10MB 全过、30MB 上传下载一致、8 并发 8/8、5% 丢包一致、零告警、73 单测、release 零警告。吞吐回环 5-11MB/s（cwnd 4MB cap，正确性优先）。

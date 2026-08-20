@@ -70,6 +70,10 @@ pub struct Config {
     /// 心跳间隔秒数（默认 5）
     #[serde(default = "default_heartbeat")]
     pub heartbeat_secs: u64,
+    /// 连接池大小（客户端，P1.5 配置化；每条连接独立拥控窗口，
+    /// 默认 4，取值依1公网对照实验 4 连接 +70% 收益；范围 1..=16）
+    #[serde(default = "default_pool_size")]
+    pub pool_size: usize,
 }
 
 /// SOCKS5 用户条目（服务端配置，用于认证客户端 SOCKS5 连接）
@@ -137,6 +141,10 @@ pub struct ReconnectConfig {
 
 fn default_crypto() -> String {
     "aes-128".to_string()
+}
+
+fn default_pool_size() -> usize {
+    4
 }
 
 fn default_udp_mode() -> UdpMode {
@@ -323,6 +331,11 @@ impl Config {
                 .map(|s| s.parse::<u64>().map_err(|_| "SRT_HEARTBEAT_SECS 不是有效数字".to_string()))
                 .transpose()?
                 .unwrap_or_else(default_heartbeat),
+            pool_size: std::env::var("SRT_POOL_SIZE")
+                .ok()
+                .map(|s| s.parse::<usize>().map_err(|_| "SRT_POOL_SIZE 不是有效数字".to_string()))
+                .transpose()?
+                .unwrap_or_else(default_pool_size),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -429,6 +442,11 @@ impl Config {
                 self.heartbeat_secs = v;
             }
         }
+        if let Ok(p) = std::env::var("SRT_POOL_SIZE") {
+            if let Ok(v) = p.parse::<usize>() {
+                self.pool_size = v;
+            }
+        }
     }
 
     /// 校验配置合法性（必填字段 + 取值范围）
@@ -441,6 +459,11 @@ impl Config {
         // 旧实现 0 可通过校验 -> 服务端永久拒绝所有连接且无限循环告警（无法提供服务）。
         if self.max_clients < 1 {
             return Err("max_clients 必须至少为 1".to_string());
+        }
+        // 连接池大小校验（P1.5 配置化）：过小无并发收益，过大占服务端
+        // max_clients 名额且 UDP 流数膨胀（伪装权衡）
+        if self.pool_size < 1 || self.pool_size > 16 {
+            return Err("pool_size 必须在 1..=16 范围（连接池大小）".to_string());
         }
         // 加密强度校验
         match self.crypto.as_str() {

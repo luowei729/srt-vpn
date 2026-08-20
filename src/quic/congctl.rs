@@ -23,8 +23,6 @@ use std::time::{Duration, Instant};
 /// BBR 参数
 const STARTUP_GAIN: f64 = 2.885; // 慢启动增益（BBR v1 标准 2.885）
 const DRAIN_GAIN: f64 = 0.5; // 排水增益
-const PROBE_BW_GAIN_HI: f64 = 1.25; // 探测带宽高增益
-const PROBE_BW_GAIN_LO: f64 = 0.75; // 探测带宽低增益
 const PROBE_BW_GAIN_CRUISE: f64 = 1.0; // 巡航增益
 const PROBE_RTT_INTERVAL: Duration = Duration::from_secs(10); // 每 10s 一次 RTT 探测
 const PROBE_RTT_DURATION: Duration = Duration::from_millis(200);
@@ -75,7 +73,8 @@ pub struct Bbr {
     probe_rtt_time: Instant,
     /// RTT 探测结束时间
     probe_rtt_done_at: Option<Instant>,
-    /// 上次发送时刻（pacing）
+    /// 上次发送时刻（v1 pacing 遗留；P1.5 pacing 接入时启用）
+    #[allow(dead_code)]
     last_send_time: Instant,
 }
 
@@ -226,27 +225,6 @@ impl Bbr {
         }
     }
 
-    /// 带宽探测周期性增益（PROBE_BW 阶段由时间驱动切换 1.25/0.75/1.0）
-    pub fn probe_bw_cycle(&mut self, now: Instant) {
-        if self.state != BbrState::ProbeBw {
-            return;
-        }
-        // 周期 8 个 RTT 长度（简化固定 1s）
-        const CYCLE: Duration = Duration::from_secs(1);
-        let elapsed = now.duration_since(self.last_send_time); // 用上次发送时间近似轮次
-        if elapsed > CYCLE {
-            // 在 h/l/cruise 间轮转
-            self.pacing_gain = if self.pacing_gain >= PROBE_BW_GAIN_HI {
-                PROBE_BW_GAIN_LO
-            } else if self.pacing_gain <= PROBE_BW_GAIN_LO {
-                PROBE_BW_GAIN_CRUISE
-            } else {
-                PROBE_BW_GAIN_HI
-            };
-            self.last_send_time = now;
-        }
-    }
-
     /// 拥塞事件（丢包/超时重传时调用）：降低速率与窗口（BBR 不只靠丢包，
     /// 但持续超时说明带宽估计过高，做防御性回退）
     pub fn on_congestion(&mut self) {
@@ -255,31 +233,6 @@ impl Bbr {
         self.pacing_rate = self.max_bw * self.pacing_gain;
         let bdp = (self.max_bw * self.min_rtt.as_secs_f64()) as usize;
         self.cwnd = (bdp * 2).max(self.cwnd_min);
-    }
-
-    /// 是否允许发送一个数据包（外部连接调度调用）
-    ///
-    /// - 超出拥塞窗口：不发送
-    /// - 满足 pacing 间隔：可发（还返回下一次可发的时间间隔给发送节流）
-    pub fn can_send(&self, now: Instant, inflight_bytes: usize) -> bool {
-        // 窗口检查
-        if inflight_bytes >= self.cwnd {
-            return false;
-        }
-        // pacing 检查（速率 >0 时）
-        if self.pacing_rate > 0.0 {
-            let interval = (1316.0 / self.pacing_rate).max(1e-6); // 每包间隔（秒）
-            let elapsed = now.duration_since(self.last_send_time).as_secs_f64();
-            if elapsed < interval {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// 发送一个包后调用（更新 last_send_time）
-    pub fn on_send(&mut self, now: Instant) {
-        self.last_send_time = now;
     }
 
     /// 当前拥塞窗口字节数
@@ -292,20 +245,16 @@ impl Bbr {
 mod tests {
     use super::*;
 
-    /// CAN_SEND 窗口限制基本行为
+    /// 窗口增长基本行为（v2：预算制，can_send 已删，验证 cwnd 增长）
     #[test]
-    fn test_can_send_window() {
+    fn test_cwnd_growth() {
         let mut bbr = Bbr::new();
-        let now = Instant::now();
-        // 初始窗口 16×1316 = 21056，inflight 小于窗口可发
-        assert!(bbr.can_send(now, 0));
-        // 模拟填满窗口则拒绝
-        assert!(!bbr.can_send(now, bbr.cwnd_bytes()));
-        // 更新后窗口变大再可发
+        // 初始窗口 16×1316 = 21056
+        assert_eq!(bbr.cwnd_bytes(), 16 * 1316);
+        // 模拟带宽建立：每 RTT 50ms 确认 100KB
         bbr.on_ack(100_000, Duration::from_millis(50));
-        // 短暂轮次模拟带宽建立
         bbr.on_round(Duration::from_millis(100));
-        assert!(bbr.cwnd_bytes() > 16 * 1316, "慢启动后窗口应增长");
+        assert!(bbr.cwnd_bytes() > 16 * 1316, "慢启动后窗口应增长: {}", bbr.cwnd_bytes());
     }
 
     /// 带宽累计后窗口应覆盖 BDP

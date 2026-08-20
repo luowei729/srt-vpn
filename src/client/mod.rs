@@ -18,12 +18,10 @@ use crate::quic::connection::{QuicConfig, QuicConnection};
 use crate::quic::crypto::derive_key;
 use crate::tunnel::multiplex::MuxEncoder;
 
-/// 连接池大小（B 方案，2026-08-20 验证期先固定 4；后续可配置化）
-///
-/// 取值依据：公网对照实验 4 连接并发 151 MB/s（+70% 于单连接 89 MB/s）。
+/// 连接池大小已配置化（P1.5）：Config.pool_size（默认 4）/ SRT_POOL_SIZE 环境变量。
+/// 默认值取值依据：公网对照实验 4 连接并发 151 MB/s（+70% 于单连接 89 MB/s），
 /// 4 条已获大部分收益，过多连接会显著增加 UDP 流数量（伪装权衡）与
 /// 服务端 max_clients 占用，收益递减。
-const POOL_SIZE: usize = 4;
 
 /// 客户端运行入口
 pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
@@ -79,11 +77,13 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
         .unwrap_or(socks5_cfg.listen.clone());
 
     loop {
-        // 建池：POOL_SIZE 条连接（每条独立 QUIC 连接 + 独立拥控窗口，B 方案核心）
+        // 建池：pool_size 条连接（每条独立 QUIC 连接 + 独立拥控窗口，B 方案核心）
+        // P1.5 配置化：池大小来自配置（默认 4，SRT_POOL_SIZE 可覆盖）
+        let pool_size = cfg.pool_size.clamp(1, 16);
         let conns_raw = if first_connect {
             // 首次建池：调用 connect_pool_with_retry（内部按 reconnect 配置重试直到成功或达上限）
             first_connect = false;
-            connect_pool_with_retry(&quic_cfg, cfg).await?
+            connect_pool_with_retry(&quic_cfg, cfg, pool_size).await?
         } else {
             // 断线重连：按 reconnect 配置重试上限
             attempt += 1;
@@ -95,7 +95,7 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
             }
             tracing::warn!(attempt, interval, "隧道断开，准备重连");
             tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-            match connect_pool_once(&quic_cfg).await {
+            match connect_pool_once(&quic_cfg, pool_size).await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(error = %e, "重连 QUIC 失败");
@@ -188,13 +188,13 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
     }
 }
 
-/// 建立单次 QUIC 连接池（B 方案 2026-08-20：并行建 POOL_SIZE 条连接）
+/// 建立单次 QUIC 连接池（B 方案 2026-08-20：并行建 pool_size 条连接）
 ///
 /// 并行建连（spawn_blocking 各自独立），全部成功返回 Vec，任一失败返回 Err
 /// （由调用方按 reconnect 配置重试整个池）。
-async fn connect_pool_once(quic_cfg: &QuicConfig) -> Result<Vec<Arc<QuicConnection>>, String> {
-    let mut handles = Vec::with_capacity(POOL_SIZE);
-    for _ in 0..POOL_SIZE {
+async fn connect_pool_once(quic_cfg: &QuicConfig, pool_size: usize) -> Result<Vec<Arc<QuicConnection>>, String> {
+    let mut handles = Vec::with_capacity(pool_size);
+    for _ in 0..pool_size {
         let cfg = quic_cfg.clone();
         handles.push(tokio::task::spawn_blocking(move || {
             // QuicConnection::connect 内部创建 socket + 收发线程 + 发握手
@@ -202,7 +202,7 @@ async fn connect_pool_once(quic_cfg: &QuicConfig) -> Result<Vec<Arc<QuicConnecti
             rt.block_on(QuicConnection::connect(&cfg))
         }));
     }
-    let mut conns = Vec::with_capacity(POOL_SIZE);
+    let mut conns = Vec::with_capacity(pool_size);
     for h in handles {
         conns.push(
             h.await
@@ -328,12 +328,12 @@ async fn run_recv_inner(
 /// 带重连的 QUIC 连接池（设计决策：5s 心跳 + 客户端自动重连，B 方案 2026-08-20）
 ///
 /// 重连语义与旧版一致（B3）：首次建池 + 断线重建整个池。
-async fn connect_pool_with_retry(cfg: &QuicConfig, app_cfg: &Config) -> Result<Vec<Arc<QuicConnection>>, String> {
+async fn connect_pool_with_retry(cfg: &QuicConfig, app_cfg: &Config, pool_size: usize) -> Result<Vec<Arc<QuicConnection>>, String> {
     let interval = app_cfg.reconnect.as_ref().map(|r| r.interval_secs).unwrap_or(5);
     let max_retries = app_cfg.reconnect.as_ref().map(|r| r.max_retries).unwrap_or(10);
     let mut attempt = 0u64;
     loop {
-        match connect_pool_once(cfg).await {
+        match connect_pool_once(cfg, pool_size).await {
             Ok(conns) => {
                 tracing::info!(attempt, conns = conns.len(), "QUIC 连接池建立成功");
                 return Ok(conns);
