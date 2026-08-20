@@ -124,26 +124,59 @@ impl SendTracker {
 
     /// 收到 ACK：推进 largest_acked，标记确认，采样 RTT 更新 RTO
     /// 返回本轮被确认的包数
+    ///
+    /// 2026-08-20 P1.5 修复（连续 4 次请求后隧道失效根因）：
+    /// ACK 字段语义从"包序号"改为"**字节偏移边界**"。原因是 seq 是发送方内部
+    /// 维护的全局递增序号，接收方从 STREAM 帧只能拿到 (offset, len)，无法
+    /// 映射到对端的包序号——旧实现 send_ack 固定确认 0，导致 seq>0 的包永久
+    /// 未确认 → in_flight 无限增长（send_loop 停发新包，第 5/6 次请求失败）
+    /// + find_expired 无限重传旧包（实测 session:1 回传重传风暴 1108 次）。
+    /// 现在 ACK(largest_offset) 确认"字节偏移边界 <= largest_offset"的所有包，
+    /// 与接收侧 recv_data 的 offset 幂等重组语义天然对齐。
     pub fn on_ack(&mut self, acked_seq: u64, delay_us: u32) -> usize {
         if acked_seq > self.largest_acked {
             self.largest_acked = acked_seq;
         }
         let mut confirmed = 0usize;
-        // 若 acked_seq 有对应的已发送记录，做 RTT 采样
-        if let Some(pkt) = self.sent.get(&acked_seq) {
-            if !pkt.acked {
-                let now = Instant::now();
-                let sample = now.saturating_duration_since(pkt.sent_time);
-                self.update_rtt(sample, Duration::from_micros(delay_us as u64));
-            }
-        }
-        // 标记所有 seq <= acked_seq 的包为已确认，并统计确认的数据量
+        // 标记所有"字节边界 <= acked_seq"的包已确认（offset 语义）
         let to_remove: Vec<u64> = self
             .sent
             .iter()
-            .filter(|(seq, p)| **seq <= acked_seq && !p.acked)
-            .map(|(seq, _)| *seq)
+            .filter_map(|(seq, p)| {
+                if p.acked {
+                    return None;
+                }
+                // 按负载字节边界确认（offset+len 为此包覆盖的字节上界）
+                let boundary = match &p.payload {
+                    Some(pl) => pl.offset + pl.data.len() as u64,
+                    None => *seq, // 无负载包（PING 等）按序号确认——不参与数据确认
+                };
+                if boundary <= acked_seq {
+                    Some(*seq)
+                } else {
+                    None
+                }
+            })
             .collect();
+        // RTT 采样：用被确认包中触发边界推进的包（取边界最接近 acked_seq 的）
+        if !to_remove.is_empty() {
+            let now = Instant::now();
+            // 采样最近发出的确认包 RTT（简化：取 to_remove 中发送时间最新者）
+            let mut newest_sent = Instant::now();
+            let mut has_sample = false;
+            for seq in &to_remove {
+                if let Some(pkt) = self.sent.get(seq) {
+                    if !has_sample || pkt.sent_time > newest_sent {
+                        newest_sent = pkt.sent_time;
+                        has_sample = true;
+                    }
+                }
+            }
+            if has_sample {
+                let sample = now.saturating_duration_since(newest_sent);
+                self.update_rtt(sample, Duration::from_micros(delay_us as u64));
+            }
+        }
         for seq in &to_remove {
             if let Some(pkt) = self.sent.get_mut(seq) {
                 pkt.acked = true;
@@ -237,7 +270,7 @@ impl SendTracker {
 mod tests {
     use super::*;
 
-    /// 发送与 ACK 基本流程
+    /// 发送与 ACK 基本流程（offset 语义：ACK 确认字节边界）
     #[test]
     fn test_send_ack_flow() {
         let mut t = SendTracker::new();
@@ -250,7 +283,8 @@ mod tests {
         assert_eq!(seq, 0);
         assert_eq!(t.in_flight(), 1);
 
-        let confirmed = t.on_ack(0, 0);
+        // ACK 确认字节边界 4（offset 0 + len 4）
+        let confirmed = t.on_ack(4, 0);
         assert_eq!(confirmed, 1);
         assert_eq!(t.in_flight(), 0);
         // 已确认后应清出表
@@ -282,35 +316,36 @@ mod tests {
         assert_eq!(expired[0].data, b"xyz");
     }
 
-    /// RTT 更新后 RTO 收敛
+    /// RTT 更新后 RTO 收敛（offset 语义）
     #[test]
     fn test_rtt_update() {
         let mut t = SendTracker::new();
-        let seq = t.on_send(Some(SentPayload {
+        let _seq = t.on_send(Some(SentPayload {
             stream_id: 1,
             offset: 0,
             data: vec![0; 100],
             fin: false,
         }));
         std::thread::sleep(Duration::from_millis(20));
-        t.on_ack(seq, 0);
+        // 确认字节边界 100（offset 0 + len 100）
+        t.on_ack(100, 0);
         // SRTT 应接近 20ms（允许较低的系统时钟抖动）
         assert!(t.srtt >= Duration::from_millis(8), "SRTT 应采样 ~10-20ms: {:?}", t.srtt);
         assert!(t.rto >= MIN_RTO);
     }
 
-    /// 重复 ACK 幂等
+    /// 重复 ACK 幂等（offset 语义）
     #[test]
     fn test_dup_ack_idempotent() {
         let mut t = SendTracker::new();
-        let seq = t.on_send(Some(SentPayload {
+        let _seq = t.on_send(Some(SentPayload {
             stream_id: 1,
             offset: 0,
             data: vec![1; 50],
             fin: false,
         }));
-        t.on_ack(seq, 0);
-        let c2 = t.on_ack(seq, 0);
+        t.on_ack(50, 0);
+        let c2 = t.on_ack(50, 0);
         assert_eq!(c2, 0, "重复 ACK 不重复确认");
     }
 }

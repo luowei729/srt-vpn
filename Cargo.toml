@@ -17,6 +17,9 @@ tokio = { version = "1", features = ["full"] }
 argon2 = "0.5"
 sha2 = "0.10"
 rand = "0.8"
+# UDP socket 缓冲调优（SO_RCVBUF/SO_SNDBUF，高吞吐防接收缓冲溢出丢包；
+# 2026-08-20 重构后唯一保留的 FFI 依赖，无 build.rs，无 C 编译）
+libc = "0.2"
 # 日志（JSON 结构化日志）
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }

@@ -115,6 +115,12 @@ pub struct QuicConnection {
     /// 迁移后的数据端口（服务端分配独立数据通道；0 = 未迁移，仍用原监听端口）
     /// 2026-08-20 多设备架构：监听 socket 只握手，认证后数据走独立端口。
     data_only_port: Arc<std::sync::atomic::AtomicU16>,
+    /// 主数据流已接收字节边界（发给对端 ACK 用，offset 语义）
+    /// 2026-08-20 P1.5 修复（连续 4 次请求后隧道失效根因）：
+    /// 接收方从 STREAM 帧拿到 (offset, len)，以 offset+len 推进本游标；
+    /// send_ack 携带该值，发送方据此确认所有字节边界 <= 它的包。
+    /// 仅 recv 线程访问，用普通 Mutex<u64> 即可（与 tracker 解耦）。
+    pub_recv_offset: Mutex<u64>,
     /// 心跳间隔（秒，断线检测）
     heartbeat_secs: u64,
 }
@@ -128,6 +134,23 @@ const ST_CLOSED: u8 = 2;
 /// 决策 F：单连接共享拥控窗口，复用层消息都走这一条流，
 /// QUIC 内部可靠传输保证有序不丢，前端 TunnelSession 语义不变。
 const MAIN_STREAM_ID: u32 = 1;
+
+/// 尝试调大 UDP socket 收发缓冲（高吞吐必需）
+///
+/// 2026-08-20 吞吐修复（P1.5）：内核默认 rmem/wmem 仅 208KB，发送窗口
+/// 一旦突破该值，接收侧 UDP 缓冲溢出丢包（AGENTS.md 2026-08-20 05:30
+/// 已有此教训：应用层请求会被 rmem_max 静默钳制）。尝试设 4MB，被钳制
+/// 则回落到内核允许的最大值（setsockopt 钳制不报错，尽力而为）。
+pub fn enlarge_socket_buffers(sock: &UdpSocket) {
+    const TARGET: i32 = 4 * 1024 * 1024;
+    use std::os::fd::AsRawFd;
+    let fd = sock.as_raw_fd();
+    // SO_RCVBUF（接收）/ SO_SNDBUF（发送）；失败/钳制静默回落默认
+    unsafe {
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &TARGET as *const _ as *const libc::c_void, std::mem::size_of::<i32>() as u32);
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &TARGET as *const _ as *const libc::c_void, std::mem::size_of::<i32>() as u32);
+    }
+}
 
 impl QuicConnection {
     /// 建立连接（客户端入口：connect 到 peer + 发送 SRT 特征握手 AUTH）
@@ -145,6 +168,7 @@ impl QuicConnection {
         let peer = cfg.peer.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "客户端需 peer"))?;
         let sock = UdpSocket::bind("0.0.0.0:0")?;
         sock.set_nonblocking(true)?;
+        enlarge_socket_buffers(&sock);
 
         let (rx_tx, rx_rx) = tokio::sync::mpsc::unbounded_channel::<RecvEvent>();
         let conn = Arc::new(Self {
@@ -161,6 +185,7 @@ impl QuicConnection {
             rx_rx: Arc::new(Mutex::new(Some(rx_rx))),
             authenticated: Arc::new(AtomicBool::new(false)),
             data_only_port: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            pub_recv_offset: Mutex::new(0),
         });
 
         // 启动接收线程（非阻塞 recv 轮询 + 帧解析 + 事件投递）
@@ -213,6 +238,7 @@ impl QuicConnection {
             rx_rx: Arc::new(Mutex::new(Some(rx_rx))),
             authenticated: Arc::new(AtomicBool::new(true)), // 服务端：attach 前已认证
             data_only_port: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            pub_recv_offset: Mutex::new(0),
         });
 
         let conn2 = conn.clone();
@@ -264,21 +290,26 @@ impl QuicConnection {
                         self.state.store(ST_CLOSED, Ordering::Release);
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(10));
+                    // 2026-08-20 吞吐修复：10ms -> 500µs。突发场景下对端一口气
+                    // 灌满缓冲后暂停，本端处理完已缓冲的包后需尽快回到 recv；
+                    // 10ms 睡眠会把 ACK 响应/数据处理延迟一个数量级，高吞吐
+                    // 下表现为吞吐骤降。500µs 对空转 CPU 占用可忽略（2‰）。
+                    std::thread::sleep(Duration::from_micros(500));
                 }
                 Err(_e) => break,
             }
         }
     }
 
-    /// 处理一个 UDP 数据报（SRT 外壳解析 + 内层帧）
+    /// 处理一个 UDP 数据报（SRT 外壳解析 + 解密 + 内层帧）
     fn handle_datagram(&self, data: &[u8]) {
         // 1. SRT 外壳解析（16B 头；区分控制/数据包）
         let Some((is_ctrl, msg_type, inner)) = crate::srt_shell::outer::decode_packet(data) else {
             return; // 非法包（<16B / 未知控制类型）丢弃
         };
         if is_ctrl {
-            // 控制包：握手响应 / 装饰性 ACK / keepalive
+            // 控制包：握手响应 / 装饰性 ACK / keepalive（**不加密**，
+            // 与 SRT 握手首包特征一致；且未协商密钥前对端无法解）
             match msg_type {
                 crate::srt_shell::header::MSG_HANDSHAKE => {
                     // 握手响应（AUTH_OK/FAIL 载荷在内层 Handshake 帧）
@@ -290,8 +321,16 @@ impl QuicConnection {
             }
             return;
         }
-        // 2. 数据壳：内层传输帧（quic frame）
-        self.handle_frame(inner);
+        // 2. 数据壳：先解密内层传输帧，再解析（P1.5 载荷加密接入）
+        let plain = match crate::quic::crypto::decrypt_block(&self.secret, inner) {
+            Some(p) => p,
+            None => {
+                // 解密失败（密钥不匹配/包损坏）：丢弃（对齐 SRT 对异常包的静默）
+                tracing::trace!(len = inner.len(), "数据包解密失败，丢弃");
+                return;
+            }
+        };
+        self.handle_frame(&plain);
     }
 
     /// 处理内层传输帧
@@ -303,28 +342,54 @@ impl QuicConnection {
             FrameType::Stream => {
                 // STREAM 帧：投递到流管理 + 发送 ACK
                 if let Ok((fin, sid, offset, data)) = packet::decode_stream(frame) {
-                    if sid == MAIN_STREAM_ID {
-                        // 主数据流（承载前端 Mux 消息）：每个 STREAM 帧 payload
-                        // 即一条完整消息（消息边界由 send_msg 保证），直接投递。
-                        // 注意：不经过 stream buffer 字节流重组——QUIC 内部 ACK/
-                        // 重传保证有序不丢，接收顺序 = 发送顺序。
-                        let _ = self.rx_tx.send(RecvEvent::Data {
-                            stream_id: sid,
-                            data: data.to_vec(),
-                        });
+                    // 所有流（含主数据流）统一走 recv_data 按 offset 重组。
+                    //
+                    // 2026-08-20 P1.5 修复（高速下数据错乱根因）：旧实现主数据流
+                    // 绕过重组"直接投递"，假设"发送顺序=到达顺序"。但丢包后重传的
+                    // 包会乱序到达（N 丢 N+1 先到，N 重传到），直接投递导致数据错位。
+                    // 现在统一进流缓冲重组，recv_take 按序取连续数据投递上层，
+                    // 乱序/重传由 offset 幂等重组消化，语义正确。
+                    let mut sm = self.streams.lock().unwrap();
+                    if !sm.stream_exists(sid) {
+                        let _ = sm.open_stream_at(sid);
+                    }
+                    if let Some(s) = sm.get(sid) {
+                        // 记录重组前的交付边界（判断本次是否推进）
+                        let before = s.recv.as_ref().map(|r| r.delivered_offset).unwrap_or(0);
+                        s.recv_data(offset, data, fin);
+                        // 取重组后的连续数据投递（可能多块，一次投递拼接）
+                        let delivered = s.recv_take();
+                        // 乱序缓冲保护：堆积过大说明前序包长时间未重传到
+                        //（队头阻塞），丢弃策略会让流永久卡死，这里仅告警观测
+                        if let Some(r) = &s.recv {
+                            if r.unordered.len() > 1024 {
+                                tracing::warn!(stream = sid, pending = r.unordered.len(), delivered_offset = r.delivered_offset, "乱序缓冲异常堆积（队头阻塞观测）");
+                            }
+                        }
+                        drop(sm);
+                        if !delivered.is_empty() {
+                            let _ = self.rx_tx.send(RecvEvent::Data {
+                                stream_id: sid,
+                                data: delivered,
+                            });
+                        }
                         if fin {
                             let _ = self.rx_tx.send(RecvEvent::Fin { stream_id: sid });
                         }
-                    } else {
-                        // 其他流（未来 per-session 模式）：走流缓冲重组
-                        let mut sm = self.streams.lock().unwrap();
-                        if let Some(s) = sm.get(sid) {
-                            s.recv_data(offset, data, fin);
+                        // ACK 聚合（2026-08-20 吞吐修复）：只在重组推进时回 ACK--
+                        // 乱序包（未推进 delivered_offset）不回 ACK，等前序到齐
+                        // 一并确认，避免高速下每帧一个 ACK 的 ACK 风暴（ACK 包
+                        // 量 = 数据包量，白耗一半带宽）。重复包同样不回。
+                        let after = {
+                            let mut sm = self.streams.lock().unwrap();
+                            sm.get(sid).and_then(|s| s.recv.as_ref()).map(|r| r.delivered_offset).unwrap_or(0)
+                        };
+                        if after > before {
+                            let largest = after.max(*self.pub_recv_offset.lock().unwrap());
+                            *self.pub_recv_offset.lock().unwrap() = largest;
+                            self.send_ack(largest);
                         }
-                        let _ = offset;
                     }
-                    // 发送 ACK（聚合：每收到一个 STREAM 帧回一 ACK，简单可靠）
-                    self.send_ack();
                 }
             }
             FrameType::Ack => {
@@ -369,9 +434,14 @@ impl QuicConnection {
                         self.authenticated.store(true, Ordering::Release);
                         self.state.store(ST_CONNECTED, Ordering::Release);
                         // 解析服务端分配的数据端口（无则保留 0 = 沿用原端口）
-                        if let Some(port) = crate::srt_shell::auth::parse_auth_ok_port(payload) {
-                            self.data_only_port.store(port, Ordering::Release);
-                            tracing::debug!(data_port = port, "认证成功，数据通道迁移到独立端口");
+                        match crate::srt_shell::auth::parse_auth_ok_port(payload) {
+                            Some(port) => {
+                                self.data_only_port.store(port, Ordering::Release);
+                                tracing::info!(data_port = port, "认证成功，数据通道迁移到独立端口");
+                            }
+                            None => {
+                                tracing::warn!(plen = payload.len(), p0 = payload[0], "AUTH_OK 端口解析失败（不迁移，走监听端口）");
+                            }
                         }
                     }
                     let _ = self.rx_tx.send(RecvEvent::Control(payload.to_vec()));
@@ -384,10 +454,17 @@ impl QuicConnection {
         }
     }
 
-    /// 发送 ACK（聚合帧）
-    fn send_ack(&self) {
+    /// 发送 ACK（确认主数据流已收的最大字节边界，offset 语义）
+    ///
+    /// 2026-08-20 P1.5 修复（连续 4 次请求后隧道失效根因）：
+    /// 旧版本固定 encode_ack(...,0)——ACK 永远确认"包序号 0"。而发送方的
+    /// 包序号是连接级全局递增（跨会话累积），接收方无法从 STREAM 帧反推,
+    /// 导致除首包外所有包被判断为"未确认"→ in_flight 无限增长（发送停止）
+    /// + 重传风暴。现改为确认主数据流的字节偏移边界（offset+len），发送方
+    /// `SendTracker::on_ack` 按"包字节边界 <= largest"判定确认，语义闭合。
+    fn send_ack(&self, largest_offset: u64) {
         let mut ack = Vec::new();
-        packet::encode_ack(&mut ack, 0, 0); // largest_acked 由 tracker 维护，简化固定
+        packet::encode_ack(&mut ack, largest_offset, 0);
         self.send_raw(&ack);
     }
 
@@ -403,11 +480,43 @@ impl QuicConnection {
         }
     }
 
-    /// 发送原始帧（数据壳：SRT 数据包外形）
+    /// 发送原始帧（数据壳：SRT 数据包外形 + 载荷加密）
+    ///
+    /// P1.5 载荷加密接入（2026-08-20）：内层传输帧先 AES 流式加密（crypto.rs），
+    /// 密文前置 12B 随机 nonce（接收方据此派生密钥流解密），再外包 16B SRT 头。
+    /// 特性：长度不变（XOR 流）、每包 nonce 不同（防重放/防模式识别），
+    /// 与 SRT 的 kmreq 加密语义对齐（流式加密 + 载荷不可见）。
     fn send_raw(&self, inner: &[u8]) {
-        // 组装外层 SRT 壳（16B 数据包头，bit31=0）
-        let pkt = crate::srt_shell::outer::encode_data_packet(inner);
-        let _ = self.udp.send_to(&pkt, self.send_target());
+        // 1. 载荷加密：随机 nonce + XOR 密钥流（crypto::encrypt_block 返回 [nonce||ct]）
+        let nonce: [u8; 12] = {
+            use rand::RngCore;
+            let mut n = [0u8; 12];
+            rand::thread_rng().fill_bytes(&mut n);
+            n
+        };
+        let encrypted = crate::quic::crypto::encrypt_block(&self.secret, &nonce, inner);
+        // 2. 组装外层 SRT 壳（16B 数据包头，bit31=0）
+        let pkt = crate::srt_shell::outer::encode_data_packet(&encrypted);
+        // 3. 发送（非阻塞 socket：wmem 满时 EAGAIN，短自旋重试避免静默丢包）
+        //
+        // 2026-08-20 吞吐修复：旧实现 `let _ = send_to(...)` 忽略失败--
+        // wmem 满/暂态错误时包被静默丢弃，要等 RTO（1s）才发现丢包，
+        // 高速下表现为吞吐骤降+队头阻塞。改为有限自旋重试（最多 200 次/µs 级），
+        // 仍失败则放弃该包（ACK 不推进会触发重传，保底可靠）。
+        let target = self.send_target();
+        for attempt in 0..200 {
+            match self.udp.send_to(&pkt, target) {
+                Ok(_) => return,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if attempt == 0 {
+                        std::thread::sleep(Duration::from_micros(50));
+                    } else {
+                        std::thread::sleep(Duration::from_micros(50));
+                    }
+                }
+                Err(_) => return, // 其他错误（对端不可达等）：放弃，靠重传保底
+            }
+        }
     }
 
     /// 客户端发送 SRT 特征握手（外层控制壳 0x80 + 内层 Handshake 帧 + AUTH 载荷）
@@ -477,6 +586,8 @@ impl QuicConnection {
     /// 发送循环（由上层 spawn：定期把流缓冲 -> 网络，按 BBR 调速 + ACK 聚合）
     pub fn send_loop(&self) {
         tracing::debug!("QUIC send_loop 启动");
+        // 装饰性 SRT ACK 节奏计时器（P1.5：周期性发 SRT 外形 ACK 伪装纹理）
+        let mut last_deco_ack = Instant::now();
         loop {
             // 断开退出
             if self.closed.load(Ordering::Acquire) {
@@ -497,28 +608,43 @@ impl QuicConnection {
                 cwnd.saturating_sub(inflight_now)
             };
             let mut budget = room;
-            // 收集各流待发块（每个流取一块，公平轮询；受预算约束）
+            // 收集各流待发块（每条流在预算内循环取尽，突破"每轮一块"的吞吐瓶颈）
+            //
+            // 2026-08-20 吞吐修复（P1.5）：
+            // 旧实现 `for id in ids { 每条流取一块 }` —— 每轮最多发 N 条流 × 1 块(1316B)，
+            // 然后 sleep(1ms)，吞吐被锁死在 ~1.3MB/s，且 BBR 因此采样到"链路只有 ~0.07MB/s"
+            // 的低带宽，cwnd 恒为初始 21056 永不增长，形成低带宽自我实现的稳态。
+            // 修复：外层 while 循环持续在预算内取每流剩余块（流间仍公平轮询），
+            // 直到预算耗尽或所有流取空，让 BBR 探测到真实链路带宽。
             let blocks: Vec<(u32, u64, Vec<u8>, bool)> = {
                 let mut sm = self.streams.lock().unwrap();
-                let ids: Vec<u32> = sm.active_ids();
                 let mut out = Vec::new();
-                for id in ids {
-                    if budget == 0 {
-                        break;
-                    }
-                    if let Some(s) = sm.get(id) {
-                        // 先 peek 块大小，预算内才取（避免取出后预算不足丢块）
-                        match s.peek_send_block() {
-                            Some((_, bytes, _)) if bytes.len() <= budget => {
-                                if let Some((off, b, fin)) = s.take_send_block() {
-                                    budget -= b.len();
-                                    out.push((id, off, b, fin));
+                loop {
+                    let ids: Vec<u32> = sm.active_ids();
+                    let mut any_taken = false;
+                    for id in ids {
+                        if budget == 0 {
+                            break;
+                        }
+                        if let Some(s) = sm.get(id) {
+                            // 先 peek 块大小，预算内才取（避免取出后预算不足丢块）
+                            match s.peek_send_block() {
+                                Some((_, bytes, _)) if bytes.len() <= budget => {
+                                    if let Some((off, b, fin)) = s.take_send_block() {
+                                        budget -= b.len();
+                                        out.push((id, off, b, fin));
+                                        any_taken = true;
+                                    }
+                                }
+                                _ => {
+                                    // 块太大/无块：跳过本流
                                 }
                             }
-                            _ => {
-                                // 块太大/无块：跳过本流
-                            }
                         }
+                    }
+                    // 预算耗尽或所有流取空则结束本轮
+                    if budget == 0 || !any_taken {
+                        break;
                     }
                 }
                 out
@@ -566,6 +692,16 @@ impl QuicConnection {
             }
             // 4. 超时重传检查
             self.retransmit_expired();
+            // 5. 装饰性 SRT ACK 节奏（P1.5 伪装增强）：
+            //    周期性向对端发 SRT 外形 ACK 控制包（0x80 02 00 00 + 控制信息），
+            //    使抓包呈现真实 SRT 的周期性 ACK 纹理（约每 10ms 一个）。
+            //    注意：这是"外形同步"的装饰包（不承载内层确认语义——真实可靠性
+            //    由内层 quic ACK 帧承担），走**明文控制壳**（与 SRT ACK 一致）。
+            if crate::srt_shell::ack::should_emit_ack(last_deco_ack, Instant::now()) {
+                let deco = crate::srt_shell::ack::make_ack_packet();
+                let _ = self.udp.send_to(&deco, self.send_target());
+                last_deco_ack = Instant::now();
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
     }

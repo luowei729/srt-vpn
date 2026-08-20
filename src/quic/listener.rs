@@ -125,6 +125,8 @@ impl QuicListener {
             }
         };
         let _ = data_sock.set_nonblocking(true);
+        // 2026-08-20 吞吐修复：调大数据通道 socket 缓冲（默认 208KB 高速下必溢出丢包）
+        crate::quic::connection::enlarge_socket_buffers(&data_sock);
         // 获取随机绑定端口（独立数据通道端口，回传给客户端迁移）
         let data_port = local_port(&data_sock);
         tracing::trace!(peer = %src, data_port, "为客户端建立独立数据通道");

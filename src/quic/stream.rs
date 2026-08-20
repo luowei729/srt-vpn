@@ -76,6 +76,11 @@ pub(crate) struct StreamRecv {
     pub(crate) delivered_offset: u64,
     /// 接收乱序缓冲（按 offset 存储已到但未交付的数据）
     pub(crate) unordered: std::collections::BTreeMap<u64, Vec<u8>>,
+    /// 已重组的连续数据块（按序交付给应用；recv_take 取走）
+    /// 2026-08-20 P1.5 修复（高速下数据错乱根因）：主数据流原先不经过
+    /// 重组直接投递——丢包重传后到达顺序颠倒导致数据错位。现在所有流都
+    /// 走 recv_data 按 offset 重组，连续块暂存本队列，供上层顺序消费。
+    pub(crate) delivered: std::collections::VecDeque<Vec<u8>>,
     /// 对端是否已发 FIN（收到 FIN 帧标记）
     pub(crate) fin_received: bool,
     /// 收到 FIN 的流内偏移
@@ -89,6 +94,7 @@ impl StreamRecv {
         Self {
             delivered_offset: 0,
             unordered: std::collections::BTreeMap::new(),
+            delivered: std::collections::VecDeque::new(),
             fin_received: false,
             fin_offset: 0,
             receiver_finished: false,
@@ -245,11 +251,11 @@ impl Stream {
         }
         // 合并到乱序缓冲
         r.unordered.insert(offset, data.to_vec());
-        // 交付连续段
+        // 交付连续段（无空洞时把连续块暂存到 delivered 队列，供 recv_take 顺序取）
         let mut next = r.delivered_offset;
         while let Some(bytes) = r.unordered.remove(&next) {
-            // 触发上层 recv 通知（简化：由调用方检查 delivered_offset 推进）
-            next += bytes.len() as u64;
+            r.delivered.push_back(bytes);
+            next += r.delivered.back().map(|b| b.len() as u64).unwrap_or(0);
         }
         r.delivered_offset = next;
         // 若已收 FIN 且全部交付，接收方向完成
@@ -259,12 +265,19 @@ impl Stream {
     }
 
     /// 应用层读取已交付数据：返回从 delivered_offset 起的连续数据并推进
-    /// 由 recv_data 的 unordered 清理推动（本函数返回等待时的空闲）
-    /// 简化实现：每次 recv_data 后，调用方可扫描 delivered；此处提供直接读取。
-    #[allow(dead_code)]
+    ///
+    /// 2026-08-20 P1.5 修复：由 recv_data 重组暂存到 delivered 队列，本函数
+    /// 按序取出全部已交付字节（乱序重传在 recv_data 已解决，这里天然有序）。
     pub fn recv_take(&mut self) -> Vec<u8> {
-        // 实际数据交付经 recv_data 的 buffer 完成；这里保持 API 形状与旧 TunnelSession 对齐
-        Vec::new()
+        let r = match self.recv.as_mut() {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for b in r.delivered.drain(..) {
+            out.extend_from_slice(&b);
+        }
+        out
     }
 
     /// 是否已收到 FIN 且数据完整交付（对端发送方向结束；P1.5 per-session 接入启用）

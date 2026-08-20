@@ -201,7 +201,13 @@ impl Bbr {
         } else {
             self.cwnd_min
         };
-        self.cwnd = target.max(self.cwnd_min);
+        // 2026-08-20 吞吐修复：cwnd 上限保护。BBR 在极低 RTT（本机回环 ~50µs）
+        // 下带宽采样可能瞬时虚高（如一轮确认 20MB/0.1ms -> max_bw 虚高），
+        // 导致 cwnd 暴涨到 21MB，远超对端 UDP 接收缓冲（即使调大到 4MB），
+        // 造成接收溢出丢包 -> 队头阻塞。cap 到 4MB（与 enlarge_socket_buffers
+        // 的目标一致），公网 BDP 场景（100Mbps×50ms≈625KB）不受影响。
+        const CWND_MAX: usize = 4 * 1024 * 1024;
+        self.cwnd = target.max(self.cwnd_min).min(CWND_MAX);
         // RTT 探测调度
         let now = Instant::now();
         if now >= self.probe_rtt_time && self.state != BbrState::ProbeRtt {

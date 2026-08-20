@@ -271,7 +271,8 @@ srt-vpn/
 - [x] 设计文档产出（REFACTOR_PLAN_v3.md：协议字节草图 + 目录 + 里程碑）
 - [x] **P0 内核+外壳（2026-08-20 09:55 完成）**：自研 quic/（varint/帧/多流/ACK/丢包/BBR）+ srt_shell/（0x80 握手 + 16B 头 + auth）；废弃 libsrt/build.rs；回环 + 多设备端到端验证通过
 - [x] **P1 前端重建（部分完成）**：socks5/HTTP/UDP 重接新内核 + tunnel 保壳 + 多设备独立数据端口；UDP 待重验重、payload 加密待接线
-- [ ] **P1.5 完善**：载荷加解密接线 + 装饰 ACK 节奏 + 乒乓心跳 RTT + 多用户账号
+- [x] **P1.5 传输层核心（2026-08-20 11:06 完成）**：载荷加解密接线（✓ send_raw/handle_datagram）+ 装饰 ACK 节奏（✓ make_ack_packet 接入 send_loop）+ **传输层三连修**（ACK 字节偏移语义/主流 offset 重组/吞吐三瓶颈，回环 1MB/s -> 下载 28/上传 14 MB/s，详见 CHANGELOG 11:06）
+- [ ] **P1.5 剩余**：乒乓心跳 RTT（ping/pong 接入）+ 多用户账号 + SACK/快速重传（公网丢包优化）+ POOL_SIZE 配置化
 - [ ] **P2 部署与 passwall**：passwall 适配新核心 + Docker/CI + 公网多线程 + SRT 特征抓包验证
 
 ### 重构共识决策表（grilling 收束，2026-08-20）

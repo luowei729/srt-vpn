@@ -2,6 +2,65 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-20 11:06] - P1.5 传输层三连修：ACK 字节偏移语义 + 主流重组 + 吞吐三瓶颈（回环 1MB/s → 下载 28/上传 14 MB/s）
+
+### 改动前总结
+重构 P0 后端到端功能正常但存在三个严重传输层缺陷：① 连续 4 次请求后隧道失效
+（客户端收到 session:1 回传 1108 次、服务端大量"数据帧无法路由"）；② 高速传输
+下数据错乱（10MB 文件 byte~25 万处 differ）+ 断链（rc=18）；③ 吞吐仅 ~1MB/s
+（BBR cwnd 恒为初始 21056 永不增长）。
+
+### 根因分析（三层叠加）
+1. **ACK 固定确认 0**（连续请求失效根因）：`send_ack` 固定 `encode_ack(0,0)`。
+   包序号是发送方内部全局递增值，接收方从 STREAM 帧只能拿到 (offset,len) 无法反推，
+   导致除首包外全部"未确认"→ in_flight 无限增长（send_loop 停发新包）+ find_expired
+   无限重传（重传风暴）。
+2. **主数据流绕过重组直接投递**（数据错乱根因）：旧实现假设"发送有序=到达有序"，
+   但丢包重传后 N+1 先到 N 后到，直接投递导致字节错位。
+3. **吞吐三瓶颈**：send_loop 每轮每流只取一块（1316B/ms≈1.3MB/s 上限且 BBR 采样
+   低带宽自我实现）；本机内核 rmem_max=208KB 钳制（接收溢出→队头阻塞死锁，实测
+   乱序缓冲堆积告警 9596 次）；cwnd 无上限（BBR 回环误判冲 21MB 超接收缓冲）。
+
+### 改动后总结
+1. **ACK 字节偏移语义**（quic/ack.rs + connection.rs）：ACK 帧携带主数据流
+   `delivered_offset`（接收字节边界），`SendTracker::on_ack` 按
+   `payload.offset+len <= largest` 判定确认。**自研协议收发两侧语义闭环**。
+   RTT 采样改为对确认包组中最新发送者采样。
+2. **主数据流统一走 recv_data 重组**（quic/stream.rs + connection.rs）：
+   `StreamRecv` 新增 `delivered: VecDeque<Vec<u8>>` 暂存连续块，`recv_take()`
+   真正取走有序数据（原为空壳 API）。主流不再直接投递，乱序/重传由 offset
+   幂等重组消化。乱序缓冲 >1024 块时告警（队头阻塞观测）。
+3. **send_loop 预算内循环取尽**（connection.rs）：每流每轮不再只取一块，
+   while 循环在预算内取尽每流剩余块（流间仍公平轮询），突破 1.3MB/s 伪上限，
+   BBR 得以采样真实带宽。
+4. **socket 缓冲调优**（connection.rs enlarge_socket_buffers + listener.rs）：
+   libc setsockopt SO_RCVBUF/SO_SNDBUF 尝试 4MB（Cargo.toml 加 libc 依赖，
+   重构后唯一保留的 FFI，无 build.rs）。**部署机仍需 sysctl 调 rmem_max/wmem_max
+   ≥32MB**（应用层请求会被 rmem_max 静默钳制）。
+5. **send_raw EAGAIN 自旋重试**：非阻塞 socket wmem 满时短自旋（200 次×50µs）
+   而非静默丢包等 RTO。
+6. **BBR cwnd cap 4MB**（congctl.rs）：防回环极低 RTT 下带宽采样虚高导致窗口
+   暴涨超对端接收缓冲。
+7. **ACK 聚合**：只在 delivered_offset 推进时回 ACK（乱序包/重复包不回），
+   防高速下 ACK 风暴占带宽（ACK 包量=数据包量）。
+8. **recv_loop 轮询加速**：WouldBlock 分支 sleep 10ms→500µs（突发数据处理
+   延迟降一个数量级）。
+
+### 验证
+- 编译零警告 + 63 单测全过（ack.rs 4 个测试适配 offset 语义）
+- 连续 80 次小请求 100% 成功（修复前第 5/6 次即失败）
+- 30MB 下载：28MB/s + 数据完全一致（修复前 1MB/s + 数据错乱 + 断链）
+- 30MB 上传：14MB/s + 服务端确认收到完整 31457280 字节
+- 异常指标全零：乱序堆积 0 / 无法路由 0 / 解密失败 0
+- 对照实验：旧版（stash 验证）下载 10MB 超时+数据不一致，证明数据错乱为
+  修复前已存在（非本次改动引入）
+
+### 遗留待办（P1.5 后续）
+- SACK/快速重传：真实网络丢包场景下乱序 ACK 提示空洞位置（当前仅 RTO 超时重传）
+- 上传方向吞吐：14MB/s vs 下载 28MB/s（单流上传待分析）
+- POOL_SIZE 配置化（当前硬编码 4）
+- 本机 sysctl 持久化（net.core.rmem_max/wmem_max=32MB 已临时生效，未写 sysctl.conf）
+
 ## [2026-08-20 11:10] - 陈旧代码与文档清理（release 零警告）+ 文档同步
 
 ### 改动前总结
