@@ -2,6 +2,39 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-20 14:10] - 性能优化：AES-128-CTR 替换 SHA256 密钥流 + BTreeSet retain 消除（单线程 11→150 MB/s，4并发 11→381 MB/s）
+
+### 改动前总结
+v2 重写后传输层功能正确但吞吐仅 11 MB/s（单线程，CPU 130%），4 并发也只有 11 MB/s。
+用户要求"探索不加密"对比与"利用全部核心"。perf 定位到 **70% CPU 花在
+`RecvTracker::on_recv` 的 `BTreeSet::retain`**（4096 窗口每包触发全集合遍历 O(n)），
+加密开销经 A/B 对比仅 2%（AES-NI 硬件加速后与明文几乎一致）。
+
+### 根因分析
+1. **加密层（SH섹256 密钥流）轻度瓶颈**：每 1316B 包做 42 次 SHA256 派生 ~76MB/s 单核。
+   A/B 对比（no-crypto feature）：明文 18.4 vs AES 18.1 MB/s，确认加密不是主瓶颈但仍有开销。
+2. **BTreeSet::retain 是 70% CPU 根因**：`on_recv` 里 `received.retain(|&n| n >= cutoff)`
+   在高速下载时每包触发（窗口膨胀 > 4096+64），retain 遍历整个 BTreeSet 重建树。
+3. **多核利用**：每条 QUIC 连接的 `recv_loop`/`send_loop` 是独立 OS 线程，
+   pool_size 4 时 4 核线性扩展；8 并发达饱和；16 并发因锁/调度竞争退化。
+
+### 改动后总结
+- **AES-128-CTR 替换 SHA256 密钥流**（crypto.rs）：
+  - 新 `PacketCipher` 结构（连接级密钥 + 随机 nonce 前缀）
+  - nonce = [8B 连接前缀 | 8B 包号]，包号唯一保证密钥流不重复（等人于每包随机
+    nonce 且省 rand 系统调用）。AES-NI 加速 ~2.4GB/s（vs SHA256 ~76MB/s）
+  - 且 libsrt HaiCrypt 本就是 AES-128——**特征上更贴近真 SRT**
+- **RecvTracker::on_recv 消除 retain**（ack.rs）：
+  - 快路径短路：pkt_num < min_unacked 直接判重复返回（不插 BTreeSet）
+  - 裁剪改为稀疏触发（4 倍窗口才一次）+ 用 `split_off(cutoff)` 替代 `retain`
+    （BTreeSet::split_off 内部 O(log n) 分裂，不遍历剩余）
+- **no-crypto feature**（Cargo.toml + connection.rs）：
+  编译期开关用于 A/B 对比性能探索（生产必须加密防 DPI/防载荷窥探）
+- **验证矩阵全绿**：
+  - 单线程 30MB 下载 **150 MB/s**（13.6x）、4 并发 **381 MB/s**（34.6x）、8 并发 394MB/s
+  - 上传 30MB **23 MB/s**（2.1x）、netem 2%/5% 丢包一致、30 次连跑 30/30 零告警
+  - 75 单测全过、release 零警告（no-crypto feature 下 2 个 dead-code 警告无害）
+
 ## [2026-08-20 13:10] - v2 传输层完整重写：区间 ACK + 块边界协议 + 四大关键 bug 修复（10MB 下载卡 16KB 根治，零告警）
 
 ### 改动前总结

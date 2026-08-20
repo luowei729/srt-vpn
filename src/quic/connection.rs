@@ -112,7 +112,10 @@ pub struct QuicConnection {
     /// 事件通道（上层 take_events 消费）
     rx_tx: tokio::sync::mpsc::UnboundedSender<RecvEvent>,
     rx_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<RecvEvent>>>,
-    /// 加密密钥
+    /// 加密上下文（AES-128-CTR；2026-08-20 性能优化替换旧 SHA256 密钥流）
+    #[cfg_attr(feature = "no-crypto", allow(unused))]
+    cipher: crate::quic::crypto::PacketCipher,
+    /// 原始密钥（握手认证仍用，auth_request 需要 [u8;16]）
     secret: [u8; 16],
     /// 认证完成标志（客户端等 AUTH_OK）
     authenticated: Arc<AtomicBool>,
@@ -161,6 +164,7 @@ impl QuicConnection {
                 last_recv_at: Instant::now(),
             }),
             closed: Arc::new(AtomicBool::new(false)),
+            cipher: crate::quic::crypto::PacketCipher::new(cfg.secret),
             secret: cfg.secret,
             rx_tx,
             rx_rx: Mutex::new(Some(rx_rx)),
@@ -207,6 +211,7 @@ impl QuicConnection {
                 last_recv_at: Instant::now(),
             }),
             closed: Arc::new(AtomicBool::new(false)),
+            cipher: crate::quic::crypto::PacketCipher::new(secret),
             secret,
             rx_tx,
             rx_rx: Mutex::new(Some(rx_rx)),
@@ -296,8 +301,11 @@ impl QuicConnection {
                 _ => None,
             }
         } else {
-            // 数据壳：解密后是 STREAM/PING/PONG/RST 帧
-            let plain = crate::quic::crypto::decrypt_block(&self.secret, inner)?;
+            // 数据壳：数据面加密分流
+            #[cfg(not(feature = "no-crypto"))]
+            let plain = self.cipher.decrypt_packet(inner)?;
+            #[cfg(feature = "no-crypto")]
+            let plain = inner.to_vec();
             let first = *plain.first()?;
             match FrameType::from_byte(first) {
                 Some(FrameType::Stream) => {
@@ -547,21 +555,25 @@ impl QuicConnection {
         }
     }
 
-    /// 发送数据帧（加密 + 数据壳 + 包号写 SEQ 字段）
+    /// 发送数据帧（AES-128-CTR 加密 + 数据壳 + 包号写 SEQ 字段）
     ///
     /// 包号由调用方分配传入（统一 fetch_add，确保所有数据壳包唯一编号；
-    /// 重传 = 删旧条目 + 新包号新包，标准 QUIC 语义）
+    /// 重传 = 删旧条目 + 新包号新包，标准 QUIC 语义）。
+    /// 加密 nonce = [连接前缀 8B | 包号 8B]，包号唯一保证密钥流不重复。
+    #[cfg(not(feature = "no-crypto"))]
     fn send_frame_encrypted(&self, frame: &[u8], pkt_num: u64) {
-        // 加密（nonce 前置）
-        let nonce: [u8; 12] = {
-            use rand::RngCore;
-            let mut n = [0u8; 12];
-            rand::thread_rng().fill_bytes(&mut n);
-            n
-        };
-        let encrypted = crate::quic::crypto::encrypt_block(&self.secret, &nonce, frame);
+        // AES-128-CTR 加密（nonce 内含包号，无需额外 rand 系统调用）
+        let encrypted = self.cipher.encrypt_packet(pkt_num, frame);
         // 数据壳（bit31=0，包号写 SEQ 字段）
         let pkt = crate::srt_shell::outer::encode_data_packet_v2(&encrypted, pkt_num as u32);
+        self.send_udp(&pkt);
+    }
+
+    /// 不加密直通版（no-crypto 特性；**仅性能基准，严禁生产**）
+    #[cfg(feature = "no-crypto")]
+    fn send_frame_encrypted(&self, frame: &[u8], pkt_num: u64) {
+        // 明文：直接 frame 作 inner（不调用 cipher）
+        let pkt = crate::srt_shell::outer::encode_data_packet_v2(frame, pkt_num as u32);
         self.send_udp(&pkt);
     }
 

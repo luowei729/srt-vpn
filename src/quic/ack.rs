@@ -292,15 +292,25 @@ impl RecvTracker {
     ///
     /// 返回 true = 新包（首次收到）；false = 重复/过期。
     pub fn on_recv(&mut self, pkt_num: u64) -> bool {
+        // 快路径：包号 < min_unacked（已裁剪过的旧包号）直接判重复
+        // （perf 70% CPU 根因：retain 每包触发。改先短路不插 BTreeSet）
+        if pkt_num < self.min_unacked {
+            return false;
+        }
         if pkt_num > self.largest_recv {
             self.largest_recv = pkt_num;
         }
         let inserted = self.received.insert(pkt_num);
-        // 窗口裁剪：只裁 min_unacked 以下的（已报告确认过），未确认包号
-        // 永不清除（gap 证据保留）；同时约束总量防内存无限增长
-        if self.received.len() > self.window + 64 {
-            let cutoff = self.min_unacked;
-            self.received.retain(|&n| n >= cutoff);
+        // 窗口裁剪：逐次插入代价远小于批量 retain。只在膨胀到 4 倍窗口
+        // 时批量清理一次（罕见），高频 On_path 零分配。
+        // 2026-08-20 性能优化（perf 热点 70% CPU 根因：retain 每包触发）
+        if self.received.len() > self.window * 4 {
+            let cutoff = self.largest_recv.saturating_sub(self.window as u64);
+            let kept = self.received.split_off(&cutoff);
+            self.received = kept;
+            // 更新 min_unacked 防止下一批重复插入触发短路前的包号被
+            // 误认"已裁剪"（实际是已被 split_off 移走但 > 旧 min_unacked）
+            self.min_unacked = self.min_unacked.max(cutoff);
         }
         inserted
     }

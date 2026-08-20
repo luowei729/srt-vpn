@@ -13,9 +13,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 异步运行时（客户端/服务器事件循环）
 tokio = { version = "1", features = ["full"] }
-# 密码学（SOCKS5 用户密码 argon2 哈希 / 密钥派生与认证 sha2）
+# 密码学（SOCKS5 用户密码 argon2 哈希 / 密钥派生与认证 sha2 / 数据面 AES-128-CTR）
 argon2 = "0.5"
 sha2 = "0.10"
+# 数据面载荷加密（AES-128-CTR，AES-NI 硬件加速 ~2.4GB/s；2026-08-20 性能优化：
+# 替换 SHA256 密钥流 XOR（仅 ~76MB/s 单核，吞吐瓶颈 CPU 打满根因）
+# 且 libsrt HaiCrypt 本就是 AES-128，特征上更贴近真 SRT）
+aes = "0.8"
+ctr = "0.9"
 rand = "0.8"
 # UDP socket 缓冲调优（SO_RCVBUF/SO_SNDBUF，高吞吐防接收缓冲溢出丢包；
 # 2026-08-20 重构后唯一保留的 FFI 依赖，无 build.rs，无 C 编译）
@@ -25,3 +30,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 # 2026-08-20 重构清理：移除 libc/cc/build.rs（libsrt 依赖）、hmac/hex（旧 streamid
 # 令牌，已删除其函数）、crossbeam-channel（旧发送通道，已改 tokio）
+
+[features]
+# 默认：数据面 AES-128-CTR 加密（生产必须，防 DPI / 防载荷窥探）
+default = []
+# no-crypto：数据面明文直通（仅性能基准对比用，**严禁用于生产**）
+# 开启后 send_frame_encrypted / decode_wire 跳过加解密，测纯传输层吞吐
+# （认证仍走 SRT 特征握手，只是数据面不加密）
+no-crypto = []

@@ -76,3 +76,9 @@
   - **③ v2 架构**：包号放 SRT 外壳 SEQ 字段（真 SRT 语义，接收方直接可见）-> 区间 ACK（RFC9000 ACK Ranges，SACK 内建）-> 重传 = 删旧条目 + 新包号记账（标准 QUIC）-> RecvTracker 裁剪基准用 min_unacked（防吞 gap 证据）。
   - **验证方法论**：先小请求 20/20 再大文件；`grep -c '"level":"(ERROR|WARN)"'` 扫双端日志做回归基线（"帧长度超界"= 块边界被破坏的信号灯）；netem 2%/5% 丢包 + 8 并发 + 30 次连跑是发布前门槛。测试进程残留端口冲突会造成假失败（Exit 1），启动前 `pkill -9` + `ps` 确认清零。
   - 验证矩阵：30×10MB 全过、30MB 上传下载一致、8 并发 8/8、5% 丢包一致、零告警、73 单测、release 零警告。吞吐回环 5-11MB/s（cwnd 4MB cap，正确性优先）。
+- [2026-08-20 14:10] **性能优化收官（单线程 11→150MB/s，4并发 11→381MB/s）**：
+  - **① AES-128-CTR 替换 SHA256 密钥流**：旧 SHA256 密钥流每包 42 次 SHA256 派生 ~76MB/s 单核；AES-NI 硬件加速后 ~2.4GB/s（32 倍）。`PacketCipher` 用 `nonce=[8B 连接前缀|8B 包号 BE]`（包号唯一保证密钥流不重复，等价每包随机 nonce 且省 rand 系统调用）。libsrt HaiCrypt 本就是 AES-128，特征更贴近真 SRT。**A/B 对比验证**：AES 18.1 vs 明文 18.4 MB/s -- 加密开销几乎为 0。
+  - **② BTreeSet::retain 是 70% CPU 根因**（perf 实测）：`RecvTracker::on_recv` 的 `received.retain(|&n|n>=cutoff)` 在高速下载时每包触发全集合遍历 O(n)。修复：①pkt_num < min_unacked 快路径短路（不插 BTreeSet）②裁剪改稀疏触发（4 倍窗口才一次）+ `split_off(cutoff)` 替代 `retain`（O(log n) 分裂不遍历剩余）。**这是单线程 11→150MB/s 的最大杠杆**。
+  - **③ 多核利用现有架构已支持**：每条 QUIC 连接的 recv_loop/send_loop 是独立 std::thread，pool_size=4 时 4 核线性扩展。8 并发达饱和（394MB/s），16 并发因锁/调度竞争退化。**核心扩展靠 pool_size 配置**（SRT_POOL_SIZE env，1..=16 默认 4）。
+  - 验证矩阵：单线程 150MB/s、4 并发 381MB/s、8 并发 394MB/s、上传 23MB/s、netem 2%/5% 丢包一致、30 次连跑 30/30 零告警、75 单测全过、release 零警告。
+  - **no-crypto feature**：编译期开关用于性能 A/B 对比探索（`cargo build --features no-crypto`），生产必须加密防 DPI/防载荷窥探。
