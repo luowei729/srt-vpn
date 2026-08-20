@@ -82,3 +82,15 @@
   - **③ 多核利用现有架构已支持**：每条 QUIC 连接的 recv_loop/send_loop 是独立 std::thread，pool_size=4 时 4 核线性扩展。8 并发达饱和（394MB/s），16 并发因锁/调度竞争退化。**核心扩展靠 pool_size 配置**（SRT_POOL_SIZE env，1..=16 默认 4）。
   - 验证矩阵：单线程 150MB/s、4 并发 381MB/s、8 并发 394MB/s、上传 23MB/s、netem 2%/5% 丢包一致、30 次连跑 30/30 零告警、75 单测全过、release 零警告。
   - **no-crypto feature**：编译期开关用于性能 A/B 对比探索（`cargo build --features no-crypto`），生产必须加密防 DPI/防载荷窥探。
+- [2026-08-20 15:50] **CUBIC + Hybrid Slow Start + Pacer 替代 BBR（学 quic-go 完整设计）**：用户要求"阅读 quic 和 hy2 协议实现，学习高性能后重构自研核心"。深入学习 quic-go `internal/congestion/{pacer.go, cubic.go, cubic_sender.go, hybrid_slow_start.go}` + `connection.go` 发送循环 + hy2 Brutal CC/pacer 后，**完全按 quic-go 设计替代 BBR v1**。
+  - **BBR v1 病灶**：① ProbeRTT 阶段 min_rtt 重置为 100ms 后 bdp≈0，cwnd 跌到 cwnd_min=5264，max_bw 累乘 0.7 跌到 10 字节/秒，pacer 速率 6 字节/秒 完全停摆（诊断实测 2/4 连接上传卡死）；② 依赖带官认知（max_bw 采样）回环极低 RTT 下不稳定。
+  - **CUBIC 三件套（完全对照 quic-go）**：
+    - **CUBIC 三次函数拥塞窗口**（cubic.go）：丢包 ×0.7 回退 + ACK 按三次函数凸回 W_max + TCP-friendly Reno 兜底
+    - **Hybrid Slow Start**（hybrid_slow_start.go）：RTT 延迟增加退出慢启动（每轮前 8 包采 RTT，min_rtt 增加 > min_rtt/8 clamp [4ms,16ms] 则退）
+    - **pacer 令牌桶**（pacer.go）：`Budget(now) = budget_at_last_sent + rate×delta`，上限 maxBurst=`max(2ms×rate, 10×MSS)`。rate = `BandwidthEstimate = cwnd/srtt×5/4`（**不靠带官认知**，直接从窗口和 RTT 算）
+  - **API 对齐 quic-go cubic_sender.go**：`on_packet_sent/on_packet_acked(prior_in_flight)/on_congestion_event/on_retransmission_timeout/can_send/time_until_send/has_pacing_budget/bandwidth_estimate`
+  - **事件驱动 send_loop**（学 quic-go scheduleSending）：`Condvar` 唤醒替代轮询 sleep 50µs，`send_msg/on_ack_frame/on_pong` 调 `notify_send` 唤醒 send_loop
+  - **关键 bug 修复**：`prior_inflight` 必须在 `tracker.on_ack()` **前**取值（ACK 后 sent map 已清空导致 inflight=0 -> is_cwnd_limited 永远 false -> cwnd 永不增长根因）。quic-go 的 prior_in_flight 是 ACK 前的语义。
+  - **pacer 不是防探测**：SRT 0x80 外壳 + AES-128-CTR 加密是防主动探测；pacer 是匀速发送防突发压满 wmem/中间设备缓冲丢包（间接有拟真收益：真 SRT 是匀速流媒体）。
+  - 验证矩阵：下载 30MB/s（curl 单流上限）、8 并发 240MB/s（隧道真实带宽）、2%/5% 丢包一致、79 单测全过、零警告、双端零告警。
+  - **参考实现位置**：`docs/reference/quic-go/internal/congestion/`（随时查）；`docs/reference/sing-quic/hysteria/congestion/`（Brutal CC 备选）。**修改拥控/pacer 前先查 quic-go 源码**，不要自己主张。

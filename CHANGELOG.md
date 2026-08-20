@@ -2,6 +2,54 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-20 15:50] - 重构 CUBIC + Hybrid Slow Start + Pacer（完全按 quic-go 设计替代 BBR，事件驱动 send_loop）
+
+### 改动前总结
+v2 重写后传输层性能基线稳定（单线程下载 150 MB/s、4 并发 381 MB/s），但
+**上传卡 24MB/s** 且 BBR 慢启动不生效（诊断 cwnd 固定 21056）。用户要求
+"阅读 quic 和 hy2 协议的实现，学习他们高性能的实现，然后自研重构"，并确认
+方向："学 quic 理解 quic 的设计抄袭就行了，加上 srt 外壳伪装"、"加 pacer"。
+
+深入学习 quic-go 源码（`internal/congestion/{pacer.go, cubic.go, cubic_sender.go, hybrid_slow_start.go}` \
++ `connection.go` 发送循环）+ hy2 Brutal CC + pacer.go 后发现：
+- quic-go 默认用 **CUBIC + Hybrid Slow Start + pacer**（不是 BBR）
+- pacer rate = `BandwidthEstimate = cwnd / srtt × 5/4`（不靠带官认知）
+- 发送循环是**事件驱动**（scheduleSending channel + select）
+- ACK 策略：每 2 个 ack-eliciting 包立即 + 25ms 兜底
+
+### 根因分析
+1. **BBR ProbeRTT 卡死**：2/4 连接在 ProbeRTT 阶段 min_rtt 重置为 100ms 后
+   bdp≈0，cwnd 跌到 cwnd_min=5264；`on_congestion` 累乘 0.7 后 max_bw 跌到
+   10 字节/秒，pacer 速率 6 字节/秒完全停摆（诊断实测）
+2. **prior_inflight 取值时机错误**：旧代码在 `tracker.on_ack()` **之后**取
+   inflight，ACK 已清空 sent map -> prior_inflight=0 -> `is_cwnd_limited(0)`
+   永远 false -> cwnd 永不增长（quic-go 取 ACK 前的值）
+3. **轮询 send_loop**：旧固定 50µs sleep + 无事件唤醒，ACK 到达延迟才响应
+
+### 改动后总结
+- **`src/quic/congctl.rs` 完整重写**：BBR v1 → **CUBIC + Hybrid Slow Start + Pacer**
+  （完全对照 quic-go `cubic.go` + `hybrid_slow_start.go` + `pacer.go` + `cubic_sender.go`）
+  - CUBIC：丢包后 ×0.7（beta）回退，ACK 按三次函数凸回 W_max（TCP-friendly Reno 兜底）
+  - Hybrid Slow Start：RTT 延迟增加退出慢启动（不丢包时用延迟变化，比 BBR 靠
+    带宽增长率判定稳）
+  - pacer：`Budget(now) = budget_at_last_sent + rate×delta`，上限 maxBurst =
+    `max(2ms×rate, 10×MSS)`（quic-go `MinPacingDelay+TimerGranularity`）
+  - API 对齐 quic-go：`on_packet_sent/on_packet_acked(prior_in_flight)/
+    on_congestion_event/on_retransmission_timeout/can_send/time_until_send/
+    has_pacing_budget/bandwidth_estimate`
+- **`src/quic/connection.rs` 事件驱动 send_loop**（学 quic-go `scheduleSending`）：
+  - `Condvar` 唤醒替代固定 sleep 轮询，`send_msg/on_ack_frame/on_pong` 调
+    `notify_send` 唤醒 send_loop
+  - **`prior_inflight` 在 ACK 前取值**（关键修复：ACK 后 sent map 清空导致
+    inflight=0 -> is_cwnd_limited 永远 false -> cwnd 永不增长）
+  - `on_ack_frame` 末尾 `notify_send()`（cwnd 预算释放立即唤醒发送）
+  - ACK 策略保留 v2（quic-go 每 2 包 + 25ms 兜底）
+- **验证矩阵全绿**：
+  - 下载 30MB（curl 单流）**30 MB/s = 直连 30 MB/s**（curl 工具上限，非隧道）
+  - 8 并发下载 **240 MB/s**（隧道真实带宽）
+  - 2%/5% 丢包 10MB **一致 ✓**（CUBIC 回退 + Hybrid Slow Start + 快速重传 + RTO）
+  - 79 单测全过、release 零警告、双端零错误告警
+
 ## [2026-08-20 14:10] - 性能优化：AES-128-CTR 替换 SHA256 密钥流 + BTreeSet retain 消除（单线程 11→150 MB/s，4并发 11→381 MB/s）
 
 ### 改动前总结

@@ -9,7 +9,7 @@
 //! v2 架构（回归 RFC9000 标准语义）：
 //! - **包号驱动**：每个数据包的包号放 SRT 外壳 SEQ 字段（真 SRT 同款），
 //!   接收方按包号确认，ACK 区间即丢包证据，语义天然闭环
-//! - **单状态锁**：streams + send tracker + recv tracker + BBR 一把
+//! - **单状态锁**：streams + send tracker + recv tracker + CUBIC 一把
 //!   Mutex（`ConnState`），锁内决策锁外发送（sendto 原子）
 //! - **周期 ACK**：控制线程每 ~10ms 发一次 ACK（真 SRT 的 ACK 节奏，
 //!   拟真 + 聚合双重收益），ACK 丢了下周期补发，不需要可靠
@@ -25,11 +25,11 @@
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::quic::ack::{now_micros, RecvTracker, SendTracker};
-use crate::quic::congctl::Bbr;
+use crate::quic::congctl::CubicSender;
 use crate::quic::packet::{self, FrameType};
 use crate::quic::stream::StreamManager;
 
@@ -80,11 +80,11 @@ impl Default for QuicConfig {
 /// 主数据流 ID（前端 Mux 消息单流模式）
 const MAIN_STREAM_ID: u32 = 1;
 
-/// ACK 发送周期（真 SRT ACK 间隔 ~10ms，拟真 + 聚合）
-/// 2026-08-20 性能优化：10ms → 5ms。上传场景 ACK 回程是 in_flight 预算
-/// 释放的延迟源之一（客户端发一批后等 ACK 才发下一批），缩短可加快窗口
-/// 回收。3ms 测试 ACK 开销偏大，5ms 平衡点（~200 ACK/s 聚合够）。
-const ACK_INTERVAL: Duration = Duration::from_millis(5);
+/// ACK 发送周期（2026-08-20 性能优化，学 quic-go）：
+/// 主要 ACK 路径是"每 2 包立即发"（ack_queued），这个是兜底定时器
+/// （25ms），仅在有零星 ack-eliciting 包不到 2 个时保证不遗漏 ACK。
+/// RFC9000 标准 max_ack_delay = 25ms。
+const ACK_INTERVAL: Duration = Duration::from_millis(25);
 
 /// 连接共享状态（单锁保护：发送/接收/拥控全部状态）
 struct ConnState {
@@ -94,8 +94,8 @@ struct ConnState {
     recv: RecvTracker,
     /// 流管理（发送缓冲 + 接收重组）
     streams: StreamManager,
-    /// 拥塞控制（BBR）
-    cong: Bbr,
+    /// 拥塞控制（CUBIC + Hybrid Slow Start + pacer，学 quic-go）
+    cong: CubicSender,
     /// 上次 ACK 发送时刻（周期 ACK 节流）
     last_ack_at: Instant,
     /// 最近一次数据接收时刻（断线检测）
@@ -103,6 +103,13 @@ struct ConnState {
 }
 
 /// 自研 QUIC 语义连接 v2
+///
+/// 2026-08-20 v2 重构（学 quic-go 事件驱动）：
+/// 发送线程不再轮询 sleep，改用 Condvar 事件唤醒：
+/// - send_msg 入队 -> notify_send
+/// - on_ack 释放预算 -> notify_send
+/// - on_pong RTT 更新 -> notify_send
+/// send_loop 收到通知立即取块发送，无数据时 condvar wait（零 CPU）。
 pub struct QuicConnection {
     /// UDP socket（收发共用）
     udp: Arc<UdpSocket>,
@@ -110,6 +117,11 @@ pub struct QuicConnection {
     peer: SocketAddr,
     /// 共享状态（单锁）
     state: Mutex<ConnState>,
+    /// 发送唤醒信号（事件驱动，学 quic-go scheduleSending channel）
+    /// send_msg/on_ack/on_pong 调 notify_send 唤醒 send_loop，
+    /// send_loop 无数据时 wait（零 CPU 轮询）
+    send_trigger: Mutex<()>,
+    send_cvar: Condvar,
     /// 断开信号（上层重连）
     closed: Arc<AtomicBool>,
     /// 事件通道（上层 take_events 消费）
@@ -162,10 +174,12 @@ impl QuicConnection {
                 tracker: SendTracker::new(),
                 recv: RecvTracker::new(),
                 streams: StreamManager::new(),
-                cong: Bbr::new(),
+                cong: CubicSender::new(),
                 last_ack_at: Instant::now(),
                 last_recv_at: Instant::now(),
             }),
+            send_trigger: Mutex::new(()),
+            send_cvar: Condvar::new(),
             closed: Arc::new(AtomicBool::new(false)),
             cipher: crate::quic::crypto::PacketCipher::new(cfg.secret),
             secret: cfg.secret,
@@ -209,10 +223,12 @@ impl QuicConnection {
                 tracker: SendTracker::new(),
                 recv: RecvTracker::new(),
                 streams: StreamManager::new(),
-                cong: Bbr::new(),
+                cong: CubicSender::new(),
                 last_ack_at: Instant::now(),
                 last_recv_at: Instant::now(),
             }),
+            send_trigger: Mutex::new(()),
+            send_cvar: Condvar::new(),
             closed: Arc::new(AtomicBool::new(false)),
             cipher: crate::quic::crypto::PacketCipher::new(secret),
             secret,
@@ -370,17 +386,26 @@ impl QuicConnection {
         }
     }
 
-    /// ACK 帧处理：确认 + 快速重传 + BBR
+    /// ACK 帧处理：确认 + 快速重传 + CUBIC + 唤醒发送
+    ///
+    /// 2026-08-20 重构（学 quic-go 事件驱动 + CUBIC）：
+    /// 收到 ACK 后通知 send_loop 继续发（释放了 cwnd 预算），
+    /// 替代旧的"等下次轮询"延迟。
     fn on_ack_frame(&self, largest: u64, _delay: u32, ranges: &[(u64, u64)]) {
         // 快速重传（锁内新包号记账，锁外加密发送）
         let retrans: Vec<(u64, Vec<u8>)> = {
             let mut st = self.state.lock().unwrap();
+            // 先取 ACK 前的 inflight（quic-go prior_in_flight 是 ACK 前的值，
+            // ACK 处理后会清空 sent map 导致 inflight=0 -> is_cwnd_limited
+            // 永远 false -> cwnd 永不增长的根因）
+            let prior_inflight = st.tracker.in_flight_bytes() as u64;
             let (confirmed, lost) = st.tracker.on_ack(largest, ranges, None);
             if confirmed > 0 {
-                let bytes = st.tracker.bytes_acked;
+                // CUBIC OnPacketAcked（quic-go 同款：prior_in_flight + acked_bytes
+                // + event_time + latest_rtt + min_rtt）
                 let srtt = st.tracker.srtt();
-                st.cong.on_ack(bytes, srtt);
-                st.cong.on_round(srtt);
+                let min_rtt = srtt; // 简化：min_rtt 用 srtt 近似
+                st.cong.on_packet_acked(largest, confirmed as u64 * crate::quic::ack::MSS as u64, prior_inflight, Instant::now(), srtt, min_rtt);
             }
             lost.into_iter()
                 .map(|frame| {
@@ -393,6 +418,8 @@ impl QuicConnection {
         for (pkt_num, frame) in retrans {
             self.send_frame_encrypted(&frame, pkt_num);
         }
+        // 事件驱动：ACK 释放了 cwnd 预算，唤醒发送线程继续发
+        self.notify_send();
     }
 
     /// PING：回 PONG（回显载荷；新包号）
@@ -403,7 +430,7 @@ impl QuicConnection {
         self.send_frame_encrypted(&pong, pkt_num);
     }
 
-    /// PONG：RTT 采样
+    /// PONG：RTT 采样 + 唤醒发送（pacer rate 可能更新）
     fn on_pong(&self, payload: &[u8]) {
         if payload.len() == 8 {
             let sent_us = u64::from_be_bytes(payload.try_into().unwrap());
@@ -414,6 +441,8 @@ impl QuicConnection {
                 st.tracker.on_rtt_sample(Duration::from_micros(now_us - sent_us));
             }
         }
+        // RTT 更新可能改变 min_rtt，pacer rate 随之变，唤醒重算
+        self.notify_send();
     }
 
     /// RST 流重置
@@ -445,7 +474,23 @@ impl QuicConnection {
     // 发送路径：流缓冲 -> 帧组装 -> 加密 -> 外壳 -> UDP
     // ========================================================================
 
+    /// 唤醒发送线程（事件驱动，学 quic-go scheduleSending）
+    ///
+    /// 触发时机：send_msg 入队 / on_ack 释放预算 / on_pong RTT 更新。
+    /// send_loop 无数据时 condvar wait，收到通知立即继续发。
+    fn notify_send(&self) {
+        let guard = self.send_trigger.lock().unwrap();
+        self.send_cvar.notify_one();
+        drop(guard);
+    }
+
     /// 发送线程：流数据调度 + 周期 ACK + 心跳 PING + RTO 重传
+    ///
+    /// 2026-08-20 重构（学 quic-go 事件驱动 + CUBIC + pacer）：
+    /// - **事件驱动**：无数据时 condvar wait（零 CPU），有数据/ACK
+    ///   唤醒立即发。替代旧轮询 sleep(50µs)
+    /// - **CUBIC + pacer**：cwnd by CUBIC，pacer rate = cwnd/srtt×5/4
+    ///   （quic-go BandwidthEstimate，不靠带官认知回环下也正确）
     fn send_loop(&self) {
         let mut last_rto_check = Instant::now();
         loop {
@@ -453,87 +498,98 @@ impl QuicConnection {
                 break;
             }
             let now = Instant::now();
-            let mut had_data = false; // 本轮是否取到了数据块（决定是否 sleep）
 
-            // 1. 取可发块（预算 = cwnd - in_flight；锁内决策）
+            // 1. 取可发块（cwnd 预算 + pacer 预算；锁内决策）
             let out = {
                 let mut st = self.state.lock().unwrap();
-                let mut out: Vec<(u64, Vec<u8>, bool)> = Vec::new(); // (pkt_num, frame, is_data)
-                // 拥控预算
+                let mut out: Vec<(u64, Vec<u8>, bool)> = Vec::new();
+
+                // pacer 等待判定（quic-go SendPacingLimited）：
+                // cwnd 够但 pacer 预算不足 -> 此轮不取数据
+                let srtt = st.tracker.srtt();
+                let pacer_wait = st.cong.time_until_send(now, srtt);
+
+                // cwnd 预算（quic-go CanSend：in_flight < cwnd）
                 let inflight = st.tracker.in_flight_bytes();
                 let mut budget = st.cong.cwnd_bytes().saturating_sub(inflight);
-                // 各流轮询取块（预算内取尽；先收集块再记账，避免借用冲突）
-                let ids = st.streams.active_ids();
-                let mut blocks: Vec<(u32, u64, Vec<u8>, bool)> = Vec::new();
-                for id in ids {
-                    if budget == 0 {
-                        break;
-                    }
-                    if let Some(s) = st.streams.get(id) {
-                        while budget > 0 {
-                            // 2026-08-20 v2 关键修复：先窥视再取块。
-                            // 旧逻辑 take_block 后预算不足 break = 块已移出
-                            // 队列且未记账，永久丢失 -> 流内空洞 -> 接收方
-                            // delivered_offset 卡死（10MB 下载卡 16KB 根因）
-                            if s.peek_block_len() > budget {
-                                break; // 块留在队列，预算恢复后再取
-                            }
-                            match s.take_block() {
-                                Some((offset, bytes, fin)) => {
-                                    let n = bytes.len();
-                                    budget = budget.saturating_sub(n);
-                                    blocks.push((id, offset, bytes, fin));
-                                    if fin {
-                                        break;
-                                    }
+
+                if budget > 0 && pacer_wait.is_none() {
+                    let ids = st.streams.active_ids();
+                    let mut blocks: Vec<(u32, u64, Vec<u8>, bool)> = Vec::new();
+                    for id in ids {
+                        if budget == 0 {
+                            break;
+                        }
+                        if let Some(s) = st.streams.get(id) {
+                            while budget > 0 {
+                                if s.peek_block_len() > budget {
+                                    break;
                                 }
-                                None => break,
+                                match s.take_block() {
+                                    Some((offset, bytes, fin)) => {
+                                        let n = bytes.len();
+                                        budget = budget.saturating_sub(n);
+                                        blocks.push((id, offset, bytes, fin));
+                                        if fin {
+                                            break;
+                                        }
+                                    }
+                                    None => break,
+                                }
                             }
                         }
                     }
+                    for (id, offset, bytes, fin) in blocks {
+                        let mut frame = Vec::with_capacity(bytes.len() + 16);
+                        packet::encode_stream(&mut frame, id, offset, &bytes, fin);
+                        let pkt_num = self.next_pkt_num.fetch_add(1, Ordering::Relaxed);
+                        st.tracker.on_send(pkt_num, frame.clone(), true);
+                        // CUBIC on_packet_sent（pacer 记账 + cwnd 通知）
+                        let pkt_size = frame.len() + 32;
+                        st.cong.on_packet_sent(now, pkt_num, pkt_size, true, srtt);
+                        out.push((pkt_num, frame, true));
+                    }
                 }
-                // 记账 + 组帧（streams 借用已释放）
-                // 注意：包号在锁内统一分配（tracker 记账与外壳 SEQ 一致），
-                // 所有数据壳包（新数据/重传/PING）都唯一编号
-                for (id, offset, bytes, fin) in blocks {
-                    had_data = true; // 本轮取出块发了数据
-                    let mut frame = Vec::with_capacity(bytes.len() + 16);
-                    packet::encode_stream(&mut frame, id, offset, &bytes, fin);
-                    let pkt_num = self.next_pkt_num.fetch_add(1, Ordering::Relaxed);
-                    st.tracker.on_send(pkt_num, frame.clone(), true);
-                    out.push((pkt_num, frame, true));
-                }
-                // 2. RTO 重传（每 ~50ms 检查；返回帧用新包号重新记账发送）
+
+                // 2. RTO 重传（每 ~50ms 检查）
                 if last_rto_check.elapsed() >= Duration::from_millis(50) {
                     last_rto_check = now;
                     let expired = st.tracker.find_expired();
                     if !expired.is_empty() {
-                        st.cong.on_congestion();
+                        // CUBIC on_retransmission_timeout（quic-go 同款）
+                        st.cong.on_retransmission_timeout(true);
+                        let srtt2 = st.tracker.srtt();
                         for frame in expired {
                             let pkt_num = self.next_pkt_num.fetch_add(1, Ordering::Relaxed);
                             st.tracker.on_send(pkt_num, frame.clone(), true);
+                            st.cong.on_packet_sent(now, pkt_num, frame.len() + 32, true, srtt2);
                             out.push((pkt_num, frame, true));
                         }
                     }
                 }
-                // 3. 周期 ACK（~10ms，SRT 节奏）：接收方向有包才发
-                if now.duration_since(st.last_ack_at) >= ACK_INTERVAL {
+
+                // 3. ACK 发送（quic-go：每 2 包立即 + 25ms 兜底）
+                let send_ack = st.recv.should_send_ack_immediately()
+                    || now.duration_since(st.last_ack_at) >= ACK_INTERVAL;
+                if send_ack {
                     let (largest, ranges) = st.recv.ack_ranges(16);
                     if largest > 0 || !ranges.is_empty() {
                         let mut ack = Vec::new();
                         packet::encode_ack_ranges(&mut ack, largest, 0, &ranges);
-                        out.push((0, ack, false)); // ACK 走控制壳（明文）
+                        out.push((0, ack, false));
                     }
                     st.last_ack_at = now;
                 }
-                out
+
+                (out, pacer_wait)
             };
-            // 4. 锁外发送（ACK 走控制壳，数据走加密数据壳；包号已分配）
-            for (pkt_num, frame, is_data) in out {
-                if is_data {
-                    self.send_frame_encrypted(&frame, pkt_num);
+
+            // 4. 锁外发送
+            for (pkt_num, frame, is_data) in &out.0 {
+                if *is_data {
+                    self.send_frame_encrypted(frame, *pkt_num);
                 } else {
-                    self.send_ctrl_frame(&frame);
+                    self.send_ctrl_frame(frame);
                 }
             }
 
@@ -560,14 +616,20 @@ impl QuicConnection {
                 }
             }
 
-            // 2026-08-20 性能优化：条件休眠。本轮有数据发出（had_data）说明
-            // 管线在流，立即下一轮继续发（零延迟）；本轮无数据（预算耗尽
-            // 等 ACK 或无待发）才 sleep 50µs 等待 ACK 释放预算。
-            // 旧固定 1ms/50µs sleep 在上传场景成为吞吐上限：单连接 18000
-            // 包/s × 50µs = 0.9s/s 全在 sleep。had_data 标志让它忙但有数据时
-            // 光速循环（CPU 换吞吐，合理）。
-            if !had_data {
-                std::thread::sleep(Duration::from_micros(50));
+            // 7. 事件驱动等待（学 quic-go Run() select）：
+            // 有数据发出 -> 立即下一轮（光速循环，CPU 换吞吐）
+            // 无数据发出 -> condvar wait 直到 notify_send 唤醒
+            // pacer 限制 -> 等待 pacer_time_until_send 时长
+            if out.0.is_empty() {
+                let wait = match out.1 {
+                    // pacer 限制：等 pacer 恢复（100µs 细粒度，回环高带宽关键）
+                    Some(d) => d.min(Duration::from_micros(100)),
+                    // 无数据：等唤醒或 1ms 超时保底（防丢失 notify_send；
+                    // 回环 ACK~150µs，1ms 足够响应）
+                    None => Duration::from_millis(1),
+                };
+                let guard = self.send_trigger.lock().unwrap();
+                let _ = self.send_cvar.wait_timeout(guard, wait);
             }
         }
     }
@@ -653,11 +715,10 @@ impl QuicConnection {
     /// 发送一条完整消息（前端 Mux 帧；写入主流缓冲，send_loop 调度）
     ///
     /// 背压语义：缓冲满时自旋等待（连接关闭返回 false）。
+    ///
+    /// 2026-08-20 v2 事件驱动：入队后 notify_send 唤醒 send_loop，
+    /// 替代旧的"等下次轮询"延迟。
     pub fn send_msg(&self, data: &[u8]) -> bool {
-        // StreamSend::send 已是原子语义（整块放不下返回 0），整块重试
-        // 安全：不会部分写入，块边界 = Mux 帧边界全程保持。
-        // （v2 曾改为部分续写--但部分写入会把 Mux 帧拆成两个流块，
-        // 接收侧帧头与 payload 分离 -> "帧长度超界"，已回退并根治）
         loop {
             if self.closed.load(Ordering::Acquire) {
                 return false;
@@ -669,11 +730,14 @@ impl QuicConnection {
                 }
                 if let Some(s) = st.streams.get(MAIN_STREAM_ID) {
                     if s.send(data) == data.len() {
+                        // 入队成功，唤醒发送线程（学 quic-go onHasStreamData -> scheduleSending）
+                        drop(st);
+                        self.notify_send();
                         return true;
                     }
                 }
             }
-            // 2026-08-20 性能优化：1ms → 50µs，缩短背压等待延迟
+            // 缓冲满，背压等待
             std::thread::sleep(Duration::from_micros(50));
         }
     }

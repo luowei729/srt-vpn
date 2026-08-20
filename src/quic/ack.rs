@@ -206,9 +206,15 @@ impl SendTracker {
         self.sent.values().filter(|p| p.is_data && !p.acked).map(|p| p.frame.len()).sum()
     }
 
-    /// 当前 SRTT（外部心跳采样入口也用）
+    /// SRTT（外部心跳采样入口也用）
     pub fn srtt(&self) -> Duration {
         self.srtt
+    }
+
+    /// 未确认表条目总数（诊断用；含 ACK 后待删条目）
+    #[allow(dead_code)]
+    pub fn sent_count(&self) -> usize {
+        self.sent.len()
     }
 
     /// 外部 RTT 采样（心跳 PING/PONG 测得，无数据流时维持新鲜 RTO）
@@ -253,6 +259,12 @@ impl SendTracker {
 /// 记录已收到的数据包号，生成降序 ACK 区间（RFC9000 ACK Ranges）。
 /// 内存控制：只保留最近 ACK_K_WINDOW 个包号（更早的都已确认过，
 /// 发送方早已清理；窗口外重复到达直接忽略）。
+///
+/// 2026-08-20 性能优化（学 quic-go ACK 策略）：
+/// ACK 发送改为"每 2 个 ack-eliciting 包立即发 + 有 missing 立即发 +
+/// 25ms 兜底定时器"，替代旧的固定 5ms 周期。上传场景客户端等 ACK
+/// 释放 in_flight，旧 5ms 周期是反应延迟 5ms 的根因（上传 24 vs 下载
+/// 120MB/s），改后每 2 包即回 ACK，反应延迟降到 ~1 包的 RTT。
 pub struct RecvTracker {
     /// 已收包号集合（有序；ACK 发出后仍保留，供重复包去重）
     received: std::collections::BTreeSet<u64>,
@@ -267,6 +279,12 @@ pub struct RecvTracker {
     min_unacked: u64,
     /// 记录窗口上限（防内存无限增长；仅约束 min_unacked 以上的额外保留）
     window: usize,
+    /// 2026-08-20 性能优化（学 quic-go）：收到多少 ack-eliciting 包未发 ACK
+    packets_since_last_ack: u32,
+    /// 2026-08-20 性能优化（学 quic-go）：是否需要立即发 ACK（收到 2 包/有 missing）
+    ack_queued: bool,
+    /// 2026-08-20 性能优化（学 quic-go）：上次检测时有没有 missing（用于重传恢复即时 ACK）
+    last_had_missing: bool,
 }
 
 /// 接收记录窗口（最近 4096 个包号足够覆盖重传乱序范围）
@@ -285,6 +303,9 @@ impl RecvTracker {
             largest_recv: 0,
             min_unacked: 0,
             window: ACK_K_WINDOW,
+            packets_since_last_ack: 0,
+            ack_queued: false,
+            last_had_missing: false,
         }
     }
 
@@ -293,7 +314,6 @@ impl RecvTracker {
     /// 返回 true = 新包（首次收到）；false = 重复/过期。
     pub fn on_recv(&mut self, pkt_num: u64) -> bool {
         // 快路径：包号 < min_unacked（已裁剪过的旧包号）直接判重复
-        // （perf 70% CPU 根因：retain 每包触发。改先短路不插 BTreeSet）
         if pkt_num < self.min_unacked {
             return false;
         }
@@ -301,18 +321,35 @@ impl RecvTracker {
             self.largest_recv = pkt_num;
         }
         let inserted = self.received.insert(pkt_num);
-        // 窗口裁剪：逐次插入代价远小于批量 retain。只在膨胀到 4 倍窗口
-        // 时批量清理一次（罕见），高频 On_path 零分配。
-        // 2026-08-20 性能优化（perf 热点 70% CPU 根因：retain 每包触发）
+        // 窗口裁剪：只在膨胀到 4 倍窗口时批量清理一次（罕见）
         if self.received.len() > self.window * 4 {
             let cutoff = self.largest_recv.saturating_sub(self.window as u64);
             let kept = self.received.split_off(&cutoff);
             self.received = kept;
-            // 更新 min_unacked 防止下一批重复插入触发短路前的包号被
-            // 误认"已裁剪"（实际是已被 split_off 移走但 > 旧 min_unacked）
             self.min_unacked = self.min_unacked.max(cutoff);
         }
+
+        // 2026-08-20 性能优化（学 quic-go ACK 策略）：
+        // 收到 ack-eliciting 包后检查是否应立即发 ACK
+        if inserted {
+            self.packets_since_last_ack += 1;
+            // ① 收到之前 missing 的包（重传恢复） -> 立即 ACK
+            if self.last_had_missing {
+                self.ack_queued = true;
+            }
+            // ② 每 2 个包一次立即 ACK（quic-go packetsBeforeAck = 2）
+            else if self.packets_since_last_ack >= 2 {
+                self.ack_queued = true;
+            }
+        }
         inserted
+    }
+
+    /// 2026-08-20 性能优化（学 quic-go）：
+    /// 返回 true 表示应立即发 ACK（不等周期定时器）。
+    /// ack_queued 在 ack_ranges() 调用时清除。
+    pub fn should_send_ack_immediately(&self) -> bool {
+        self.ack_queued
     }
 
     /// 生成 ACK 区间（从最大已收包号向下降序，最多 max_ranges 段）
@@ -360,6 +397,12 @@ impl RecvTracker {
                 self.min_unacked = *lowest;
             }
         }
+        // 2026-08-20 性能优化（学 quic-go）：
+        // ACK 已发，清除 queued 标志和计数。记录本次是否有 gap（多于
+        // 1 个区间=有 missing），下次收到恢复的包时立即 ACK。
+        self.ack_queued = false;
+        self.packets_since_last_ack = 0;
+        self.last_had_missing = ranges.len() > 1;
         (largest, ranges)
     }
 
