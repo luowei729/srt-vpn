@@ -81,7 +81,10 @@ impl Default for QuicConfig {
 const MAIN_STREAM_ID: u32 = 1;
 
 /// ACK 发送周期（真 SRT ACK 间隔 ~10ms，拟真 + 聚合）
-const ACK_INTERVAL: Duration = Duration::from_millis(10);
+/// 2026-08-20 性能优化：10ms → 5ms。上传场景 ACK 回程是 in_flight 预算
+/// 释放的延迟源之一（客户端发一批后等 ACK 才发下一批），缩短可加快窗口
+/// 回收。3ms 测试 ACK 开销偏大，5ms 平衡点（~200 ACK/s 聚合够）。
+const ACK_INTERVAL: Duration = Duration::from_millis(5);
 
 /// 连接共享状态（单锁保护：发送/接收/拥控全部状态）
 struct ConnState {
@@ -250,8 +253,12 @@ impl QuicConnection {
                     self.handle_datagram(&buf[..n]);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // 空闲：sleep 500µs 回轮（突发处理延迟敏感）
-                    std::thread::sleep(Duration::from_micros(500));
+                    // 空闲：sleep 50µs 回轮。
+                    // 2026-08-20 性能优化：500µs → 50µs。上传场景服务端 recv_loop
+                    // 在两批数据包之间 WouldBlock，500µs sleep 成为每批 500µs 延迟
+                    // 瓶颈（上传 24 vs 下载 150 MB/s 的主因）。50µs 与 send_loop
+                    // EAGAIN 重试对齐，CPU 开销可忽略（空闲态才会到此分支）。
+                    std::thread::sleep(Duration::from_micros(50));
                 }
                 Err(_) => break,
             }
@@ -551,7 +558,19 @@ impl QuicConnection {
                 }
             }
 
-            std::thread::sleep(Duration::from_millis(1));
+            // 2026-08-20 性能优化：自适应休眠。有待发数据时 50µs 快回轮
+            // （等 ACK 释放预算），空闲时 1ms 省 CPU。上传场景发送方
+            // send_loop 每轮 1ms 固定 sleep 是吞吐上限（1000 包/s ≈ 1.3MB/s
+            // 单连接），改自适应后快路径零延迟。
+            let has_pending = {
+                let st = self.state.lock().unwrap();
+                st.streams.any_pending()
+            };
+            if has_pending {
+                std::thread::sleep(Duration::from_micros(50));
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 
@@ -656,7 +675,8 @@ impl QuicConnection {
                     }
                 }
             }
-            std::thread::sleep(Duration::from_millis(1));
+            // 2026-08-20 性能优化：1ms → 50µs，缩短背压等待延迟
+            std::thread::sleep(Duration::from_micros(50));
         }
     }
 
