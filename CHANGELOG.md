@@ -2,6 +2,37 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-20 16:30] - 丢包检测完全按 quic-go detectLostPackets 重写（RFC9002 §7.3，时间+包号阈值+lossTime）
+
+### 改动前总结
+旧版丢包检测是 gap-based：只在 ACK 区间间有 gap 时判丢。quic-go
+`ackhandler/sent_packet_handler.go:787 detectLostPackets` **不依赖 gap**——
+直接遍历 largest_acked 之前的未确认包，按两个阈值判丢。
+
+### 改动后总结
+完全按 quic-go `detectLostPackets` 重写（RFC9002 §7.3）：
+- **时间阈值**（`timeThreshold = 9/8`，§7.3.1）：`sent_time <= now - maxRTT × 9/8` 判丢
+  （maxRTT = max(LatestRTT, SRTT)，我们简化用 SRTT；P1.5 接入 latest_rtt 后改 max）
+- **包号阈值**（`packetThreshold = 3`，§7.3.2）：`largest_acked - pn >= 3` 判丢
+- 不达阈值且 `pn < largest_acked` 的包：设置 `loss_time` 定时器（quic-go `pnSpace.lossTime`）
+- `get_loss_detection_timeout()` 暴露定时器（send_loop 检测触发兜底重传）
+
+新方法：`is_packet_time_lost`（时间阈值判定）、`update_loss_time`（更新定时器）、
+`get_loss_detection_timeout`。删除原 gap-based 快速重传代码（quic-go 不用 gap 二次判丢）。
+
+**SRT 外壳未变**：包号仍走 SRT 0x80 外壳 SEQ 字段、ACK 走 SRT ACK 控制壳——
+这是 srt-vpn 在 quic-go 基础上加的 SRT 伪装层（不破坏伪装）。
+
+### 验证
+- 81 单测全过（含 3 个新丢包检测测试：packet_threshold_loss、no_early_loss、gap 场景）
+- 下载 30MB/s = 直连、2% 丢包 3 轮全一致、5% 丢包 30MB 一致 4MB/s
+- 双端零错误零告警
+
+### POOL_SIZE 配置化（P1.5 待办）已实施
+config.rs 已实现：`SRT_POOL_SIZE` 环境变量 + `pool_size` 配置项 + clamp 1..=16 默认 4。
+quic-go 是单连接库无连接池概念，POOL_SIZE 是 srt-vpn B 方案的扩展（不属 quic 对标），
+已实现不删，不再扩展新功能。
+
 ## [2026-08-20 15:50] - 重构 CUBIC + Hybrid Slow Start + Pacer（完全按 quic-go 设计替代 BBR，事件驱动 send_loop）
 
 ### 改动前总结

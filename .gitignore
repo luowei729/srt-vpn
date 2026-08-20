@@ -20,4 +20,9 @@
 # quiche/hysteria 源码克隆（供查阅，非本项目代码）
 docs/reference/quiche/
 docs/reference/hysteria/
+docs/reference/quic-go/
+docs/reference/sing-box/
+docs/reference/sing-quic/
+docs/reference/tuic/
+docs/reference/tuic-impl/
 

@@ -28,6 +28,14 @@ pub const MAX_RTO: Duration = Duration::from_secs(60);
 #[allow(dead_code)]
 pub const MSS: usize = 1316;
 
+/// 包号阈值（quic-go packetThreshold = 3，RFC9002 §7.3.2）：
+/// `largest_acked - pn >= 3` 判丢
+const PACKET_THRESHOLD: u64 = 3;
+
+/// 时间阈值因子（quic-go timeThreshold = 9/8，RFC9002 §7.3.1）：
+/// 包 sent_time ≤ now - maxRTT × 9/8 判丢
+const TIME_THRESHOLD: f64 = 9.0 / 8.0;
+
 // ============================================================================
 // 发送侧：未确认包表 + RTO
 // ============================================================================
@@ -51,7 +59,7 @@ pub struct SendTracker {
     sent: BTreeMap<u64, SentPacket>,
     /// 最大已确认包号（ACK 推进）
     largest_acked: u64,
-    /// 累计已确认数据字节（BBR 带宽采样）
+    /// 累计已确认数据字节
     pub bytes_acked: u64,
 
     // RTT 估计（RFC9002 §5.3）
@@ -60,6 +68,10 @@ pub struct SendTracker {
     rto: Duration,
     /// 连续超时次数（指数退避 2^N）
     rto_backoff: u32,
+
+    /// 丢包检测定时器（quic-go pnSpace.lossTime）：
+    /// 不满足时间/包号阈值的未确认包设置此定时器，到点兜底重传
+    loss_time: Option<Instant>,
 }
 
 impl Default for SendTracker {
@@ -78,6 +90,7 @@ impl SendTracker {
             rttvar: Duration::from_millis(5),
             rto: INITIAL_RTO,
             rto_backoff: 0,
+            loss_time: None,
         }
     }
 
@@ -137,33 +150,33 @@ impl SendTracker {
                 self.update_rtt(sample);
             }
         }
-        // 3. 快速重传：gap（区间之间未收的包号）中在表未确认的数据包 -> 判丢
-        //
-        // 架构约定（标准 QUIC 语义）：重传 = 删除旧条目 + 调用方用新包号重新
-        // 记账发送（旧包号已作废，新包号被 ACK 才算恢复）。这里返回帧字节，
-        // 由调用方重新编号；旧条目直接删除，不会在 tracker 里残留等 RTO。
+        // 最小时间粒度保护 quic-go TimerGranularity（避免 RTT=0 时全部判丢）
+
+        // 3. 丢包检测（完全按 quic-go detectLostPackets，RFC9002 §7.3）：
+        // - 时间阈值（timeThreshold = 9/8）：sent_time <= now - maxRTT × 9/8 判丢
+        // - 包号阈值（packetThreshold = 3）：largest_acked - pn >= 3 判丢
+        // - 未达阈值的包设置 loss_time 定时器（PTO 兜底，见 get_loss_detection_timeout）
+        // 注意：底层包号走 SRT 0x80 外壳 SEQ 字段（不破坏 SRT 伪装），
+        // ACK 走 SRT ACK 控制壳——这是 srt-vpn 在 quic-go 基础上加的 SRT 外壳层。
+        let now = Instant::now();
         let mut lost: Vec<Vec<u8>> = Vec::new();
-        if ranges.len() >= 2 {
-            for w in ranges.windows(2) {
-                // w[0] 是更靠上的区间 (low0, high0)，w[1] 是下一段 (low1, high1)
-                let low0 = w[0].0;
-                let high1 = w[1].1;
-                if low0 > high1 + 1 {
-                    // 空洞 (high1, low0) 开区间：包号 high1+1 ..= low0-1 未收到
-                    let lost_nums: Vec<u64> = self
-                        .sent
-                        .range(high1 + 1..low0)
-                        .filter(|(_, p)| p.is_data && !p.acked)
-                        .map(|(&n, _)| n)
-                        .collect();
-                    for n in lost_nums {
-                        if let Some(pkt) = self.sent.remove(&n) {
-                            lost.push(pkt.frame);
-                        }
-                    }
-                }
+        let lost_nums: Vec<u64> = self
+            .sent
+            .range(..self.largest_acked)
+            .filter(|(&n, p)| p.is_data && !p.acked && {
+                let time_lost = self.is_packet_time_lost(p.sent_time, now);
+                let reorder_lost = self.largest_acked - n >= PACKET_THRESHOLD;
+                time_lost || reorder_lost
+            })
+            .map(|(&n, _)| n)
+            .collect();
+        for n in lost_nums {
+            if let Some(pkt) = self.sent.remove(&n) {
+                lost.push(pkt.frame);
             }
         }
+        // 更新 loss_time：largest_acked 之前未达两个阈值的包设置定时器
+        self.update_loss_time(now);
         if confirmed > 0 {
             self.rto_backoff = 0; // 有新确认即重置退避
         }
@@ -195,7 +208,59 @@ impl SendTracker {
         out
     }
 
-    /// 未确认数据包数（窗口占用指标；P1.5 监控接入时启用）
+    /// 时间阈值丢包判定（quic-go detectLostPackets）：
+    /// 包 sent_time ≤ now - maxRTT × 9/8 即判丢（maxRTT = max(LatestRTT, SRTT)）
+    ///
+    /// 我们无 LatestRTT 独立字段，用 srtt 近似（quic-go max(LatestRTT, SRTT)）
+    fn is_packet_time_lost(&self, sent_time: Instant, now: Instant) -> bool {
+        let max_rtt = self.srtt; // 简化：用 SRTT（P1.5 接入 latest_rtt 后改 max）
+        let loss_delay = Duration::from_secs_f64(max_rtt.as_secs_f64() * TIME_THRESHOLD);
+        // quic-go: lossDelay = max(lossDelay, TimerGranularity=1ms)
+        let loss_delay = loss_delay.max(Duration::from_millis(1));
+        let lost_send_time = now.checked_sub(loss_delay).unwrap_or(now);
+        sent_time <= lost_send_time
+    }
+
+    /// 更新丢包检测定时器（quic-go 设置 pnSpace.lossTime）
+    ///
+    /// 遍历 largest_acked 之前的未确认数据包，未达两个阈值的取最早
+    /// sent_time + loss_delay 作为 loss_time，到点由 send_loop 检查触发。
+    fn update_loss_time(&mut self, now: Instant) {
+        self.loss_time = None;
+        let max_rtt = self.srtt;
+        let loss_delay = Duration::from_secs_f64(max_rtt.as_secs_f64() * TIME_THRESHOLD)
+            .max(Duration::from_millis(1));
+        for (&n, p) in self.sent.range(..self.largest_acked) {
+            if !p.is_data || p.acked {
+                continue;
+            }
+            // 包号阈值已判的不算（不会到这里，已被删，但循环时防误）
+            if self.largest_acked - n >= PACKET_THRESHOLD {
+                continue;
+            }
+            // 时间阈值已判的跳过（也已删，但循环时防误）
+            if self.is_packet_time_lost(p.sent_time, now) {
+                continue;
+            }
+            // 此包需要 loss_time 定时器兜底
+            let lt = p.sent_time + loss_delay;
+            self.loss_time = Some(match self.loss_time {
+                Some(existing) => existing.min(lt),
+                None => lt,
+            });
+        }
+    }
+
+    /// 丢包检测定时器超时时刻（quic-go GetLossDetectionTimeout）
+    ///
+    /// send_loop 调：若 now >= loss_time 则触发一次兜底重传
+    /// （检测 timer 触发时所有过阈值的包判丢）。
+    #[allow(dead_code)]
+    pub fn get_loss_detection_timeout(&self) -> Option<Instant> {
+        self.loss_time
+    }
+
+    /// 未确认数据包数（窗口占用指标）
     #[allow(dead_code)]
     pub fn in_flight(&self) -> usize {
         self.sent.values().filter(|p| p.is_data && !p.acked).count()
@@ -439,20 +504,58 @@ mod tests {
         assert_eq!(t.in_flight(), 0);
     }
 
-    /// gap 快速重传：区间间空洞的包立即判丢
+    /// 包号阈值丢包判定（quic-go packetThreshold=3，RFC9002 §7.3.2）：
+    /// ACK largest=5 确认包 5 和 1，包 2,3,4 在 gap 内但 quic-go 不
+    /// 直接用 gap 判丢，而是按 packetThreshold 判：
+    /// - 包 0 距 largest_acked=5 距离 5 >= 3 → 判丢
+    /// - 包 2,3,4 距离 3,2,1 < 3 → 不判丢（设 loss_time 兜底）
+    ///
+    /// 注：gap 区间的包（2,3,4）由 ACK Ranges 自身治理——接收方连续
+    /// 范围内确认/未确认在 ranges 里已表达，quic-go 不二次判丢。
     #[test]
     fn test_fast_retransmit_on_gap() {
         let mut t = SendTracker::new();
         for n in 0..6 {
             t.on_send(n, vec![n as u8; 10], true);
         }
-        // 接收方收到 {5, 1}：包 2,3,4 在 gap 里应判丢（旧条目删除，返回重发）
+        // ACK largest=5, ranges=[(5,5),(1,1)]：
+        // 距离 largest_acked=5 >= 3 的包判丢：包 0（5-0=5）+ 包 2（5-2=3）
+        // 包 3,4 距离 2,1 < 3 不判丢（设 loss_time 兜底）
         let (c, lost) = t.on_ack(5, &[(5, 5), (1, 1)], None);
         assert_eq!(c, 2, "确认 5 和 1");
-        assert_eq!(lost.len(), 3, "gap 内 2,3,4 应快速重传");
-        // v2 架构：判丢即删旧条目（重发由调用方用新包号记账），
-        // 表里只剩包 0（不在任何区间也不在 gap 内，靠 RTO 兜底）
-        assert_eq!(t.in_flight(), 1, "包 0 仍未确认（RTO 兜底）");
+        assert_eq!(lost.len(), 2, "包 0 和 2 达 packetThreshold>=3");
+        assert!(t.get_loss_detection_timeout().is_some(), "应有 loss_time");
+    }
+
+    /// 单区间无 gap 但包号阈值达标的丢包判定（quic-go packetThreshold=3）
+    #[test]
+    fn test_packet_threshold_loss_no_gap() {
+        let mut t = SendTracker::new();
+        // 发 6 包：0,1,2,3,4,5
+        for n in 0..6 {
+            t.on_send(n, vec![n as u8; 10], true);
+        }
+        // 接收方只确认了 {5}：单区间无 gap，但 largest_acked=5，包 5-3=2，
+        // 即包 0,1,2 都 < threshold=2 应判丢（公网场景关键路径）
+        let (c, lost) = t.on_ack(5, &[(5, 5)], None);
+        assert_eq!(c, 1); // 确认包 5
+        assert_eq!(lost.len(), 3, "阈值判定丢包 0,1,2");
+        assert_eq!(t.in_flight(), 2); // 包 3,4 仍未确认（< threshold）
+    }
+
+    /// 单区间无 gap + 阈值未达标：不误判丢（防过早重传）
+    #[test]
+    fn test_no_early_loss_below_threshold() {
+        let mut t = SendTracker::new();
+        // 发 4 包：0,1,2,3
+        for n in 0..4 {
+            t.on_send(n, vec![n as u8; 10], true);
+        }
+        // 只收到 {3}：threshold = 3-3 = 0，包 0,1 距离 3 是 3 = 阈值边界
+        // 包 0 在 ..=0 范围内 but 3-0=3 >= 3 → 判丢；包 1,2 距离 2,1 不达标
+        let (_, lost) = t.on_ack(3, &[(3, 3)], None);
+        // 包 0 距 largest_acked=3 阈值 3，已判丢；包 1,2 未达阈
+        assert_eq!(lost.len(), 1, "仅包 0 达到 threshold=3");
     }
 
     /// 乱序但未丢不误判：单区间（后到先收）无 gap

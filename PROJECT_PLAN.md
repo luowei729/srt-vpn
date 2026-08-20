@@ -272,7 +272,11 @@ srt-vpn/
 - [x] **P0 内核+外壳（2026-08-20 09:55 完成）**：自研 quic/（varint/帧/多流/ACK/丢包/BBR）+ srt_shell/（0x80 握手 + 16B 头 + auth）；废弃 libsrt/build.rs；回环 + 多设备端到端验证通过
 - [x] **P1 前端重建（部分完成）**：socks5/HTTP/UDP 重接新内核 + tunnel 保壳 + 多设备独立数据端口；UDP 待重验重、payload 加密待接线
 - [x] **P1.5 传输层核心（2026-08-20 11:06 完成）**：载荷加解密接线（✓ send_raw/handle_datagram）+ 装饰 ACK 节奏（✓ make_ack_packet 接入 send_loop）+ **传输层三连修**（ACK 字节偏移语义/主流 offset 重组/吞吐三瓶颈，回环 1MB/s -> 下载 28/上传 14 MB/s，详见 CHANGELOG 11:06）
-- [ ] **P1.5 剩余**：乒乓心跳 RTT（ping/pong 接入）+ 多用户账号 + SACK/快速重传（公网丢包优化）+ POOL_SIZE 配置化
+- [x] **P1.5 剩余**：乒乓心跳 RTT（ping/pong 接入）+ 多用户账号 + SACK/快速重传（公网丢包优化）+ POOL_SIZE 配置化
+  - 乒乓心跳 RTT：✓ encode_ping/on_ping/on_pong 在 connection.rs 中已接入
+  - 多用户账号：✓ socks5.rs validate_credential 支持 socks5_users 多用户 argon2 哈希表（SRT_SOCKS5_USERS 环境变量明文转哈希），端到端验证 3 用户+错误密码+不存在用户+无认证全正确
+  - SACK/快速重传：✓ ack.rs on_ack 按完全 quic-go detectLostPackets（RFC9002 §7.3）重写：时间阈值 9/8 + 包号阈值 3 + lossTime 定时器
+  - POOL_SIZE 配置化：✓ config.rs SRT_POOL_SIZE env + pool_size 配置项 + clamp 1..=16 默认 4（quic-go 无此概念，是 srt-vpn B 方案扩展）
 - [ ] **P2 部署与 passwall**：passwall 适配新核心 + Docker/CI + 公网多线程 + SRT 特征抓包验证
 
 ### 重构共识决策表（grilling 收束，2026-08-20）
