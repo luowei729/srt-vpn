@@ -213,7 +213,11 @@ impl QuicConnection {
         Ok(conn)
     }
 
-    /// 服务端入口：attach 到已认证客户端的独立数据 socket
+    /// 服务端入口：attach 到已认证客户端的共享监听 socket
+    ///
+    /// 2026-08-20 单端口修复：不再 spawn recv_loop（避免多连接 recv_from 竞争抢读）。
+    /// 接收由 QuicListener 的单一接收线程统一做，按 src 地址分发到各连接的
+    /// handle_datagram。本方法只 spawn send_loop（发送仍由连接自身管理）。
     pub fn attach_peer(udp: Arc<UdpSocket>, peer: SocketAddr, secret: [u8; 16], heartbeat_secs: u64) -> Arc<Self> {
         let (rx_tx, rx_rx) = tokio::sync::mpsc::unbounded_channel::<RecvEvent>();
         let conn = Arc::new(Self {
@@ -242,8 +246,7 @@ impl QuicConnection {
         });
         conn.state.lock().unwrap().streams.open(MAIN_STREAM_ID);
 
-        let c2 = conn.clone();
-        std::thread::spawn(move || c2.recv_loop());
+        // 只 spawn send_loop（接收由 listener 统一分发，不在此 spawn recv_loop）
         let c3 = conn.clone();
         std::thread::spawn(move || c3.send_loop());
         conn
@@ -253,7 +256,11 @@ impl QuicConnection {
     // 接收路径：UDP -> 外壳解析 -> 解密 -> 帧分发
     // ========================================================================
 
-    /// 接收线程（非阻塞轮询；断线 = 心跳超时置 closed）
+    /// 接收线程（仅客户端用；服务端由 QuicListener 统一 recv_from 分发）
+    ///
+    /// 客户端是独立 socket 无竞争，可自行 recv_from。
+    /// 服务端共享监听 socket，多连接若各自 recv_from 会抢读丢包
+    ///（连接池第 2~4 条连接认证超时的根因），改由 listener 单线程分发。
     fn recv_loop(&self) {
         let mut buf = vec![0u8; 65536];
         loop {
@@ -283,11 +290,14 @@ impl QuicConnection {
 
     /// 处理一个 UDP 数据报（外壳解析 + 解密 + 帧分发）
     ///
+    /// pub：服务端由 QuicListener 接收线程调用（统一 recv_from 后按 src 分发）。
+    /// 客户端由自身 recv_loop 调用。
+    ///
     /// 包号记账（2026-08-20 v2 关键修复）：**所有数据壳包**（STREAM/PING/
     /// PONG/RST）消耗包号序列，必须全部记入 received 集合。旧版只记
     /// STREAM 帧--PING/PONG 的包号成黑洞，ACK 区间把黑洞当 gap 报给
     /// 发送方（误判丢包重传），而真实丢包反而淹没在噪声里。
-    fn handle_datagram(&self, data: &[u8]) {
+    pub fn handle_datagram(&self, data: &[u8]) {
         let Some((pkt_num, frame)) = self.decode_wire(data) else {
             return; // 非法包（<16B / 未知控制类型 / 解密失败）静默丢弃
         };
@@ -454,13 +464,21 @@ impl QuicConnection {
     }
 
     /// 握手帧（客户端：AUTH_OK 处理）
+    ///
+    /// 2026-08-20 公网 NAT 兼容修复：
+    /// AUTH_OK 中的 data_port 是服务端为客户端分配的独立数据端口。
+    /// 但 NAT 客户端发 PING 到 data_port 时 NAT 新建映射，服务端从
+    /// data_port 回包源端口≠9000，对称 NAT 下入站被丢弃。
+    /// 修复：不迁移端口，继续从 9000 收发（全双工 NAT 穿透）。
+    /// data_port 保留给未来 STUN 打洞场景。
     fn on_handshake(&self, payload: &[u8]) {
         if !payload.is_empty() && payload[0] == crate::srt_shell::auth::CMD_AUTH_OK {
             self.authenticated.store(true, Ordering::Release);
+            // 不迁移端口（公网 NAT 兼容）：继续从 9000 收发
+            // data_port 解析但不使用（保留给未来 STUN 场景）
             match crate::srt_shell::auth::parse_auth_ok_port(payload) {
-                Some(port) => {
-                    self.data_only_port.store(port, Ordering::Release);
-                    tracing::info!(data_port = port, "认证成功，数据通道迁移到独立端口");
+                Some(_port) => {
+                    tracing::info!(data_port = _port, "认证成功（不迁移端口，NAT 兼容）");
                 }
                 None => {
                     tracing::warn!("AUTH_OK 端口解析失败（不迁移，走监听端口）");

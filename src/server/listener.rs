@@ -39,7 +39,9 @@ pub async fn accept_loop(
         QuicListener::bind(quic_addr(listen_addr), secret, heartbeat_secs)
             .map_err(|e| format!("QUIC 监听建立失败: {e}"))?,
     );
-    tracing::info!(listen = %listen_addr, "监听已建立，等待客户端...");
+    // 启动常驻接收线程（单端口模型：唯一 recv_from 者 + 按 src 分发到各连接）
+    listener.spawn_recv_thread();
+    tracing::info!(listen = %listen_addr, "监听已建立（单接收线程分发模式），等待客户端...");
 
     loop {
         // 名额控制：max_clients 内才 accept（原子计数快照）

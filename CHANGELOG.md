@@ -2,6 +2,69 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-20 19:10] - 单端口+单接收线程分发模型（NAT 兼容+连接池修复）
+
+### 改动前总结
+上一轮"共享监听 socket"NAT 兼容修复有两个 bug：
+1. `try_handshake` 认证通过后**忘了发 AUTH_OK 回包**（只构建了连接对象）
+   → 客户端 `while !authenticated` 轮询 8s 后超时 → "认证超时"
+2. 每个连接各自 spawn `recv_loop` 从共享 socket `recv_from` 竞争抢读
+   → UDP recv_from 是原子读，第 1 条连接的 recv_loop 读走第 2~4 条连接的包
+   → 连接池 4 条连接只有第 1 条认证成功，其余超时
+
+### 改动后总结
+- **`src/quic/listener.rs`** 完全重写为单端口+单接收线程分发模型（学 TUIC/QUIC）：
+  - 新增常驻接收线程：唯一 `recv_from` 者，无竞争抢读
+  - `HashMap<SocketAddr, Arc<QuicConnection>>` 分发表：按 src 完整地址路由
+  - 快速路径：已注册客户端的数据包 → `conn.handle_datagram()`
+  - 慢速路径：未注册 src → `try_handshake_static` 握手认证 → 回发 AUTH_OK
+    → 注册到分发表 + 推送到 channel 给 accept
+  - `cleanup_stale`：WouldBlock 间隙清理已断开连接（closed=true）的分发表条目
+  - `accept` 改为从 channel 取新连接（解耦接收与 accept）
+- **`src/quic/connection.rs`**：
+  - `attach_peer` 不再 spawn `recv_loop`（接收由 listener 统一分发）
+  - `handle_datagram` 改为 `pub`（供 listener 接收线程调用）
+  - `recv_loop` 保留给客户端用（独立 socket 无竞争）
+- **`src/server/listener.rs`**：bind 后调用 `listener.spawn_recv_thread()` 启动接收线程
+- 端到端验证：4 连接池全部认证成功 + SOCKS5 隧道 HTTP 访问正常
+
+### 涉及文件
+- `src/quic/listener.rs`（重写）
+- `src/quic/connection.rs`（attach_peer/handle_datagram/recv_loop 改动）
+- `src/server/listener.rs`（启动接收线程）
+
+## [2026-08-20 17:15] - P2 passwall 适配 + CI 注释清理 + SRT 特征抓包验证 + 公网部署
+
+### 改动前总结
+P1.5 全部完成后进入 P2（部署与 passwall）。passwall 节点配置界面和
+util_srt-vpn.lua 还在传已废弃的 crypto/streamid 字段；CI workflow
+有 libsrt 时代残留注释；SRT 0x80 外壳伪装需抓包验证真实性。
+
+### 改动后总结
+- **passwall 适配**（openwrt-passwall-srt-vpn 仓库）：
+  - `util_srt-vpn.lua`：不再把 crypto/streamid 写入 client.json（已废弃，
+    重构后加密统一 AES-128-CTR 由 passphrase 派生）；新增 pool_size 字段
+  - `7_srt-vpn.lua`：crypto/streamid 选项标"已废弃"说明；新增 pool_size
+    选项（1..=16 默认 4，B 方案多连接多带宽）
+- **CI workflow 注释清理**（release.yml）：移除 libsrt 时代残留描述
+  （cmake/openssl/linux-headers/build.rs/srt-1.5.6/submodules），更新为
+  纯 Rust + rust:1.97-alpine 描述
+- **SRT 特征抓包验证**（tcpdump）：
+  - 客户端握手包首字节 `0x80` ✓（SRT 控制包标志位）
+  - 服务端响应首字节 `0x80` ✓
+  - **不是 QUIC**（QUIC 首字节 0xC0+ Long Header）
+  - **不是裸 HTTP/3**（HTTP/3 走 QUIC 也是 0xC0）
+  - DPI 看到 0x80 首字节 → 判定为 SRT 流量（伪装成功）
+- **公网部署验证**（129.150.44.117 新加坡 aarch64）：
+  - 服务器源码同步（tar over ssh）+ 本地编译 v0.3.0 成功（2m16s）
+  - systemd service 更新指向新二进制路径（/root/srt-vpn-src/）
+  - 服务端启动正常，4 连接池建立成功
+  - **链路问题**：客户端 NAT（112.3.201.48 中国移动上海）入站 UDP 被运
+    商限制——服务端 PONG 发出但客户端零 In 包。**非代码 bug**（本地
+    回环全正常）。待换有公网 IP 的客户端环境验证。
+- **旧进程清理**：服务器上 4 个旧 srt_probe_mc（libsrt FFI 时代探针）
+  和旧 Docker 容器 srtvpn-sg（v0.2.3）已停止清理
+
 ## [2026-08-20 16:30] - 丢包检测完全按 quic-go detectLostPackets 重写（RFC9002 §7.3，时间+包号阈值+lossTime）
 
 ### 改动前总结
