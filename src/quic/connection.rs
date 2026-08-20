@@ -453,6 +453,7 @@ impl QuicConnection {
                 break;
             }
             let now = Instant::now();
+            let mut had_data = false; // 本轮是否取到了数据块（决定是否 sleep）
 
             // 1. 取可发块（预算 = cwnd - in_flight；锁内决策）
             let out = {
@@ -495,6 +496,7 @@ impl QuicConnection {
                 // 注意：包号在锁内统一分配（tracker 记账与外壳 SEQ 一致），
                 // 所有数据壳包（新数据/重传/PING）都唯一编号
                 for (id, offset, bytes, fin) in blocks {
+                    had_data = true; // 本轮取出块发了数据
                     let mut frame = Vec::with_capacity(bytes.len() + 16);
                     packet::encode_stream(&mut frame, id, offset, &bytes, fin);
                     let pkt_num = self.next_pkt_num.fetch_add(1, Ordering::Relaxed);
@@ -558,18 +560,14 @@ impl QuicConnection {
                 }
             }
 
-            // 2026-08-20 性能优化：自适应休眠。有待发数据时 50µs 快回轮
-            // （等 ACK 释放预算），空闲时 1ms 省 CPU。上传场景发送方
-            // send_loop 每轮 1ms 固定 sleep 是吞吐上限（1000 包/s ≈ 1.3MB/s
-            // 单连接），改自适应后快路径零延迟。
-            let has_pending = {
-                let st = self.state.lock().unwrap();
-                st.streams.any_pending()
-            };
-            if has_pending {
+            // 2026-08-20 性能优化：条件休眠。本轮有数据发出（had_data）说明
+            // 管线在流，立即下一轮继续发（零延迟）；本轮无数据（预算耗尽
+            // 等 ACK 或无待发）才 sleep 50µs 等待 ACK 释放预算。
+            // 旧固定 1ms/50µs sleep 在上传场景成为吞吐上限：单连接 18000
+            // 包/s × 50µs = 0.9s/s 全在 sleep。had_data 标志让它忙但有数据时
+            // 光速循环（CPU 换吞吐，合理）。
+            if !had_data {
                 std::thread::sleep(Duration::from_micros(50));
-            } else {
-                std::thread::sleep(Duration::from_millis(1));
             }
         }
     }

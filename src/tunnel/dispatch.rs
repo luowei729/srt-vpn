@@ -286,6 +286,17 @@ impl TunnelSession {
         Some(ev)
     }
 
+    /// 非阻塞取一个事件（有则返回，无则 None）
+    /// 2026-08-20 性能优化：批量合并写用，避免逐包 write_all 的调度开销
+    pub fn try_recv_event(&mut self) -> Option<SessionEvent> {
+        let ev = self.rx.try_recv().ok()?;
+        if let SessionEvent::Data(d) = &ev {
+            let m = crate::metrics::metrics();
+            m.rx_bytes.fetch_add(d.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some(ev)
+    }
+
     /// 从隧道接收数据（等数据 / 对端关闭时返回 None）
     /// 兼容旧调用场景：过滤出 Data 事件，FIN/Close 视为数据流结束
     pub async fn recv(&mut self) -> Option<Vec<u8>> {

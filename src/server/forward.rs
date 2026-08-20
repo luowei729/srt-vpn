@@ -645,7 +645,20 @@ pub async fn start_tcp_forward(
                         if rx_bytes % 262144 < 4096 {
                             tracing::debug!(session = session_id, rx_total = rx_bytes, "隧道→目标 进度");
                         }
-                        stream.write_all(&data).await
+                        // 2026-08-20 性能优化：批量合并写。
+                        // 旧逐块 write_all 每包一次 tokio 调度 + 一次 TCP send
+                        // 系统调用，上传场景单连接 18000 包/s 调度开销占大头。
+                        // 改为：先写入首块，再 try_recv 尽量多取合并成大块一次
+                        // write_all，减少系统调用 + 调度次数 N 倍。
+                        let mut buf = data;
+                        while let Some(ev) = session.try_recv_event() {
+                            match ev {
+                                SessionEvent::Data(d) => buf.extend_from_slice(&d),
+                                SessionEvent::Fin => { peer_fin = true; break; }
+                                SessionEvent::Close => { peer_fin = true; break; }
+                            }
+                        }
+                        stream.write_all(&buf).await
                             .map_err(|e| format!("写目标数据失败: {e}"))?;
                         // 有活动：重置看门狗
                         idle_watchdog.as_mut().reset(tokio::time::Instant::now() + idle_duration);
