@@ -20,17 +20,23 @@
 use super::header::{HS_VERSION_UDT4, SRT_MSS, URQ_INDUCTION};
 
 /// 握手包体（CHandShake 序列化）长度（libsrt m_iContentSize = 48）
+///（P1.5 深度握手拟真接入时启用）
+#[allow(dead_code)]
 pub const HANDSHAKE_BODY_LEN: usize = 48;
 
-/// 握手类型（libsrt handshake.h URQ_* 常量）
-pub const URQ_CONCLUSION: u32 = 1; // 简化：1 = induction（与 libsrt 对齐），结论轮用 2
-pub const URQ_ACCEPT: u32 = 2; // 简化结论确认
+/// 握手类型（libsrt handshake.h URQ_* 常量；P1.5 深度握手拟真接入时启用）
+#[allow(dead_code)]
+pub const URQ_CONCLUSION: u32 = 1;
+#[allow(dead_code)]
+pub const URQ_ACCEPT: u32 = 2;
 
 /// 序列化 CHandShake 握手包体（48B，对齐 libsrt store_to 字段顺序）
+///（P1.5 深度握手拟真接入时启用）
 ///
 /// 字段布局（对齐 libsrt handshake.cpp store_to）：
 /// [version u32][type u32][ISN u32][MSS u32][FlightFlagSize u32][ReqType u32]
 /// [socketID u32][cookie u32][peerIP u32 ×4]
+#[allow(dead_code)]
 pub fn serialize_handshake(
     req_type: u32,
     socket_id: u32,
@@ -63,6 +69,8 @@ pub fn serialize_handshake(
 
 /// 解析握手包体（返回 (version, req_type, socket_id, cookie)）
 /// 非法返回 None
+///（P1.5 深度握手拟真接入时启用）
+#[allow(dead_code)]
 pub fn parse_handshake(body: &[u8]) -> Option<(u32, u32, u32, u32)> {
     if body.len() < HANDSHAKE_BODY_LEN {
         // 允许兼容短的握手（简化协商）
@@ -86,13 +94,15 @@ pub fn parse_handshake(body: &[u8]) -> Option<(u32, u32, u32, u32)> {
     Some((version, req_type, socket_id, cookie))
 }
 
-/// 生成握手 ISN（随机初始序号）
+/// 生成握手 ISN（随机初始序号；P1.5 深度握手拟真接入时启用）
+#[allow(dead_code)]
 pub fn random_isn() -> u32 {
     use rand::Rng;
     rand::thread_rng().gen()
 }
 
-/// 生成 cookie（服务端握手确认用）
+/// 生成 cookie（服务端握手确认用；P1.5 深度握手拟真接入时启用）
+#[allow(dead_code)]
 pub fn random_cookie() -> u32 {
     use rand::Rng;
     rand::thread_rng().gen()

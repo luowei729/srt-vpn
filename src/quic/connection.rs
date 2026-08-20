@@ -26,8 +26,9 @@ use crate::quic::congctl::Bbr;
 use crate::quic::packet::{self, FrameType};
 use crate::quic::stream::StreamManager;
 
-/// 对外暴露：连接状态
+/// 对外暴露：连接状态（P1.5 监控/日志接入时启用 state()）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum QuicState {
     /// 握手未完成
     Handshaking,
@@ -40,8 +41,8 @@ pub enum QuicState {
 /// 接收到的数据事件（转发给上层会话）
 #[derive(Debug)]
 pub enum RecvEvent {
-    /// 应用数据（流 ID + 字节）
-    Data { stream_id: u32, data: Vec<u8> },
+    /// 应用数据（流 ID + 字节；stream_id 供 per-session 未来扩展，现单主数据流）
+    Data { #[allow(dead_code)] stream_id: u32, data: Vec<u8> },
     /// 流 FIN（对端发送方向关闭）
     Fin { stream_id: u32 },
     /// 流 RST
@@ -53,15 +54,16 @@ pub enum RecvEvent {
 /// QUIC 连接配置
 #[derive(Debug, Clone)]
 pub struct QuicConfig {
-    /// 对端地址（客户端必填；服务端由 bind 后 accept 填充）
+    /// 对端地址（客户端 connect 必填；服务端由 attach_peer 直接指定）
     pub peer: Option<SocketAddr>,
-    /// 服务端模式（bind 监听）还是客户端模式（connect）
+    /// 服务端模式 / 本机监听地址 / 初始拥控窗口（预留配置项，当前用默认）
+    #[allow(dead_code)]
     pub is_server: bool,
-    /// 本机监听地址（服务端）
+    #[allow(dead_code)]
     pub bind_addr: Option<SocketAddr>,
     /// 载荷加密密钥（由 passphrase + 握手协商确定，见 crypto.rs）
     pub secret: [u8; 16],
-    /// 拥塞控制初始窗口（包数，BBR 自动调整）
+    #[allow(dead_code)]
     pub init_cwnd_packets: usize,
     /// 心跳间隔（秒）
     pub heartbeat_secs: u64,
@@ -359,10 +361,6 @@ impl QuicConnection {
                     let _ = self.rx_tx.send(RecvEvent::Reset { stream_id: sid });
                 }
             }
-            FrameType::MaxData | FrameType::MaxStreamData => {
-                // 流控窗口更新（简化：本内核单连接共享窗口，暂忽略精确流控，
-                // 由 BBR 拥控承担）
-            }
             FrameType::Handshake => {
                 // 认证握手载荷（SRT 特征握手）
                 if let Ok(payload) = packet::decode_handshake(frame) {
@@ -439,6 +437,8 @@ impl QuicConnection {
     }
 
     /// 打开一条新流（映射一个上层会话）
+    ///（P1.5 per-session 多流接入时启用；当前单主数据流模式用 open_stream_at）
+    #[allow(dead_code)]
     pub fn open_stream(&self) -> Option<u32> {
         let mut sm = self.streams.lock().unwrap();
         sm.open_stream()
@@ -453,7 +453,8 @@ impl QuicConnection {
     /// 向指定流发送数据（应用层 -> 流缓冲）
     ///
     /// 返回实际写入字节；0 表示背压（流缓冲满，稍后重试）。
-    /// 发送线程（send_loop）按 BBR 窗口从各流取数据发出。
+    ///（P1.5 per-session 多流接入启用；当前单主数据流模式用 send_msg）
+    #[allow(dead_code)]
     pub fn stream_send(&self, sid: u32, data: &[u8]) -> usize {
         let mut sm = self.streams.lock().unwrap();
         if let Some(s) = sm.get(sid) {
@@ -464,6 +465,8 @@ impl QuicConnection {
     }
 
     /// 向指定流标记 FIN（发送方向关闭）
+    ///（P1.5 per-session 多流接入启用）
+    #[allow(dead_code)]
     pub fn stream_fin(&self, sid: u32) {
         let mut sm = self.streams.lock().unwrap();
         if let Some(s) = sm.get(sid) {
@@ -473,14 +476,12 @@ impl QuicConnection {
 
     /// 发送循环（由上层 spawn：定期把流缓冲 -> 网络，按 BBR 调速 + ACK 聚合）
     pub fn send_loop(&self) {
-        let mut ticks: u64 = 0;
         tracing::debug!("QUIC send_loop 启动");
         loop {
             // 断开退出
             if self.closed.load(Ordering::Acquire) {
                 break;
             }
-            ticks += 1;
             // 1. BBR 探测周期
             {
                 let mut c = self.congctl.lock().unwrap();
@@ -596,7 +597,8 @@ impl QuicConnection {
         }
     }
 
-    /// 状态查询
+    /// 状态查询（P1.5 监控/日志接入启用）
+    #[allow(dead_code)]
     pub fn state(&self) -> QuicState {
         match self.state.load(Ordering::Acquire) {
             ST_HANDSHAKING => QuicState::Handshaking,
@@ -605,12 +607,14 @@ impl QuicConnection {
         }
     }
 
-    /// 是否已断开（上层重连信号）
+    /// 是否已断开（上层重连信号；P1.5 监控接入启用）
+    #[allow(dead_code)]
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// 对端地址
+    /// 对端地址（P1.5 监控/日志接入启用）
+    #[allow(dead_code)]
     pub fn peer(&self) -> SocketAddr {
         self.peer
     }
@@ -679,23 +683,25 @@ impl QuicConnection {
         self.send(data)
     }
 
-    /// 由上层接收循环调用的消息消费 API（旧 recv_async 的角色由事件流承担）
+    /// 由上层接收循环调用的消息消费 API（P1.5 备用；当前用 take_events 事件流）
+    #[allow(dead_code)]
     pub async fn recv_async(&self) -> Option<RecvEvent> {
         let mut rx = self.rx_rx.lock().unwrap();
         let rx = rx.as_mut()?;
         rx.recv().await
     }
 
-    /// 标记主流发送完成（清空尾部剩余数据）
+    /// 标记主流发送完成（清空尾部剩余数据；P1.5 连接关闭时序接入启用）
+    #[allow(dead_code)]
     pub fn send_msg_fin(&self) {
         self.stream_fin(1);
     }
 
-    /// 关闭连接（清理 socket）
+    /// 关闭连接（预留优雅关闭；当前由进程退出/重连重建终结）
+    #[allow(dead_code)]
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         // UDP socket Drop 自动关闭；recv 线程因 WouldBlock 循环检测 closed
-        // 简化：进程退出由 runtime Drop 清理
     }
 }
 

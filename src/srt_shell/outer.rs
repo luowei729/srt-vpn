@@ -70,6 +70,8 @@ fn msg_seq() -> u32 {
 }
 
 /// 最大可发 payload（保持包长 ≤ MSS + 头部）
+///（P1.5 包长纹理拟真接入时启用）
+#[allow(dead_code)]
 pub fn max_inner_len() -> usize {
     SRT_MSS as usize - SRT_HEADER_LEN
 }

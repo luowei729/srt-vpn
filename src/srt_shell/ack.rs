@@ -12,15 +12,19 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 /// SRT ACK 发送间隔（约 10ms，对齐 libsrt 的 COMM_SYN_INTERVAL_US=10ms）
+///（P1.5 装饰性 ACK 节奏接入时启用）
+#[allow(dead_code)]
 pub const ACK_INTERVAL: Duration = Duration::from_millis(10);
 
 /// ACK 序号（单调递增，仿真 SRT ACK 序号纹理）
 static ACK_SEQ: AtomicU32 = AtomicU32::new(1);
 
 /// 生成一条装饰性 SRT ACK 控制包（外层 0x80 02 00 00 + 控制信息）
+///（P1.5 装饰性 ACK 节奏接入时启用）
 ///
 /// 控制信息布局（对齐 libsrt packet.cpp pack(UMSG_ACK)）：
 /// [ACK seq u32][数据 seq 最小][RTT u32][RTT var u32][buffer left]
+#[allow(dead_code)]
 pub fn make_ack_packet() -> Vec<u8> {
     use crate::srt_shell::header::MSG_ACK;
     use crate::srt_shell::outer::{encode_ctrl_packet, now_ts_us};
@@ -35,11 +39,15 @@ pub fn make_ack_packet() -> Vec<u8> {
 }
 
 /// 判断是否到了发送装饰 ACK 的时刻（按 ACK_INTERVAL 节流）
+///（P1.5 装饰性 ACK 节奏接入时启用）
+#[allow(dead_code)]
 pub fn should_emit_ack(last_ack_at: Instant, now: Instant) -> bool {
     now.duration_since(last_ack_at) >= ACK_INTERVAL
 }
 
 /// 心跳 keepalive（SRT 空闲时定期发包，仿真 SRT 空闲特征）
+///（P1.5 装饰性 keepalive 接入时启用）
+#[allow(dead_code)]
 pub fn make_keepalive() -> Vec<u8> {
     use crate::srt_shell::header::MSG_NACK;
     use crate::srt_shell::outer::encode_ctrl_packet;

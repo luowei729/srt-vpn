@@ -16,12 +16,16 @@
 use sha2::{Digest, Sha256};
 
 /// 密钥派生盐长度
+/// P1.5 接入数据面加解密时启用
+#[allow(dead_code)]
 pub const SALT_LEN: usize = 16;
 /// 派生密钥长度（与 libsrt 的 AES-128 对齐：16B）
 pub const KEY_LEN_128: usize = 16;
 /// PBKDF 迭代次数（仿 libsrt 风格，防离线暴力）
 const PBKDF_ITERATIONS: u32 = 10_000;
 /// 密钥流生成块的字节数（SHA256 输出 32B 一块）
+/// P1.5 接入数据面加解密时启用
+#[allow(dead_code)]
 const KEYSTREAM_BLOCK: usize = 32;
 
 /// 派生内容加密密钥（passphrase + salt -> 密钥，PBKDF2 风格简化）
@@ -55,6 +59,8 @@ pub fn derive_key(passphrase: &[u8], salt: &[u8], key_len: usize) -> Vec<u8> {
 }
 
 /// 生成随机盐
+/// P1.5 接入数据面加解密时启用
+#[allow(dead_code)]
 pub fn random_salt() -> [u8; SALT_LEN] {
     use rand::RngCore;
     let mut salt = [0u8; SALT_LEN];
@@ -63,12 +69,14 @@ pub fn random_salt() -> [u8; SALT_LEN] {
 }
 
 /// 用密钥流 XOR 加密一块数据（流式，长度不变）
+///（P1.5 接入数据面加解密时启用）
 ///
 /// - key: derive_key 产出的密钥
 /// - nonce: 12B 随机 nonce（SRT 加密的密钥派生语义，每块不同 => 密钥流不同）
 /// - plaintext: 明文
 ///
 /// 返回 [nonce || ciphertext]（nonce 前置，接收方无需额外协商）
+#[allow(dead_code)]
 pub fn encrypt_block(key: &[u8], nonce: &[u8; 12], plaintext: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(nonce.len() + plaintext.len());
     out.extend_from_slice(nonce);
@@ -77,6 +85,8 @@ pub fn encrypt_block(key: &[u8], nonce: &[u8; 12], plaintext: &[u8]) -> Vec<u8> 
 }
 
 /// 解密（encrypt_block 的对称操作——流加密对称，密钥流 XOR 回可得明文）
+///（P1.5 接入数据面加解密时启用）
+#[allow(dead_code)]
 pub fn decrypt_block(key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
     if data.len() < 12 {
         return None;
@@ -89,6 +99,8 @@ pub fn decrypt_block(key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
 /// 生成密钥流并 XOR 到数据（每 KEYSTREAM_BLOCK 字节派生一次密钥流块）
 ///
 /// 密钥流 = SHA256(key || nonce || 块索引)，伪随机伸展，与明文 XOR。
+///（P1.5 接入数据面加解密时启用）
+#[allow(dead_code)]
 fn xor_keystream(key: &[u8], nonce: &[u8; 12], data: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; data.len()];
     // 逐块处理（每 KEYSTREAM_BLOCK 字节一块，密钥流块不同）
@@ -105,6 +117,8 @@ fn xor_keystream(key: &[u8], nonce: &[u8; 12], data: &[u8]) -> Vec<u8> {
 }
 
 /// 生成一个密钥流块（SHA256 抽象 XOR 流，每块派生一次）
+///（P1.5 接入数据面加解密时启用）
+#[allow(dead_code)]
 fn keystream(block: usize, key: &[u8], nonce: &[u8; 12]) -> [u8; KEYSTREAM_BLOCK] {
     let mut h = Sha256::new();
     h.update(key);

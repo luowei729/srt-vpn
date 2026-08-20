@@ -119,6 +119,8 @@ impl MuxEncoder {
 
 /// 从心跳帧载荷解析发起方时间戳（毫秒，M8 RTT 计算用）
 /// 返回 None 表示载荷非法（非 8 字节）
+///（生产路径心跳 RTT 由内核心跳承担；本函数供测试与 P1.5 心跳接入使用）
+#[allow(dead_code)]
 pub fn heartbeat_timestamp(payload: &[u8]) -> Option<i64> {
     if payload.len() != 8 {
         return None;

@@ -2,6 +2,39 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-20 11:10] - 陈旧代码与文档清理（release 零警告）+ 文档同步
+
+### 改动前总结
+重构 P0 落地后存在大量陈旧物：Dockerfile/release.yml 仍引用 libsrt 构建依赖
+（cmake/openssl/linux-headers/build.rs/srt-1.5.6）、59 个未使用接口/常量警告、
+废弃的 streamid 认证函数、README 仍标注"重构中 v0.2.x 时代"。
+
+### 改动后总结
+1. **Dockerfile 纯 Rust 化**：移除 libsrt 构建依赖（cmake/openssl-dev/linux-headers/
+   build.rs/srt-1.5.6/libstdc++/openssl runtime），多阶段只剩 rust:1.97-alpine 编译
+   + alpine runtime 拷贝 musl 静态产物（镜像更小、构建更快）
+2. **release.yml 同步**：build-binaries job 移除 Alpine 容器内 libsrt 依赖安装
+   （纯 Rust 直接 cargo build）
+3. **依赖收敛**：Cargo.toml 移除 hmac/hex/crossbeam-channel（旧 streamid 令牌/
+   旧发送通道），仅剩 clap/serde/tokio/argon2/sha2/rand/tracing/hex
+4. **死代码删除**：config.rs crypto_to_pbkeylen（旧加密强度）、auth/mod.rs
+   streamid 四函数（derive/build/extract/verify_token，旧静态令牌认证）
+5. **待接入接口标注**：quic/srt_shell 中 P1.5 待接入的协议接口（载荷加解密、
+   装饰性 SRT ACK 节奏、完整握手序列化、per-session 多流 API、心跳 ping/pong
+   等）统一加 `#[allow(dead_code)]` + 中文说明"P1.x 接入时启用"
+6. **警告清零**：59 → 0（release build 零警告）
+7. **文档同步**：README 更新为重构完成态（新架构 + 多设备支持说明）
+
+### 涉及文件
+- Dockerfile / .github/workflows/release.yml（纯 Rust 构建）
+- Cargo.toml（依赖收敛）
+- src/auth/mod.rs（删 streamid 旧认证函数）
+- src/config.rs（删 crypto_to_pbkeylen）
+- src/quic/{crypto,packet,ack,stream,connection,listener}.rs（待接入接口标注）
+- src/srt_shell/{auth,handshake,header,ack,outer}.rs（待接入接口标注）
+- src/tunnel/multiplex.rs（heartbeat_timestamp 保留供测试与 P1.5 心跳）
+- README.md（重构完成态）
+
 ## [2026-08-20 09:55] - 重构 P0 落地：Rust 自研 QUIC 语义内核 + SRT 外壳 + 多设备多用户打通
 
 ### 改动前总结

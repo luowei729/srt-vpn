@@ -133,17 +133,6 @@ pub struct ReconnectConfig {
 
 // ===== 通用辅助 =====
 
-/// 加密强度字符串 -> pbkeylen 字节数（16/24/32 = aes-128/192/256）
-/// L 级修复（2026-08-19）：统一到 config.rs（此前 client/mod.rs 与
-/// server/mod.rs 各有一份重复实现，两处维护易分叉）
-pub fn crypto_to_pbkeylen(crypto: &str) -> i32 {
-    match crypto {
-        "aes-192" => 24,
-        "aes-256" => 32,
-        _ => 16, // aes-128（默认，未知值回退）
-    }
-}
-
 // ===== 默认值函数 =====
 
 fn default_crypto() -> String {

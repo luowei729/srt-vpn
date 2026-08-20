@@ -30,19 +30,22 @@ pub const MSG_TYPE_MASK: u32 = 0x7FFF_0000;
 /// 控制消息类型
 pub const MSG_HANDSHAKE: u32 = 0; // UMSG_HANDSHAKE
 pub const MSG_ACK: u32 = 2; // UMSG_ACK
+///（P1.5 keepalive/丢包报告拟真接入时启用）
+#[allow(dead_code)]
 pub const MSG_NACK: u32 = 3; // UMSG_LOSSREPORT
 
-/// SRT/UDT 版本（握手第二 word）
+/// SRT/UDT 版本（握手第二 word；P1.5 深度握手拟真接入时启用）
+#[allow(dead_code)]
 pub const HS_VERSION_UDT4: u32 = 4;
 
-/// 握手请求类型
+/// 握手请求类型（P1.5 深度握手拟真接入时启用）
+#[allow(dead_code)]
 pub const URQ_INDUCTION: u32 = 1; // 客户端首包（握手协商起点）
 
-/// 默认 MSS（1500 标准以太网 MTU）
+/// 默认 MSS / payload（P1.5 包长纹理拟真接入时启用）
+#[allow(dead_code)]
 pub const SRT_MSS: u32 = 1500;
-/// 默认 payload（1500 - IP20 - UDP8 - SRT16 = 1456？——注意：libsrt 默认 1316，
-/// 因为 SRT 头 16B + UDP 8 + IP 20 + 尾 20B（以太网帧尾/选项）≈ 1456 的差异。
-/// 对齐 libsrt 官方 SRT_LIVE_DEF_PLSIZE=1316，见 AGENTS 05:30 条目）
+#[allow(dead_code)]
 pub const SRT_DEF_PAYLOAD: usize = 1316;
 
 /// 编码 SRT 控制包头（首 16B）

@@ -27,7 +27,8 @@ pub struct QuicListener {
     secret: [u8; 16],
     /// 心跳间隔（客户端分配）
     heartbeat_secs: u64,
-    /// 是否已关闭
+    /// 是否已关闭（供上层监控；当前监听循环常驻）
+    #[allow(dead_code)]
     closed: Arc<AtomicBool>,
 }
 
@@ -78,10 +79,9 @@ impl QuicListener {
         }
     }
 
-    /// 当前注册的客户端数（由 accept 返回的连接计数——简化：静态计数）
-    /// 实际活跃客户端由上层 (accept_loop) 维护；此处返回缓存计数。
+    /// 当前注册的客户端数（预留监控接口）
+    #[allow(dead_code)]
     fn clients_count_hint(&self) -> usize {
-        // 简化：不做全局表；上层 accept_loop 自行统计
         0
     }
 
@@ -145,7 +145,8 @@ impl QuicListener {
         Some(conn)
     }
 
-    /// 关闭监听
+    /// 关闭监听（预留清理接口；当前监听循环由进程退出终结）
+    #[allow(dead_code)]
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
     }

@@ -13,16 +13,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 异步运行时（客户端/服务器事件循环）
 tokio = { version = "1", features = ["full"] }
-# 多线程流控/队列
-crossbeam-channel = "0.5"
-# 密码学（argon2 哈希 + HMAC-SHA256 挑战-应答）
+# 密码学（SOCKS5 用户密码 argon2 哈希 / 密钥派生与认证 sha2）
 argon2 = "0.5"
-hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 # 日志（JSON 结构化日志）
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-# 十六进制编码（令牌/校验）
-hex = "0.4"
-# 2026-08-20 重构：移除 libc（libsrt FFI 依赖）/ cc（C 编译器）/ build.rs（libsrt 编译脚本）
+# 2026-08-20 重构清理：移除 libc/cc/build.rs（libsrt 依赖）、hmac/hex（旧 streamid
+# 令牌，已删除其函数）、crossbeam-channel（旧发送通道，已改 tokio）

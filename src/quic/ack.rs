@@ -26,15 +26,14 @@ pub const INITIAL_RTO: Duration = Duration::from_millis(1000);
 pub const MIN_RTO: Duration = Duration::from_millis(200);
 /// 最大 RTO
 pub const MAX_RTO: Duration = Duration::from_secs(60);
-/// RTO 乘数（RTT 波动时增长）
-pub const RTO_MULTIPLIER: f64 = 2.0;
 
 /// 未确认数据包条目
 #[derive(Debug, Clone)]
 pub struct SentPacket {
     /// 发送时间（计算 RTO/超时用）
     pub sent_time: Instant,
-    /// 包序号（发送侧全局递增）
+    /// 包序号（发送侧全局递增；P1.5 ACK 序号关联启用）
+    #[allow(dead_code)]
     pub seq: u64,
     /// 是否已确认
     pub acked: bool,
@@ -101,7 +100,8 @@ impl SendTracker {
         }
     }
 
-    /// 分配下一个包序号
+    /// 分配下一个包序号（P1.5 ACK 关联启用）
+    #[allow(dead_code)]
     pub fn next_seq(&self) -> u64 {
         self.next_seq
     }

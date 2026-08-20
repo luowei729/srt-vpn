@@ -129,9 +129,8 @@ jobs:
           fetch-depth: 0
 
       # 静态编译环境（与 Dockerfile builder 阶段一致，在 Alpine 容器内编译保证 musl 静态）
-      # linux-headers：libsrt 源码包含 <linux/if.h>（2026-08-19 CI 踩坑）
-      # openssl-libs-static：Rust musl 默认 -Wl,-Bstatic 必须静态 OpenSSL 库
-      #                     （openssl-dev 只有 .so stub 会报 cannot find -lcrypto）
+      # 2026-08-20 重构：纯 Rust 项目（libsrt 已废弃），无需 cmake/openssl/linux-headers；
+      # rust:1.97-alpine 自带 cargo，直接编译即得 musl 静态产物
       # 挂载宿主 dist 目录经 Docker 卷写入产物（避免容器退出后文件丢失）
       - name: 在 Alpine 容器内静态编译
         run: |
@@ -139,7 +138,6 @@ jobs:
           docker run --rm -v "$PWD":/build -v "$PWD/dist":/dist -w /build \
             rust:1.97-alpine sh -c '
               set -e
-              apk add --no-cache build-base cmake openssl-dev openssl-libs-static linux-headers pkgconfig
               cargo build --release
               cp target/release/srt-vpn /dist/srt-vpn-linux-${{ matrix.arch }}
               chmod +x /dist/srt-vpn-linux-${{ matrix.arch }}

@@ -21,6 +21,8 @@ pub const MAX_STREAMS: u32 = 256;
 pub const STREAM_SEND_BUFFER: usize = 1 << 20;
 
 /// 单流接收缓冲上限（字节）。超限丢弃远端数据（协议级流控屏障）。
+///（P1.5 接收侧精确流控接入时启用）
+#[allow(dead_code)]
 pub const STREAM_RECV_BUFFER: usize = 1 << 20;
 
 /// 流的状态
@@ -28,9 +30,11 @@ pub const STREAM_RECV_BUFFER: usize = 1 << 20;
 pub enum StreamState {
     /// 已打开（可收发）
     Open,
-    /// 发送方向已关闭（本端发完 FIN，仍可收）
+    /// 发送方向已关闭（本端发完 FIN，仍可收；P1.5 半关闭接入启用）
+    #[allow(dead_code)]
     SendClosed,
-    /// 接收方向已关闭（对端发 FIN，仍可发）
+    /// 接收方向已关闭（对端发 FIN，仍可发；P1.5 半关闭接入启用）
+    #[allow(dead_code)]
     RecvClosed,
     /// 双向关闭（或 RST）
     Closed,
@@ -40,7 +44,8 @@ pub enum StreamState {
 pub(crate) struct StreamSend {
     /// 已发出的最大流内偏移（对端从这里继续期待数据）
     pub(crate) sent_offset: u64,
-    /// 对端已确认的最大偏移（用于回收缓冲）
+    /// 对端已确认的最大偏移（用于回收缓冲；P1.5 ACK 回收启用）
+    #[allow(dead_code)]
     pub(crate) acked_offset: u64,
     /// 待发送缓冲（VecDeque: (offset, bytes)）
     pub(crate) pending: std::collections::VecDeque<(u64, Vec<u8>)>,
@@ -93,6 +98,8 @@ impl StreamRecv {
 
 /// 一条流的双端状态（需显式 Default，因为有 Option 字段与复杂状态）
 pub struct Stream {
+    /// 流 ID（语义标识；当前以 HashMap key 关联，字段保留供日志/诊断）
+    #[allow(dead_code)]
     pub(crate) id: u32,
     pub(crate) state: StreamState,
     pub(crate) send: Option<StreamSend>,
@@ -115,22 +122,26 @@ impl Stream {
         }
     }
 
-    /// 流的当前状态
+    /// 流的当前状态（P1.5 per-session 接入启用）
+    #[allow(dead_code)]
     pub fn state(&self) -> StreamState {
         self.state
     }
 
-    /// 发送方向是否完成（发完 FIN 且数据全 ack）
+    /// 发送方向是否完成（发完 FIN 且数据全 ack；P1.5 per-session 接入启用）
+    #[allow(dead_code)]
     pub fn is_send_finished(&self) -> bool {
         self.send.as_ref().map(|s| s.sender_finished).unwrap_or(true)
     }
 
-    /// 接收方向是否完成（收到 FIN 且数据全交付）
+    /// 接收方向是否完成（收到 FIN 且数据全交付；P1.5 per-session 接入启用）
+    #[allow(dead_code)]
     pub fn is_recv_finished(&self) -> bool {
         self.recv.as_ref().map(|r| r.receiver_finished).unwrap_or(true)
     }
 
-    /// 双向是否都完成
+    /// 双向是否都完成（P1.5 per-session 接入启用）
+    #[allow(dead_code)]
     pub fn is_complete(&self) -> bool {
         self.is_send_finished() && self.is_recv_finished()
     }
@@ -161,7 +172,8 @@ impl Stream {
         take
     }
 
-    /// 应用层标记发送结束（发 FIN）
+    /// 应用层标记发送结束（发 FIN；P1.5 per-session 接入启用）
+    #[allow(dead_code)]
     pub fn send_fin(&mut self) {
         if let Some(s) = self.send.as_mut() {
             s.fin_sent = true;
@@ -197,7 +209,8 @@ impl Stream {
         None
     }
 
-    /// 对端 ACK 推进（确认到 acked_offset，回收发送缓冲）
+    /// 对端 ACK 推进（确认到 acked_offset，回收发送缓冲；P1.5 ACK 回收启用）
+    #[allow(dead_code)]
     pub fn on_ack(&mut self, acked_offset: u64) -> Option<u64> {
         let s = self.send.as_mut()?;
         if acked_offset > s.acked_offset {
@@ -254,7 +267,8 @@ impl Stream {
         Vec::new()
     }
 
-    /// 是否已收到 FIN 且数据完整交付（对端发送方向结束）
+    /// 是否已收到 FIN 且数据完整交付（对端发送方向结束；P1.5 per-session 接入启用）
+    #[allow(dead_code)]
     pub fn is_fin_received(&self) -> bool {
         let r = self.recv.as_ref().map(|r| r.fin_received && r.receiver_finished).unwrap_or(false);
         r
@@ -272,7 +286,8 @@ impl Stream {
 pub struct StreamManager {
     /// 流表 id -> Stream
     streams: HashMap<u32, Stream>,
-    /// 下一个待分配的空闲流 ID（从 1 起，循环查找）
+    /// 下一个待分配的空闲流 ID（从 1 起，循环查找；诊断/统计用）
+    #[allow(dead_code)]
     next_id: u32,
     /// 活动流计数（用于指标）
     active: usize,
@@ -295,6 +310,8 @@ impl StreamManager {
     }
 
     /// 分配一条新流（返回流 ID；满则 None）
+    ///（P1.5 per-session 多流接入时启用）
+    #[allow(dead_code)]
     pub fn open_stream(&mut self) -> Option<u32> {
         if self.streams.len() >= MAX_STREAMS as usize {
             return None;
@@ -348,7 +365,8 @@ impl StreamManager {
         Some(s)
     }
 
-    /// 活动流数
+    /// 活动流数（P1.5 指标/监控接入时启用）
+    #[allow(dead_code)]
     pub fn active_count(&self) -> usize {
         self.active
     }
@@ -358,7 +376,8 @@ impl StreamManager {
         self.streams.keys().copied().collect()
     }
 
-    /// 流总数（含完成未回收的）
+    /// 流总数（含完成未回收的；P1.5 指标/监控接入时启用）
+    #[allow(dead_code)]
     pub fn total(&self) -> usize {
         self.streams.len()
     }

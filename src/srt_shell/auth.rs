@@ -15,9 +15,11 @@
 use crate::quic::crypto::KEY_LEN_128;
 use sha2::{Digest, Sha256};
 
-/// 认证挑战长度（nonce + 时间戳，16B）
+/// 认证挑战长度（nonce + 时间戳，16B；P1.5 握手扩展时启用）
+#[allow(dead_code)]
 pub const CHALLENGE_LEN: usize = 16;
-/// 认证响应长度（HMAC-SHA256 派生 on 密钥）
+/// 认证响应长度（HMAC-SHA256 派生 on 密钥；P1.5 握手扩展时启用）
+#[allow(dead_code)]
 pub const RESPONSE_LEN: usize = 32;
 
 /// 认证载荷布局（内层握手帧的 payload，见 quic/packet.rs encode_handshake）
@@ -31,8 +33,12 @@ pub const RESPONSE_LEN: usize = 32;
 /// 认证命令类型
 pub const CMD_AUTH: u8 = 0x01;
 pub const CMD_AUTH_OK: u8 = 0x02;
+/// 以下命令为 P1.5 心跳/握手扩展预留（当前认证只用 CMD_AUTH/CMD_AUTH_OK）
+#[allow(dead_code)]
 pub const CMD_AUTH_FAIL: u8 = 0x03;
+#[allow(dead_code)]
 pub const CMD_PING: u8 = 0x04;
+#[allow(dead_code)]
 pub const CMD_PONG: u8 = 0x05;
 
 /// 生成认证请求（客户端 → 服务端）
@@ -106,14 +112,16 @@ pub fn parse_auth_ok_port(payload: &[u8]) -> Option<u16> {
     Some(u16::from_be_bytes([payload[5], payload[6]]))
 }
 
-/// 生成 AUTH_FAIL 响应
+/// 生成 AUTH_FAIL 响应（P1.5 认证失败回执启用）
+#[allow(dead_code)]
 pub fn auth_fail() -> Vec<u8> {
     let mut out = Vec::new();
     out.push(CMD_AUTH_FAIL);
     out
 }
 
-/// 生成 PING 载荷（心跳保活，仿 SRT keepalive）
+/// 生成 PING 载荷（心跳保活，仿 SRT keepalive；P1.5 心跳接入启用）
+#[allow(dead_code)]
 pub fn ping() -> Vec<u8> {
     let mut out = Vec::with_capacity(9);
     out.push(CMD_PING);
@@ -125,7 +133,8 @@ pub fn ping() -> Vec<u8> {
     out
 }
 
-/// 生成 PONG 载荷（回声）
+/// 生成 PONG 载荷（回声；P1.5 心跳 RTT 接入启用）
+#[allow(dead_code)]
 pub fn pong(echo: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(CMD_PONG);

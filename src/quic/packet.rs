@@ -198,6 +198,8 @@ pub fn decode_ack(buf: &[u8]) -> io::Result<(u64, u32)> {
 /// 编码 PING/PONG 帧
 ///
 /// PING 无负载（探测/RTT 测量起点）；PONG 回显发起方时间戳载荷。
+///（P1.5 心跳/RTT 测量接入时启用）
+#[allow(dead_code)]
 pub fn encode_ping(buf: &mut Vec<u8>) {
     buf.push(FrameType::Ping as u8);
 }
@@ -224,6 +226,8 @@ pub fn decode_pong(buf: &[u8]) -> io::Result<&[u8]> {
 }
 
 /// 编码 RST_STREAM 帧（流重置）
+///（P1.5 流级复位接入时启用）
+#[allow(dead_code)]
 pub fn encode_rst_stream(buf: &mut Vec<u8>, stream_id: u32, error_code: u32) {
     buf.push(FrameType::RstStream as u8);
     encode_varint(stream_id as u64, buf);
@@ -241,6 +245,8 @@ pub fn decode_rst_stream(buf: &[u8]) -> io::Result<(u32, u32)> {
 }
 
 /// 编码 MAX_DATA（连接级流控窗口更新）
+///（P1.5 精确流控接入时启用；当前单连接共享拥控窗口由 BBR 承担）
+#[allow(dead_code)]
 pub fn encode_max_data(buf: &mut Vec<u8>, max_data: u64) {
     buf.push(FrameType::MaxData as u8);
     encode_varint(max_data, buf);
@@ -256,6 +262,8 @@ pub fn decode_max_data(buf: &[u8]) -> io::Result<u64> {
 }
 
 /// 编码 MAX_STREAM_DATA（流级流控窗口更新）
+///（P1.5 精确流控接入时启用；当前单连接共享拥控窗口由 BBR 承担）
+#[allow(dead_code)]
 pub fn encode_max_stream_data(buf: &mut Vec<u8>, stream_id: u32, max_data: u64) {
     buf.push(FrameType::MaxStreamData as u8);
     encode_varint(stream_id as u64, buf);
