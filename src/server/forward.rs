@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::srt::connection::SrtConnection;
+use crate::quic::connection::QuicConnection;
 use crate::tunnel::dispatch::{SessionEvent, SessionRegistry, TunnelSession};
 use crate::tunnel::multiplex::{MuxEncoder, FRAME_DATA_MAX};
 use crate::tunnel::FrameType;
@@ -66,7 +66,7 @@ pub async fn handle_open_with_rx(
     session_id: u16,
     open_payload: &[u8],
     rx: tokio::sync::mpsc::UnboundedReceiver<crate::tunnel::dispatch::SessionEvent>,
-    conn: Arc<SrtConnection>,
+    conn: Arc<QuicConnection>,
     mux_enc: Arc<MuxEncoder>,
     registry: SessionRegistry,
 ) -> Result<(), String> {
@@ -108,7 +108,7 @@ pub async fn handle_open_with_rx(
 ///
 /// 2026-08-20 新增：服务端会话死亡的唯一讣告出口。
 /// 无论会话因何原因结束（目标 RST/超时/错误），客户端必须得知才能停止发送。
-async fn notify_session_closed(session_id: u16, conn: &Arc<SrtConnection>, mux_enc: &Arc<MuxEncoder>) {
+async fn notify_session_closed(session_id: u16, conn: &Arc<QuicConnection>, mux_enc: &Arc<MuxEncoder>) {
     let frame = mux_enc.encode_frame(FrameType::Close, session_id, 0, &[]);
     if let Err(e) = conn.send(frame) {
         // 隧道本身断开时发不出去（客户端整条隧道都在重建，会话随之清空），忽略
@@ -129,7 +129,7 @@ async fn start_udp_forward(
     session_id: u16,
     _open: &OpenRequest, // 多目标：目标在每帧地址头，忽略 Open 的固定目标
     rx: tokio::sync::mpsc::UnboundedReceiver<crate::tunnel::dispatch::SessionEvent>,
-    conn: Arc<SrtConnection>,
+    conn: Arc<QuicConnection>,
     mux_enc: Arc<MuxEncoder>,
     registry: SessionRegistry,
 ) -> Result<(), String> {
@@ -558,7 +558,7 @@ pub async fn start_tcp_forward(
     session_id: u16,
     open: &OpenRequest,
     rx: tokio::sync::mpsc::UnboundedReceiver<crate::tunnel::dispatch::SessionEvent>,
-    conn: Arc<SrtConnection>,
+    conn: Arc<QuicConnection>,
     mux_enc: Arc<MuxEncoder>,
     registry: SessionRegistry,
 ) -> Result<(), String> {

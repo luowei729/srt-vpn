@@ -22,8 +22,9 @@ mod client;
 mod config;
 mod logging;
 mod metrics;
+mod quic;
 mod server;
-mod srt;
+mod srt_shell;
 mod tunnel;
 
 /// 进程退出码（S6：跨 runtime Drop 传递失败状态）

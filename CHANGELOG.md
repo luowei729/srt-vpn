@@ -2,6 +2,87 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-20 09:55] - 重构 P0 落地：Rust 自研 QUIC 语义内核 + SRT 外壳 + 多设备多用户打通
+
+### 改动前总结
+在 grilling 共识（docs/refactor/REFACTOR_PLAN_v3.md）基础上开始实施：彻底废弃 libsrt，
+Rust 自研"借鉴 RFC 9000 传输机制"的轻量内核 + 手写 SRT 全仿外壳。
+
+### 改动后总结
+1. **新内核 `src/quic/`（自研 QUIC 语义，无 TLS 明文）**：
+   - packet.rs：varint + Stream/Ack/Ping/Pong/Rst/MaxData/Handshake 帧编解码
+   - stream.rs：256 流上限 + 乱序重组 + FIN/RST 语义 + 发送缓冲背压
+   - ack.rs：ACK/丢失恢复/RTO（采样 + 退避）
+   - congctl.rs：BBR 风格拥控（慢启动/带宽探测/单连接共享窗）
+   - connection.rs：客户端 connect（SRT 特征握手认证 + 等 AUTH_OK）+ 服务端 attach，
+     收发线程 + send_loop（拥控预算取块不丢数据）
+   - listener.rs：服务端 QuicListener（握手内建 SRT 特征认证）
+2. **手写 SRT 飞壳 `src/srt_shell/`（流量伪装）**：
+   - header.rs：0x80 控制(HANDSHAKE)/0x80 02(ACK) + 16B 头（SEQ/消息号/TS/ID）
+   - handshake.rs：握手包体（版本 4 等 SRT 特征）
+   - auth.rs：passphrase → 派生密钥 → nonce 签名认证（防主动探测，替代旧双 HMAC）
+   - outer.rs：16B 数据/控制包封装；真 ACK 节奏（ack.rs）待接入
+3. **换芯保壳**：保留 Mux 帧格式 + SessionRegistry/TunnelSession 前端语义不变，
+   底层 conn 从 SrtConnection → QuicConnection（send_msg/事件流兼容）。
+4. **废弃 libsrt**：删 src/srt/（FFI）+ build.rs + [build-dependencies] cc/docs libc；
+   删旧 examples（srt_duplex/srt_probe，libsrt 时代探针）；旧双 HMAC challenge.rs 删除
+   （auth/mod.rs 保留 argon2 SOCKS5 密码哈希）；版本 Cargo 0.2.3 → 0.3.0。
+5. **多设备架构（本条目关键）**：服务端为每客户端建立**独立 UDP 数据端口**（监听 socket
+   只做握手），AUTH_OK 载荷携带分配端口，客户端收到后迁移数据通道
+   （send_target 用迁移端口、recv 只按 IP 过滤避免丢包）。
+   修复：多客户端在共享监听 socket 上 recv 竞争丢数据（首请求偶发失败根因）。
+   解析逻辑即"数据帧无法路由"（会话复用时序）也已修。
+6. **验证**：编译 0 错误（纯 Rust 无 C 依赖）、63 单测通过；回环 TCP 隧道打通
+   （HELLO 回显）；**多设备端到端 2 客户端×4 请求=8/8 全成功**（各 SOCKS5 监听独立端口）。
+
+### 涉及文件（核心）
+- src/quic/（packet/stream/congctl/ack/crypto/connection/listener/mod）
+- src/srt_shell/（header/handshake/auth/ack/outer/mod）
+- src/tunnel/dispatch.rs（TunnelSession conn: 改 QuicConnection + registry.has()）
+- src/client/{mod,pool}.rs（QuicConfig/连接池/握手后迁移）
+- src/server/{mod,listener,forward}.rs（QuicListener + 独立数据端口）
+- src/auth/mod.rs（保留 argon2；删 streamid/challenge 异步）
+- Cargo.toml（0.3.0，去 libc/cc/argon2? 待最终依赖收敛）
+- 删除：src/srt/、build.rs、examples/srt_duplex|probe、src/auth/challenge.rs
+
+### 待接入（P1.x）
+- 载荷实际加解密（crypto.rs 已就绪，send/handle 未接线）
+- 装饰性 SRT ACK 节奏（srt_shell/ack.rs 未接入）
+- 剩余 ~58 个协议接口/常量加了 cannot clean（重构中间态，未接入的高阶功能）
+- 多用户不同账号 passphrase（当前单能力）
+
+## [2026-08-20 07:09] - 架构重构共识 + 设计文档（PX 阶段启动）
+
+### 改动前总结
+libsrt 拥塞控制（FileCC）是单连接级全局单窗口 + 单发送时隙，多线程/多路并发共享同一窗口，
+公网高 RTT 下单连接带宽结构性封顶（对照实验：单连接 89MB/s vs 4 连接并发 151MB/s，+70%）。
+A 方案（单连接+复用层公平调度）编码验证失败（302→36MB/s, await 背压开销），B 方案（POOL=4
+多连接池）达到公网直连链路 ~78%，但多 UDP 流破坏伪装且窗口=带宽×RTT 仍受限，无法根治。
+经多轮 grilling 盘问（20+ 问题），与用户达成重构共识。
+
+### 改动后总结
+1. **重构共识（grilling 盘问收束，用户认可）**：**Rust 全盘自研 + 真 QUIC 语义传输内核 + 手写
+   SRT 全仿外壳**（hy2 思路，壳=SRT 非 HTTP/3）。8 项决策锁定于 PROJECT_PLAN 第五节。
+2. **设计文档**：`docs/refactor/REFACTOR_PLAN_v3.md`——线协议字节草图（外层 SRT 16B 壳 + 内层
+   自研传输帧）、目录结构（新增 src/quic/ + src/srt_shell/，删 src/srt/ + src/auth/ + build.rs）、
+   里程碑任务清单（P0 内核+外壳 / P1 前端重建 / P2 部署+passwall）。
+3. **参考材料落地** `docs/reference/`：RFC 9000/9001/9002 + quiche（Cloudflare 实现）+ hysteria
+   （hy2 协议源码 PROTOCOL.md），随时查阅。
+4. **关键架构判断**：标准 QUIC 库（quiche/msquic）绑死 TLS1.3 Initial 明文（首包 0xC0+ClientHello），
+   DPI 一眼看穿不是 SRT -> 必须自研"借鉴 RFC9000 传输机制"的轻量内核，首包按 SRT 0x80 写、无 TLS。
+5. 认证改为**学习 SRT 特征处理**（拟真 libsrt 握手加密特征，防主动探测），不保留现有双 HMAC。
+
+### 涉及文件
+- docs/refactor/REFACTOR_PLAN_v3.md（新设计文档）
+- docs/reference/（RFC9000/9001/9002 + quiche/ + hysteria/）
+- PROJECT_PLAN.md（新增 PX 阶段 + 重构共识决策表）
+- AGENTS.md（新增 07:09 重构共识开发提示）
+- CHANGELOG.md（本条）
+
+### 下一阶段（P0）
+自研 quic/ 传输内核（varint/帧/多流/ACK/丢包/B BR 拥控）+ srt_shell/ 外壳（0x80 握手 + 16B 头 + ACK 节奏），
+废弃 libsrt/build.rs/auth，回环吞吐验收对比 49/61 MB/s 基线。
+
 ## [2026-08-20 06:13] - B 方案（多 SRT 连接池）实现 + 公网验证中
 
 ### 改动前总结

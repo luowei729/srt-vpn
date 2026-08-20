@@ -2,6 +2,10 @@
 
 基于 **SRT 直播流协议** 的 VPN 隧道（伪装为 SRT 直播流量，原生加密 + 多路复用）。
 
+> ⚠️ **重构中（PX，2026-08-20）**：传输内核正从 libsrt 重构为 Rust 自研 QUIC 语义内核 + 手写
+> SRT 全仿外壳（详见 `docs/refactor/REFACTOR_PLAN_v3.md` 与 PROJECT_PLAN 第五节）。本文档为
+> 当前可用版本（v0.2.x，libsrt 时代）的使用说明，重构落地后同步更新。
+
 - **服务端**：监听 SRT UDP 端口，认证后为多个客户端提供直连转发出口
 - **客户端**：SOCKS5 + HTTP + HTTPS 三合一代理入口，经加密隧道到服务器
 - **UDP 代理**：SOCKS5 UDP ASSOCIATE 多目标 + 大包分片重组（支持至 65507B）

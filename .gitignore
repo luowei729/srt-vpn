@@ -15,3 +15,9 @@
 *.swp
 *.swo
 .DS_Store
+
+# ===== 参考源码（大体积，不提交；详见 docs/README）=====
+# quiche/hysteria 源码克隆（供查阅，非本项目代码）
+docs/reference/quiche/
+docs/reference/hysteria/
+

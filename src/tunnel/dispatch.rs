@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::srt::connection::SrtConnection;
+use crate::quic::connection::QuicConnection;
 use crate::tunnel::multiplex::{Frame, MuxEncoder, FRAME_DATA_MAX};
 use crate::tunnel::MAX_SESSIONS;
 use crate::tunnel::FrameType;
@@ -126,6 +126,12 @@ impl SessionRegistry {
         Some(rx)
     }
 
+    /// 会话 ID 是否已占用（接收循环/转发任务检查用）
+    /// 2026-08-20 重构：服务端 Open 处理时判断同 ID 复用（客户端 Close→新 Open 相邻）
+    pub fn has(&self, session_id: u16) -> bool {
+        self.sessions.lock().unwrap().contains_key(&session_id)
+    }
+
     /// 路由数据到指定会话（隧道接收循环调用）
     /// 返回是否路由成功（会话存在）
     pub fn route(&self, session_id: u16, event: SessionEvent) -> bool {
@@ -178,8 +184,8 @@ pub struct TunnelSession {
     pub session_id: u16,
     /// 接收通道（隧道 → 本会话）
     rx: mpsc::UnboundedReceiver<SessionEvent>,
-    /// SRT 连接（发送用）
-    conn: Arc<SrtConnection>,
+    /// QUIC 连接（发送用，2026-08-20 重构：替代 SrtConnection）
+    conn: Arc<QuicConnection>,
     /// 复用编码器
     mux_enc: Arc<MuxEncoder>,
     /// 注册表（用于移除会话）
@@ -190,10 +196,11 @@ impl TunnelSession {
     /// 创建隧道会话（由 SessionRegistry::allocate 后调用）
     ///
     /// 2026-08-19：移除 TS 伪装层，不再需要 ts_enc 参数。
+    /// 2026-08-20 重构：conn 由 SrtConnection 改为 QuicConnection（协议层不变）。
     pub fn new(
         session_id: u16,
         rx: mpsc::UnboundedReceiver<SessionEvent>,
-        conn: Arc<SrtConnection>,
+        conn: Arc<QuicConnection>,
         mux_enc: Arc<MuxEncoder>,
         registry: SessionRegistry,
     ) -> Self {
@@ -303,8 +310,8 @@ impl TunnelSession {
         self.send_control(FrameType::Open, &payload).await
     }
 
-    /// SRT 连接引用（转发循环抽取后供子函数发送用，2026-08-20）
-    pub fn conn_ref(&self) -> Arc<SrtConnection> {
+    /// QUIC 连接引用（转发循环抽取后供子函数发送用，2026-08-20 重构）
+    pub fn conn_ref(&self) -> Arc<QuicConnection> {
         self.conn.clone()
     }
 

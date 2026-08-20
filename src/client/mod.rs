@@ -14,7 +14,8 @@ pub mod socks5;
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::srt::connection::{SrtConfig, SrtConnection};
+use crate::quic::connection::{QuicConfig, QuicConnection};
+use crate::quic::crypto::derive_key;
 use crate::tunnel::multiplex::MuxEncoder;
 
 /// 连接池大小（B 方案，2026-08-20 验证期先固定 4；后续可配置化）
@@ -43,30 +44,20 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
         });
     }
 
-    // 1. 构建 SRT 连接配置（客户端：连接模式 + streamid 令牌）
-    // streamid 设计（决策 Q11）：
-    // - 配置里的 streamid 是"资源名"部分（如 live/srtvpn）
-    // - 必须附加 k= 令牌（HMAC-SHA256(passphrase) 派生），否则服务端认证失败
-    // - 自动保证：无论配置是否带 k=，最终 streamid 都包含有效令牌
-    let streamid = match cfg.streamid.as_deref() {
-        Some(sid) if sid.contains("k=") => sid.to_string(), // 已带令牌，直接用
-        Some(sid) => {
-            // 配置了资源名但没令牌：在基础格式上附加令牌
-            let token = crate::auth::derive_token(&cfg.passphrase);
-            format!("{sid},k={token}")
-        }
-        None => crate::auth::build_streamid(&cfg.passphrase, "live/srtvpn"),
-    };
-    let srt_cfg = SrtConfig {
-        peer_addr,
-        passphrase: cfg.passphrase.clone(),
-        pbkeylen: crate::config::crypto_to_pbkeylen(&cfg.crypto),
-        streamid: Some(streamid),
-        rcv_latency: 1000,
-        reliable: true, // 客户端跟随服务端协商，默认可靠
-        message_api: true,
-        payload_size: 1316, // SRT 官方默认 payload（SRT_LIVE_DEF_PLSIZE=1316）
+    // 1. 构建 QUIC 连接配置（客户端：connect 模式 + SRT 特征认证密钥）
+    //    2026-08-20 重构：libsrt/SrtConfig 弃用，改自研 QUIC 语义内核。
+    //    认证：passphrase → 派生密钥（crypto::derive_key），作为 SRT 特征
+    //    握手的 AUTH 载荷密钥（srt_shell/auth.rs），防主动探测。
+    let secret: [u8; 16] = derive_key(cfg.passphrase.as_bytes(), b"srt-vpn-v3-salt", 16)
+        .try_into()
+        .expect("密钥长度固定 16B");
+    let quic_cfg = QuicConfig {
+        peer: Some(peer_addr),
         is_server: false,
+        bind_addr: None,
+        secret,
+        heartbeat_secs: cfg.heartbeat_secs.max(5),
+        ..Default::default()
     };
 
     // 2. 重连循环：建立连接 → 起 SOCKS5 服务 + 接收循环 + 心跳 → 断开后按配置重试
@@ -88,28 +79,26 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
         .unwrap_or(socks5_cfg.listen.clone());
 
     loop {
-        // 建池：POOL_SIZE 条连接（每条独立 FileCC 拥塞窗口，B 方案核心）
+        // 建池：POOL_SIZE 条连接（每条独立 QUIC 连接 + 独立拥控窗口，B 方案核心）
         let conns_raw = if first_connect {
             // 首次建池：调用 connect_pool_with_retry（内部按 reconnect 配置重试直到成功或达上限）
             first_connect = false;
-            connect_pool_with_retry(&srt_cfg, cfg).await?
+            connect_pool_with_retry(&quic_cfg, cfg).await?
         } else {
             // 断线重连：按 reconnect 配置重试上限
             attempt += 1;
             if max_retries >= 0 && attempt > max_retries as u64 {
-                // 2026-08-20：认证类失败重试耗尽时提示检查系统时间
-                // （软路由时钟快 51s 实测案例：SRT 握手正常但挑战-应答永远失败，
-                //  且 NTP 走隧道时形成死循环，用户无从定位）
+                // 2026-08-20：认证类失败重试耗尽时提示检查配置
                 return Err(format!(
-                    "SRT 连接失败（已达最大重试 {max_retries} 次）。若服务端日志报\"时钟\"，请先校准本机系统时间（NTP）再启动"
+                    "QUIC 连接失败（已达最大重试 {max_retries} 次）。若服务端日志无认证通过记录，请检查 passphrase 是否一致"
                 ));
             }
             tracing::warn!(attempt, interval, "隧道断开，准备重连");
             tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-            match connect_pool_once(&srt_cfg).await {
+            match connect_pool_once(&quic_cfg).await {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::warn!(error = %e, "重连 SRT 失败");
+                    tracing::warn!(error = %e, "重连 QUIC 失败");
                     continue;
                 }
             }
@@ -118,13 +107,14 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
         // S4 修复（2026-08-19）：连接成功进入服务态后清零重连计数。
         // 语义改为"连续失败次数"：成功即清零。
         attempt = 0;
-        tracing::info!(conns = conns_raw.len(), "SRT 连接池建立成功");
+        tracing::info!(conns = conns_raw.len(), "QUIC 连接池建立成功");
 
-        // 每条连接构建 TunnelConn（独立编码器/注册表/FileCC 窗口）
+        // 每条连接构建 TunnelConn（独立编码器/注册表/拥控窗口）
         let mut tconns = Vec::with_capacity(conns_raw.len());
         for c in conns_raw {
+            // QuicConnection::connect 返回 Arc<Self>，直接使用（不再包一层 Arc）
             tconns.push(pool::TunnelConn {
-                conn: Arc::new(c),
+                conn: c,
                 mux_enc: Arc::new(MuxEncoder::new(true)),
                 registry: crate::tunnel::dispatch::SessionRegistry::new(),
             });
@@ -198,48 +188,49 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
     }
 }
 
-/// 建立单次 SRT 连接池（B 方案 2026-08-20：并行建 POOL_SIZE 条连接）
+/// 建立单次 QUIC 连接池（B 方案 2026-08-20：并行建 POOL_SIZE 条连接）
 ///
 /// 并行建连（spawn_blocking 各自独立），全部成功返回 Vec，任一失败返回 Err
 /// （由调用方按 reconnect 配置重试整个池）。
-async fn connect_pool_once(srt_cfg: &SrtConfig) -> Result<Vec<SrtConnection>, String> {
+async fn connect_pool_once(quic_cfg: &QuicConfig) -> Result<Vec<Arc<QuicConnection>>, String> {
     let mut handles = Vec::with_capacity(POOL_SIZE);
     for _ in 0..POOL_SIZE {
-        let cfg = srt_cfg.clone();
-        handles.push(tokio::task::spawn_blocking(move || SrtConnection::connect(&cfg)));
+        let cfg = quic_cfg.clone();
+        handles.push(tokio::task::spawn_blocking(move || {
+            // QuicConnection::connect 内部创建 socket + 收发线程 + 发握手
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(QuicConnection::connect(&cfg))
+        }));
     }
     let mut conns = Vec::with_capacity(POOL_SIZE);
     for h in handles {
         conns.push(
             h.await
                 .map_err(|e| format!("连接任务异常: {e}"))?
-                .map_err(|e| format!("SRT 连接失败: {e}"))?,
+                .map_err(|e| format!("QUIC 连接失败: {e}"))?,
         );
     }
     Ok(conns)
 }
 
-/// 隧道接收循环：SRT 消息 → 复用帧分发
+/// 隧道接收循环：QUIC 事件流 → 复用帧分发
 ///
-/// 职责（P1）：
-/// - 处理 Challenge 帧：生成 RESPONSE（双 HMAC 挑战-应答认证）
-/// - 处理 Heartbeat 帧：回发心跳（保活）
-/// - 处理 Data 帧：路由到对应会话（dispatch_frame）
+/// 职责（2026-08-20 重构版）：
+/// - 从 QuicConnection 事件流读取 RecvEvent（Data/Control）
+/// - Data（主数据流消息）：解析 Mux 帧 → 路由到会话（dispatch_frame）
+/// - Control（握手响应 AUTH_OK）：验证认证结果
+/// - 心跳/装饰 ACK 由内核层处理（srt_shell/ack.rs）
 ///
-/// 性能优化（2026-08-19）：
-/// - 移除 TS 伪装层，SRT 消息直接承载隧道帧
-/// - 改用批量接收（recv_batch_async），一次处理多条消息，
-///   避免逐帧 spawn_blocking 的高频调度开销
+/// 与旧版的差异：不再处理 Challenge/Heartbeat Mux 帧（由内层 QuicConnection
+/// 的握手/心跳语义承担），Data 帧处理保持不变。
 async fn recv_loop(
-    conn: Arc<SrtConnection>,
+    conn: Arc<QuicConnection>,
     mux_enc_local: Arc<MuxEncoder>,
-    passphrase: String,
+    _passphrase: String,
     registry: crate::tunnel::dispatch::SessionRegistry,
     tunnel_closed_tx: tokio::sync::watch::Sender<bool>,
 ) {
-    // 任务退出（隧道断开/异常）时置位断开信号，通知 SOCKS5 serve 停止 accept，
-    // 让重连循环接管（B3 重连缺陷修复）。
-    let result = run_recv_inner(conn, mux_enc_local, passphrase, registry).await;
+    let result = run_recv_inner(conn, mux_enc_local, registry).await;
     tracing::info!("隧道接收循环退出，通知 SOCKS5 服务停止");
     let _ = tunnel_closed_tx.send(true);
     result
@@ -247,195 +238,112 @@ async fn recv_loop(
 
 /// recv_loop 的实际处理体（分离信号通知，便于退出时统一置位）
 async fn run_recv_inner(
-    conn: Arc<SrtConnection>,
+    conn: Arc<QuicConnection>,
     mux_enc_local: Arc<MuxEncoder>,
-    passphrase: String,
     registry: crate::tunnel::dispatch::SessionRegistry,
 ) {
+    // 取事件流（连接创建时已启动收发线程）
+    let mut rx = match conn.take_events() {
+        Some(rx) => rx,
+        None => {
+            tracing::warn!("连接事件流已被消费，接收循环退出");
+            return;
+        }
+    };
     let mut mux_dec = crate::tunnel::multiplex::MuxDecoder::new();
     loop {
-        // 批量接收：一次拿最多 512 条消息（减少 spawn_blocking 调度次数）
-        match conn.recv_batch_async(512).await {
-            Ok(batch) => {
-                for msg in batch {
-                    // SRT 消息 → 复用层帧（无 TS 壳，直接解析帧头）
-                    if let Some(frame) =
-                        crate::tunnel::multiplex::decode_srt_message(&msg.data, &mut mux_dec)
-                    {
-                        // 先用分发器处理 Data/Fin/Close 帧
+        // 从 QUIC 事件流批量读（合并多条以减调度）
+        let mut batch = Vec::new();
+        // 先取一条（阻塞等待）
+        match rx.recv().await {
+            Some(ev) => batch.push(ev),
+            None => {
+                // 通道关闭（连接销毁）
+                tracing::info!("QUIC 事件流关闭，接收循环退出");
+                break;
+            }
+        }
+        // 尽量多取（非阻塞）构成批处理
+        while let Ok(ev) = rx.try_recv() {
+            batch.push(ev);
+        }
+
+        for ev in batch {
+            match ev {
+                crate::quic::connection::RecvEvent::Data { data, .. } => {
+                    // QUIC 主数据流消息 = 一条 Mux 帧字节串，解析并分发
+                    if let Some(frame) = crate::tunnel::multiplex::decode_srt_message(&data, &mut mux_dec) {
+                        // 分发（会话路由 / Fin / Close / Rst / 控制）
                         match crate::tunnel::dispatch::dispatch_frame(&frame, &registry) {
                             crate::tunnel::dispatch::DispatchAction::Routed => {
-                                // 数据已路由到会话
                                 tracing::trace!(session = frame.session_id, len = frame.payload.len(), "数据已路由到会话");
                             }
                             crate::tunnel::dispatch::DispatchAction::UnknownSession(sid) => {
                                 tracing::warn!(session = sid, "数据帧无法路由（会话不存在）");
                             }
                             crate::tunnel::dispatch::DispatchAction::Fin(sid) => {
-                                // 对端 FIN（半关闭）：事件已投递到会话通道，
-                                // 转发任务收到 SessionEvent::Fin 后处理半关闭（shutdown 本地写侧）
                                 tracing::debug!(session = sid, "对端 FIN（半关闭）");
                             }
                             crate::tunnel::dispatch::DispatchAction::Closed(sid) => {
-                                // 对端 Close：事件已投递到会话通道，转发任务清理退出
                                 tracing::debug!(session = sid, "对端关闭会话");
                             }
-                            // 2026-08-20：服务端 Rst（会话已死），事件已投递，
-                            // 转发任务收到 Close 事件立即停止发送并释放会话
                             crate::tunnel::dispatch::DispatchAction::Rst(sid) => {
-                                tracing::info!(session = sid, "服务端 Rst（会话已死），本地立即清理");
+                                tracing::info!(session = sid, "对端 Rst（会话已死），本地立即清理");
                             }
                             crate::tunnel::dispatch::DispatchAction::Open(_sid, _payload) => {
                                 tracing::warn!("客户端收到意外的 Open 帧");
                             }
                             crate::tunnel::dispatch::DispatchAction::Other => {
-                                match frame.ftype {
-                                    crate::tunnel::FrameType::Challenge => {
-                                        handle_challenge(&conn, &mux_enc_local, &frame, &passphrase);
-                                    }
-                                    crate::tunnel::FrameType::Heartbeat => {
-                                        // M8 RTT 测量（2026-08-19）：对端回发的心跳载荷
-                                        // 带的是**本端**此前发出的时间戳（pong 语义），
-                                        // now - ts 即 RTT；若时间戳异常（时钟跳变/非本端
-                                        // 发起），视为对端主动心跳，回发 pong（保留对端
-                                        // 时间戳供对端测 RTT）。
-                                        let ts = crate::tunnel::multiplex::heartbeat_timestamp(&frame.payload);
-                                        let now_ms = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .map(|d| d.as_millis() as i64)
-                                            .unwrap_or(0);
-                                        let mut is_pong = false;
-                                        if let Some(ts) = ts {
-                                            let rtt = now_ms - ts;
-                                            // RTT 合理性过滤：0~60s 内视为 pong（防时钟跳变误报）
-                                            if (0..60_000).contains(&rtt) {
-                                                tracing::debug!(rtt_ms = rtt, "心跳 pong（RTT）");
-                                                let m = crate::metrics::metrics();
-                                                m.last_rtt_ms.store(rtt.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
-                                                is_pong = true;
-                                            }
-                                        }
-                                        if !is_pong {
-                                            // 对端主动心跳：原样回发载荷（pong，保留对端时间戳）
-                                            let pong = mux_enc_local.encode_frame(
-                                                crate::tunnel::FrameType::Heartbeat,
-                                                0,
-                                                0,
-                                                &frame.payload,
-                                            );
-                                            if let Err(e) = conn.send(pong) {
-                                                tracing::warn!(error = %e, "回发心跳失败");
-                                            }
-                                        }
-                                    }
-                                    crate::tunnel::FrameType::Ack => {
-                                        tracing::trace!(session = frame.session_id, "收到 ACK");
-                                    }
-                                    _ => {
-                                        tracing::debug!(ftype = ?frame.ftype, "收到控制帧");
-                                    }
-                                }
+                                let _ = mux_enc_local; // 心跳/ACK 由内核层处理
+                                tracing::debug!(ftype = ?frame.ftype, "收到控制帧（跳过分发）");
                             }
                         }
                     } else {
                         tracing::warn!("收到无效隧道帧");
                     }
                 }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "SRT 连接断开");
-                break;
+                crate::quic::connection::RecvEvent::Fin { stream_id } => {
+                    // 主数据流 FIN（对端关闭整条隧道方向）
+                    tracing::debug!(stream = stream_id, "主数据流 FIN");
+                }
+                crate::quic::connection::RecvEvent::Reset { stream_id } => {
+                    tracing::warn!(stream = stream_id, "主数据流被重置");
+                    break;
+                }
+                crate::quic::connection::RecvEvent::Control(payload) => {
+                    // 握手响应（AUTH_OK/FAIL 等）
+                    tracing::info!(payload_len = payload.len(), "收到连接控制消息（握手响应）");
+                }
             }
         }
     }
     // S3 配套修复（2026-08-19）：隧道断开时清空会话注册表（close_all drop 全部
     // 通道 Sender），让所有本地转发任务 recv_event() 得到 None 自然退出。
-    // 旧实现只退出接收循环，转发任务永久挂在 recv_event 上（任务+会话 ID 泄漏）。
     let closed = registry.close_all();
     if closed > 0 {
         tracing::info!(sessions = closed, "隧道断开，关闭全部本地会话任务");
     }
 }
 
-/// 处理挑战-应答：解析服务器下发的 nonce，生成并发送 RESPONSE
+/// 带重连的 QUIC 连接池（设计决策：5s 心跳 + 客户端自动重连，B 方案 2026-08-20）
 ///
-/// 服务器 CHALLENGE 载荷格式：`nonce=<hex>,ts=<unix秒>`（ts 为 2026-08-20 对时握手新增，
-/// 旧服务端无 ts 字段）
-/// 客户端 RESPONSE 载荷格式：`timestamp=<unix秒>,resp=<hex hmac>`
-///
-/// 2026-08-20 对时握手：优先用**服务端下发的 ts** 计算 HMAC（本地时钟任意漂移
-/// 都不影响认证）；旧服务端（无 ts）回退本地时间戳（90s 窗口兜底）。
-fn handle_challenge(
-    conn: &SrtConnection,
-    mux_enc: &MuxEncoder,
-    frame: &crate::tunnel::multiplex::Frame,
-    passphrase: &str,
-) {
-    // 1. 解析载荷字段（nonce 必有；ts 为新服务端可选字段）
-    let payload_str = String::from_utf8_lossy(&frame.payload);
-    let mut nonce: Option<String> = None;
-    let mut server_ts: Option<i64> = None;
-    for part in payload_str.split(',') {
-        if let Some(v) = part.strip_prefix("nonce=") {
-            if !v.is_empty() {
-                nonce = Some(v.to_string());
-            }
-        } else if let Some(v) = part.strip_prefix("ts=") {
-            server_ts = v.parse().ok();
-        }
-    }
-    let nonce = match nonce {
-        Some(n) => n,
-        None => {
-            tracing::warn!(payload = %payload_str, "CHALLENGE 载荷格式无效");
-            return;
-        }
-    };
-
-    // 2. 生成应答：时间戳来源优先级 = 服务端 ts（对时握手）> 本地时间（旧服务端兼容）
-    //    用服务端 ts 时本地时钟完全无关紧要（根治软路由时钟漂移 51s 类故障）
-    let (timestamp, clock_src) = match server_ts {
-        Some(ts) => (ts, "server"),
-        None => (crate::auth::challenge::current_timestamp(), "local"),
-    };
-    let resp = crate::auth::challenge::compute_response(passphrase, &nonce, timestamp);
-
-    // 3. 构造 RESPONSE 帧并直接发送（无 TS 壳，直接作为 SRT 消息）
-    let resp_payload = format!("timestamp={timestamp},resp={resp}");
-    let frame = mux_enc.encode_frame(
-        crate::tunnel::FrameType::Response,
-        0,
-        0,
-        resp_payload.as_bytes(),
-    );
-    if let Err(e) = conn.send(frame) {
-        tracing::warn!(error = %e, "发送 RESPONSE 失败");
-    } else {
-        tracing::info!(clock_src = clock_src, "挑战-应答 RESPONSE 已发送");
-    }
-}
-
-/// 带重连的 SRT 连接池（设计决策：5s 心跳 + 客户端自动重连，B 方案 2026-08-20）
-///
-/// 2026-08-19 审查修复（B3）：
-/// - SRT 连接建立是同步阻塞（内部 epoll 等待最多 5s + 200ms 就绪 sleep），
-///   改走 spawn_blocking（connect_pool_once），避免阻塞 tokio worker 线程。
-async fn connect_pool_with_retry(cfg: &SrtConfig, app_cfg: &Config) -> Result<Vec<SrtConnection>, String> {
+/// 重连语义与旧版一致（B3）：首次建池 + 断线重建整个池。
+async fn connect_pool_with_retry(cfg: &QuicConfig, app_cfg: &Config) -> Result<Vec<Arc<QuicConnection>>, String> {
     let interval = app_cfg.reconnect.as_ref().map(|r| r.interval_secs).unwrap_or(5);
     let max_retries = app_cfg.reconnect.as_ref().map(|r| r.max_retries).unwrap_or(10);
     let mut attempt = 0u64;
     loop {
         match connect_pool_once(cfg).await {
             Ok(conns) => {
-                tracing::info!(attempt, conns = conns.len(), "SRT 连接池建立成功");
+                tracing::info!(attempt, conns = conns.len(), "QUIC 连接池建立成功");
                 return Ok(conns);
             }
             Err(e) => {
                 attempt += 1;
                 if max_retries >= 0 && attempt > max_retries as u64 {
-                    return Err(format!("SRT 连接失败（已达最大重试 {max_retries} 次）: {e}"));
+                    return Err(format!("QUIC 连接失败（已达最大重试 {max_retries} 次）: {e}"));
                 }
-                tracing::warn!(attempt, interval, error = %e, "SRT 连接失败，准备重连");
+                tracing::warn!(attempt, interval, error = %e, "QUIC 连接失败，准备重连");
                 tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
             }
         }

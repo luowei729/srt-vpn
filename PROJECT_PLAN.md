@@ -262,7 +262,34 @@ srt-vpn/
 > - **SOCKS5 认证强制**：配置了认证时只接受 0x02 方法（has_auth 判定），修复认证可绕过漏洞
 > - passwall 侧接入：组件更新（com.lua）+ 节点类型（7_srt-vpn.lua）+ app.sh srtvpn 分支 + util_srt-vpn.lua，见 openwrt-passwall-srt-vpn 仓库
 
-### P2（规划）：TUN 模式 + iptables NAT + 动态 PID + 黑名单
+### PX（重构，2026-08-20 启动）：Rust 自研 QUIC 语义内核 + 手写 SRT 全仿外壳
+
+> 触发：libsrt 拥塞控制是单连接级单窗口（FileCC/LiveCC），多线程并发共享窗口，公网高 RTT 下单连接带宽结构性封顶，多轮无法根治。
+> 决策经 grilling 盘问达成（详细设计见 docs/refactor/REFACTOR_PLAN_v3.md），用户已认可。
+
+- [x] 盘问收敛共识（8 项决策锁定，见下节）
+- [x] 设计文档产出（REFACTOR_PLAN_v3.md：协议字节草图 + 目录 + 里程碑）
+- [x] **P0 内核+外壳（2026-08-20 09:55 完成）**：自研 quic/（varint/帧/多流/ACK/丢包/BBR）+ srt_shell/（0x80 握手 + 16B 头 + auth）；废弃 libsrt/build.rs；回环 + 多设备端到端验证通过
+- [x] **P1 前端重建（部分完成）**：socks5/HTTP/UDP 重接新内核 + tunnel 保壳 + 多设备独立数据端口；UDP 待重验重、payload 加密待接线
+- [ ] **P1.5 完善**：载荷加解密接线 + 装饰 ACK 节奏 + 乒乓心跳 RTT + 多用户账号
+- [ ] **P2 部署与 passwall**：passwall 适配新核心 + Docker/CI + 公网多线程 + SRT 特征抓包验证
+
+### 重构共识决策表（grilling 收束，2026-08-20）
+
+| # | 决策点 | 结论 |
+|---|--------|------|
+| A | 核心形态 | Rust 全盘自研，不依赖 libsrt / quiche / msquic |
+| B | 传输内核 | 真 QUIC 语义（帧/多流/丢包补发/拥塞控制），**首包按 SRT 0x80、无 TLS 明文** |
+| C | 外壳 | 手写 SRT 壳：0x80 握手 + 16B 头（SEQ/消息号/时间戳/ID）+ ACK 节奏 |
+| D | libsrt | 彻底废弃（移除 build.rs/FFI/C 依赖） |
+| E | 认证 | 学习 SRT 特征处理（拟真 libsrt 握手加密特征），**不保留现有双 HMAC** |
+| F | 流控 | 单连接共享拥塞窗口（学 QUIC 流控即跑满带宽） |
+| G | 前端 | socks5/HTTP/UDP 代理功能一致，复用现有分层接口 |
+| H | passwall | 重构后按新核心再适配（不锁定旧套壳） |
+
+### P2（规划：重构后更新）：TUN 模式 + iptables NAT + 动态 PID + 黑名单
+
+> P2 原规划基于 libsrt 时代，待 PX 重构落地后按新内核重新评估 TUN/NAT/动态 PID 可行性。
 
 ### P3（规划）：性能 → 拟真 → 安全 → 跨平台打磨
 

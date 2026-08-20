@@ -1,10 +1,9 @@
 [package]
 name = "srt-vpn"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
-description = "基于 SRT 直播流协议的 VPN 隧道（伪装为 MPEG-TS 直播流）"
+description = "SRT 外壳 + 自研 QUIC 语义传输 VPN（2026-08-20 重构）"
 license = "MIT"
-build = "build.rs"
 
 [dependencies]
 # CLI 参数解析（-c / -m / -v / -h + SOCKS5 完整参数）
@@ -24,12 +23,6 @@ rand = "0.8"
 # 日志（JSON 结构化日志）
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-# libc（sockaddr 等系统类型，SRT FFI 依赖）
-libc = "0.2"
 # 十六进制编码（令牌/校验）
 hex = "0.4"
-# 2026-08-19 L 级清理：移除 chrono/byteorder（全项目零引用：
-# 时间戳用 SystemTime，字节序用 to_be_bytes/from_be_bytes），减少编译依赖
-
-[build-dependencies]
-cc = "1"
+# 2026-08-20 重构：移除 libc（libsrt FFI 依赖）/ cc（C 编译器）/ build.rs（libsrt 编译脚本）

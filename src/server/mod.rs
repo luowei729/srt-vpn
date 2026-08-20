@@ -10,28 +10,19 @@ pub mod forward;
 pub mod listener;
 
 use crate::config::Config;
-use crate::srt::connection::SrtConfig;
+use crate::quic::crypto::derive_key;
 
 /// 服务器运行入口
 pub async fn run(cfg: &Config) -> Result<(), String> {
     let listen = cfg.listen.clone().ok_or("服务端配置缺少 listen 字段")?;
     let peer_addr = parse_listen_addr(&listen)?;
 
-    // 构建监听配置（服务端：listen 模式 + 不设 streamid）
-    let srt_cfg = SrtConfig {
-        peer_addr,
-        passphrase: cfg.passphrase.clone(),
-        pbkeylen: crate::config::crypto_to_pbkeylen(&cfg.crypto),
-        streamid: None,
-        rcv_latency: 1000,
-        reliable: match cfg.udp_mode {
-            crate::cli::UdpMode::Reliable => true,
-            crate::cli::UdpMode::BestEffort => false,
-        },
-        message_api: true,
-        payload_size: 1316, // SRT 官方默认 payload
-        is_server: true,
-    };
+    // 认证密钥：passphrase → 派生密钥（与客户端一致，作为 SRT 特征握手 AUTH 密钥）
+    // 2026-08-20 重构：libsrt/SrtConfig 弃用；认证在 QuicListener 握手内完成。
+    let secret: [u8; 16] = derive_key(cfg.passphrase.as_bytes(), b"srt-vpn-v3-salt", 16)
+        .try_into()
+        .expect("密钥长度固定 16B");
+    let heartbeat_secs = cfg.heartbeat_secs.max(5);
 
     tracing::info!(listen = %listen, udp_mode = ?cfg.udp_mode, "服务端启动，等待客户端连接...");
 
@@ -46,8 +37,8 @@ pub async fn run(cfg: &Config) -> Result<(), String> {
         });
     }
 
-    // 多客户端监听循环：每客户端一个 accept + 独立处理任务
-    listener::accept_loop(&srt_cfg, cfg).await
+    // 多客户端监听循环：QuicListener 内建 SRT 特征握手认证，accept 后独立处理任务
+    listener::accept_loop(peer_addr, secret, heartbeat_secs, cfg).await
 }
 
 /// 解析监听地址（host:port）

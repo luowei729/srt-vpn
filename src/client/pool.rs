@@ -16,7 +16,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::srt::connection::SrtConnection;
+use crate::quic::connection::QuicConnection;
 use crate::tunnel::dispatch::{SessionEvent, SessionRegistry};
 use crate::tunnel::multiplex::MuxEncoder;
 
@@ -27,8 +27,8 @@ use crate::tunnel::multiplex::MuxEncoder;
 /// 独立的 MuxEncoder（帧序号独立）。
 #[derive(Clone)]
 pub struct TunnelConn {
-    /// SRT 连接
-    pub conn: Arc<SrtConnection>,
+    /// QUIC 连接（2026-08-20 重构：替代 SrtConnection）
+    pub conn: Arc<QuicConnection>,
     /// 复用层编码器
     pub mux_enc: Arc<MuxEncoder>,
     /// 会话注册表（本连接内独立）
