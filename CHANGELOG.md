@@ -2,6 +2,48 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-20 20:30] - 稳定性加固（断连/CUBIC/连接池/丢包恢复）
+
+### 改动前总结
+软路由 passwall 隧道频繁断连不稳定、CPU 异常、上传多线程 speedtest 失败、
+服务端显示 34 连接数。深度审查发现 4 类核心缺陷：
+1. **断线误判**：`handle_datagram` 只对数据壳包刷新 `last_recv_at`，纯 ACK
+   场景下 15s 无 DATA 即误判断线（实际连接正常，只是空闲或 ACK 风暴）
+2. **CUBIC 丢包不回退**：`on_ack_frame` 检测到丢包只重传不调
+   `on_congestion_event`，cwnd 永不收缩 → 重传风暴后仍按原窗口猛发
+3. **loss_time 定时器未接入**：`send_loop` 只查 RTO（1s），快恢复 loss_time
+   定时器（≈srtt×9/8）从未触发，丢包恢复延迟 1s
+4. **连接池死连接泄漏**：`allocate` 轮询不跳过 `is_closed()` 的连接，断线后
+   新会话分配到死连接上数据永远发不出（上传 0 根因）；服务端 `cleanup_stale`
+   `try_lock` 失败直接丢弃，收发高峰僵尸连接堆积
+
+### 改动后总结
+- **`src/quic/connection.rs`**：
+  - **P0-1 保活**：`handle_datagram` 任何合法包（含 ACK/Handshake）都刷新
+    `last_recv_at`，避免纯 ACK 场景误判断线
+  - **P0-2 CUBIC 回退**：`on_ack_frame` 丢包时立即 `on_congestion_event(×0.7)`
+  - **P0-3 快恢复**：`send_loop` 同时检查 RTO(50ms) 与 loss_time，loss_time
+    到点立即触发兜底重传（不等 1s RTO）
+- **`src/quic/ack.rs`**：新增 `largest_acked_snapshot()` / `pop_lost_by_loss_time()`
+  供 send_loop loss_time 路径调用
+- **`src/client/pool.rs`**：`allocate` 轮询重试跳过 `is_closed()` 的连接与会话满
+  连接，断线后新会话不再进死连接
+- **`src/quic/listener.rs`**：`cleanup_stale` 每次最多清 32 条防锁长持有
+- **`src/server/listener.rs`**：accept 循环改为无预占 + 100ms 空载 sleep
+  （消除 34 假满与 CPU 空转 8%）
+
+### 验证
+- `cargo test` 81/81 通过
+- `cargo build --release` 零错误（3 warnings：已标注 `#[allow(dead_code)]` 的
+  P1.5 待接入接口）
+
+### 涉及文件
+- `src/quic/connection.rs`（handle_datagram/on_ack_frame/send_loop）
+- `src/quic/ack.rs`（pop_lost_by_loss_time/largest_acked_snapshot）
+- `src/client/pool.rs`（allocate 跳过死连接）
+- `src/quic/listener.rs`（cleanup_stale 限 32 条）
+- `src/server/listener.rs`（accept 循环重构）
+
 ## [2026-08-20 19:10] - 单端口+单接收线程分发模型（NAT 兼容+连接池修复）
 
 ### 改动前总结

@@ -301,11 +301,20 @@ impl QuicConnection {
         let Some((pkt_num, frame)) = self.decode_wire(data) else {
             return; // 非法包（<16B / 未知控制类型 / 解密失败）静默丢弃
         };
-        // 数据壳包统一记账（控制壳包号无意义跳过）
-        if !matches!(frame, WireFrame::Ack(..) | WireFrame::Handshake(..)) {
+        // 包号记账 + 保活刷新：任何合法包（含 ACK）都算活跃，防“ACK 风暴但无 DATA”
+        // 导致 last_recv_at 不刷新而 3× 心跳超时误判断线（P0-1）
+        let is_ack = matches!(frame, WireFrame::Ack(..));
+        let is_handshake = matches!(frame, WireFrame::Handshake(..));
+        if !is_ack && !is_handshake {
             let mut st = self.state.lock().unwrap();
             st.recv.on_recv(pkt_num);
             st.last_recv_at = Instant::now();
+        } else {
+            // ACK/Handshake 虽不占接收窗口，仍刷新保活
+            self.state.lock().unwrap().last_recv_at = Instant::now();
+            if is_ack {
+                // ACK 本身不进 RecvTracker，避免污染丢包证据
+            }
         }
         match frame {
             WireFrame::Data(inner) => self.on_stream_frame(pkt_num, &inner),
@@ -402,21 +411,26 @@ impl QuicConnection {
     /// 收到 ACK 后通知 send_loop 继续发（释放了 cwnd 预算），
     /// 替代旧的"等下次轮询"延迟。
     fn on_ack_frame(&self, largest: u64, _delay: u32, ranges: &[(u64, u64)]) {
-        // 快速重传（锁内新包号记账，锁外加密发送）
+        // 快速重传 + CUBIC 拥控（锁内决策，锁外发送）
         let retrans: Vec<(u64, Vec<u8>)> = {
             let mut st = self.state.lock().unwrap();
-            // 先取 ACK 前的 inflight（quic-go prior_in_flight 是 ACK 前的值，
-            // ACK 处理后会清空 sent map 导致 inflight=0 -> is_cwnd_limited
-            // 永远 false -> cwnd 永不增长的根因）
             let prior_inflight = st.tracker.in_flight_bytes() as u64;
             let (confirmed, lost) = st.tracker.on_ack(largest, ranges, None);
+            let srtt = st.tracker.srtt();
+            // P0-2 修复：丢包必须触发 CUBIC 回退（×0.7），否则 cwnd 永不收缩、
+            // 重传风暴后仍按原窗口猛发，公网丢包场景下误判加剧。
+            // quic-go: OnCongestionEvent(packet_number, lost_bytes, prior_in_flight)
+            if !lost.is_empty() {
+                let lost_bytes: u64 = lost.iter().map(|f| f.len() as u64).sum();
+                // 用最大丢包包号作为 congestion event 锚点
+                st.cong.on_congestion_event(largest, lost_bytes, prior_inflight);
+                tracing::debug!(lost_pkts = lost.len(), lost_bytes, cwnd = st.cong.cwnd_bytes(), "CUBIC 丢包回退");
+            }
             if confirmed > 0 {
-                // CUBIC OnPacketAcked（quic-go 同款：prior_in_flight + acked_bytes
-                // + event_time + latest_rtt + min_rtt）
-                let srtt = st.tracker.srtt();
-                let min_rtt = srtt; // 简化：min_rtt 用 srtt 近似
+                let min_rtt = srtt;
                 st.cong.on_packet_acked(largest, confirmed as u64 * crate::quic::ack::MSS as u64, prior_inflight, Instant::now(), srtt, min_rtt);
             }
+            // 为丢包重传分配新包号
             lost.into_iter()
                 .map(|frame| {
                     let pkt_num = self.next_pkt_num.fetch_add(1, Ordering::Relaxed);
@@ -428,7 +442,6 @@ impl QuicConnection {
         for (pkt_num, frame) in retrans {
             self.send_frame_encrypted(&frame, pkt_num);
         }
-        // 事件驱动：ACK 释放了 cwnd 预算，唤醒发送线程继续发
         self.notify_send();
     }
 
@@ -523,7 +536,10 @@ impl QuicConnection {
                 let mut out: Vec<(u64, Vec<u8>, bool)> = Vec::new();
 
                 // pacer 等待判定（quic-go SendPacingLimited）：
-                // cwnd 够但 pacer 预算不足 -> 此轮不取数据
+                // cwnd 够但 pacer 预算不足 -> 此轮不取数据。
+                // B7 修复②：send_loop 中每轮用最新 srtt 更新带宽估计，
+                // 否则首轮后 pacer bandwidth 仍为 0，budget 恒为 maxBurst，
+                // 但 rate=0 导致 time_until_send 永远 Some，发送被长期限流。
                 let srtt = st.tracker.srtt();
                 let pacer_wait = st.cong.time_until_send(now, srtt);
 
@@ -569,20 +585,47 @@ impl QuicConnection {
                     }
                 }
 
-                // 2. RTO 重传（每 ~50ms 检查）
+                // 2. RTO + loss_time 定时重传（P0-3 修复）
+                // 学 quic-go sentPacketHandler：loss_time 早于 RTO，是快重传兜底；
+                // 到点未收 gap 也判丢。之前只查 RTO（1s），快丢恢复延迟 1s。
+                let mut retrans_frames: Vec<Vec<u8>> = Vec::new();
+                let mut need_rto_notify = false;
                 if last_rto_check.elapsed() >= Duration::from_millis(50) {
                     last_rto_check = now;
                     let expired = st.tracker.find_expired();
                     if !expired.is_empty() {
-                        // CUBIC on_retransmission_timeout（quic-go 同款）
-                        st.cong.on_retransmission_timeout(true);
-                        let srtt2 = st.tracker.srtt();
-                        for frame in expired {
-                            let pkt_num = self.next_pkt_num.fetch_add(1, Ordering::Relaxed);
-                            st.tracker.on_send(pkt_num, frame.clone(), true);
-                            st.cong.on_packet_sent(now, pkt_num, frame.len() + 32, true, srtt2);
-                            out.push((pkt_num, frame, true));
+                        need_rto_notify = true;
+                        retrans_frames.extend(expired);
+                    }
+                    // 同时检查 loss_time（RTO 周期内顺带）
+                    let lt_lost = st.tracker.pop_lost_by_loss_time(now);
+                    if !lt_lost.is_empty() {
+                        retrans_frames.extend(lt_lost);
+                    }
+                } else if let Some(lt) = st.tracker.get_loss_detection_timeout() {
+                    if now >= lt {
+                        let lt_lost = st.tracker.pop_lost_by_loss_time(now);
+                        if !lt_lost.is_empty() {
+                            retrans_frames.extend(lt_lost);
                         }
+                    }
+                }
+                if !retrans_frames.is_empty() {
+                    if need_rto_notify {
+                        st.cong.on_retransmission_timeout(true);
+                    } else {
+                        // loss_time 丢包走 congestion_event（与 ACK 路径一致，快重传回退）
+                        let lost_bytes: u64 = retrans_frames.iter().map(|f| f.len() as u64).sum();
+                        let la = st.tracker.largest_acked_snapshot();
+                        let infl = st.tracker.in_flight_bytes() as u64;
+                        st.cong.on_congestion_event(la, lost_bytes, infl);
+                    }
+                    let srtt2 = st.tracker.srtt();
+                    for frame in retrans_frames.drain(..) {
+                        let pkt_num = self.next_pkt_num.fetch_add(1, Ordering::Relaxed);
+                        st.tracker.on_send(pkt_num, frame.clone(), true);
+                        st.cong.on_packet_sent(now, pkt_num, frame.len() + 32, true, srtt2);
+                        out.push((pkt_num, frame, true));
                     }
                 }
 

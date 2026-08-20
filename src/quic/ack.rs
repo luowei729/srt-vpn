@@ -86,8 +86,12 @@ impl SendTracker {
             sent: BTreeMap::new(),
             largest_acked: 0,
             bytes_acked: 0,
-            srtt: Duration::from_millis(10),
-            rttvar: Duration::from_millis(5),
+            // B7 修复：初始 srtt 用公网真实 RTT 60ms 附近（而非 10ms），
+            // 避免 loss_delay=srtt×9/8 初始仅 11ms（公网需 ~67ms），
+            // 导致所有在途包在首轮 ACK 后立即被 time-threshold 误判丢包，
+            // CUBIC 连续回退×0.7，cwnd 拉到 min 并重传风暴，上传直接卡死。
+            srtt: Duration::from_millis(60),
+            rttvar: Duration::from_millis(30),
             rto: INITIAL_RTO,
             rto_backoff: 0,
             loss_time: None,
@@ -251,6 +255,11 @@ impl SendTracker {
         }
     }
 
+    /// 快照：最大已确认包号（给拥控回退用）
+    pub fn largest_acked_snapshot(&self) -> u64 {
+        self.largest_acked
+    }
+
     /// 丢包检测定时器超时时刻（quic-go GetLossDetectionTimeout）
     ///
     /// send_loop 调：若 now >= loss_time 则触发一次兜底重传
@@ -258,6 +267,29 @@ impl SendTracker {
     #[allow(dead_code)]
     pub fn get_loss_detection_timeout(&self) -> Option<Instant> {
         self.loss_time
+    }
+
+    /// loss_time 到点时的兜底丢包提取（P0-3 配套）
+    ///
+    /// quic-go detectLostPackets 的定时器路径：当 lossTime 到点且无新 ACK
+    /// 到达时，时间阈值已满足的包应立即判丢重传，否则靠 RTO 1s 才重传。
+    pub fn pop_lost_by_loss_time(&mut self, now: Instant) -> Vec<Vec<u8>> {
+        let Some(lt) = self.loss_time else { return Vec::new(); };
+        if now < lt {
+            return Vec::new();
+        }
+        let mut lost: Vec<Vec<u8>> = Vec::new();
+        let nums: Vec<u64> = self.sent.range(..self.largest_acked)
+            .filter(|(&n, p)| p.is_data && !p.acked && self.is_packet_time_lost(p.sent_time, now))
+            .map(|(&n, _)| n)
+            .collect();
+        for n in nums {
+            if let Some(pkt) = self.sent.remove(&n) {
+                lost.push(pkt.frame);
+            }
+        }
+        self.update_loss_time(now);
+        lost
     }
 
     /// 未确认数据包数（窗口占用指标）

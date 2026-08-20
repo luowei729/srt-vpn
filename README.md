@@ -1,7 +1,7 @@
 # SRT-VPN
 
 基于 **SRT 直播流协议** 的 VPN 隧道：**Rust 自研 QUIC 语义传输内核 + 手写 SRT 全仿外壳**
-（2026-08-20 重构落地，v0.3.0）。
+（2026-08-20 重构落地，v0.3.2，稳定性加固版）。
 
 > 架构说明（详见 `docs/refactor/REFACTOR_PLAN_v3.md` 与 PROJECT_PLAN 第五节）：
 > 传输层为纯 Rust 自研"借鉴 RFC 9000 传输机制"的内核（多流/ACK/丢包补发/BBR 拥控），

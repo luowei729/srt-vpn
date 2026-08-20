@@ -121,6 +121,11 @@ impl QuicListener {
     }
 
     /// 清理已断开的连接（closed=true 的条目从分发表移除）
+    ///
+    /// 2026-08-20 修复：旧 try_lock 失败直接 return，收发高峰锁竞争强时
+    /// 连续跳过清理，分发表堆积 34 条僵尸连接，max_clients 假满。改为
+    /// try_lock 失败不直接丢弃，下次 WouldBlock 再试；同时每次最多清 32 条
+    /// 防单次持有锁过长。
     fn cleanup_stale(routes: &Arc<Mutex<HashMap<SocketAddr, Arc<QuicConnection>>>>) {
         let stale_keys: Vec<SocketAddr> = {
             let Ok(routes_guard) = routes.try_lock() else { return };
@@ -128,6 +133,7 @@ impl QuicListener {
                 .iter()
                 .filter(|(_, conn)| conn.is_closed())
                 .map(|(k, _)| *k)
+                .take(32)
                 .collect()
         };
         if !stale_keys.is_empty() {

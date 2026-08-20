@@ -44,43 +44,28 @@ pub async fn accept_loop(
     tracing::info!(listen = %listen_addr, "监听已建立（单接收线程分发模式），等待客户端...");
 
     loop {
-        // 名额控制：max_clients 内才 accept（原子计数快照）
+        // 名额控制：以 client_count 为准（与分发表 routes 的 15s 超时解耦，
+        // 避免僵尸连接占满 max_clients 导致新客户端 8s 认证超时）。
+        // 过去 34 连接卡死就是因为 routes 15s 才清理，而 client_count 同步泄漏。
         let cur = client_count.load(std::sync::atomic::Ordering::Relaxed);
         if cur >= app_cfg.max_clients {
             tracing::warn!(max = app_cfg.max_clients, active = cur, "已达最大客户端数，暂停接受新连接");
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
         }
-        // 名额预占（accept 期间占位，防并发超卖）
-        client_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // accept：QuicListener::accept 非阻塞扫描握手；未到包返回 None，
-        // 先复制要用的数据（避免借用逃逸到闭包/任务）
-        let l_c = listener.clone();
-        let max_guard = app_cfg.max_clients + 8;
-        let conn_opt = tokio::task::spawn_blocking(move || {
-            // 非阻塞 accept：轮询少量次数（每次 50ms，至多 ~1s）避免忙等
-            for _ in 0..20 {
-                match l_c.accept(max_guard) {
-                    Ok(Some(c)) => return Some(c),
-                    Ok(None) => {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        continue;
-                    }
-                    Err(_e) => return None,
-                }
-            }
-            None
-        })
-        .await
-        .unwrap_or(None);
-
+        // accept：非阻塞取新连接（由接收线程握手后推送到 channel）。
+        // 不再做“预占+轮询 1s”模型——过去该模型 + spawn_blocking 20×50ms 空转
+        // 是软路由 CPU 空转 8% 的间接帮凶，且预占/释放与 routes 清理不同步导致计数漂移。
+        // 新模型：有连接立即取，无连接 sleep 100ms 再试（降低空载 CPU）。
+        let conn_opt = listener.accept(app_cfg.max_clients + 8).unwrap_or(None);
         if conn_opt.is_none() {
-            // accept 无新客户端（超时）：释放名额继续
-            client_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             continue;
         }
         let conn = conn_opt.unwrap();
+        // 成功取到连接后再占名额（避免空轮询时反复 fetch_add/fetch_sub）
+        client_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // accept 到连接：spawn 处理任务（名额已预占，任务结束释放）
         let cfg_c = app_cfg.clone();

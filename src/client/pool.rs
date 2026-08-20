@@ -63,18 +63,23 @@ impl TunnelPool {
 
     /// 轮询分配一个会话，返回 (选中的连接, 会话 ID, 接收通道)
     ///
-    /// 在选中连接的 registry 上 allocate（会话 ID 仅在该连接内有效）。
-    /// 返回完整的 TunnelConn（含正确的 conn/mux_enc/registry，调用方据此
-    /// 构造 TunnelSession，Drop 时能 remove 到正确连接的注册表）。
-    /// 返回 None 表示选中连接的会话数已满（255 上限，极罕见）。
+    /// 2026-08-20 P0 修复：跳过已断开的连接（closed=true），否则会话分配到
+    /// 死连接上数据永远发不出去，表现为“上传 0 字节 / 多线程卡死”。
     pub fn allocate(
         &self,
     ) -> Option<(TunnelConn, u16, tokio::sync::mpsc::UnboundedReceiver<SessionEvent>)> {
-        // 轮询：原子递增取模，均匀分散
-        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.conns.len();
-        let c = &self.conns[idx];
-        let (sid, rx) = c.registry.allocate()?;
-        Some((c.clone(), sid, rx))
+        for _ in 0..self.conns.len() {
+            let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.conns.len();
+            let c = &self.conns[idx];
+            if c.conn.is_closed() {
+                continue; // 跳过已断开连接
+            }
+            if let Some((sid, rx)) = c.registry.allocate() {
+                return Some((c.clone(), sid, rx));
+            }
+            // 该连接会话满，试下一个
+        }
+        None
     }
 
     /// 按索引取连接（供 recv_loop 等按连接维度操作，如心跳）
