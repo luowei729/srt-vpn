@@ -2,12 +2,13 @@
   "mode": "client",
   "server": "129.150.44.117:9000",
   "passphrase": "change-me-strong-passphrase-2026",
-  "crypto": "aes-128",
-  "streamid": "#!::r=live/srtvpn,m=video",
+  "uuid": "00000000-0000-0000-0000-000000000001",
+  "password": "test-password",
   "socks5": {
     "listen": "0.0.0.0:1080"
   },
   "reconnect": { "interval_secs": 5, "max_retries": 10 },
   "heartbeat_secs": 5,
-  "metrics_port": 9091
+  "metrics_port": 9091,
+  "log_level": "info"
 }

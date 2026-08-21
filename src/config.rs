@@ -81,6 +81,17 @@ pub struct Config {
     #[serde(default = "default_max_clients")]
     pub max_clients: usize,
 
+    // === 已废弃字段（向后兼容，保留但不校验，见 CHANGELOG 2026-08-21）===
+    /// @deprecated: pool_size（v0.4.0 已删连接池，单 QUIC 连接多路复用）
+    #[serde(default)]
+    pub pool_size: Option<usize>,
+    /// @deprecated: crypto（v0.4.0 加密统一 AES-128-CTR 由 passphrase 派生）
+    #[serde(default)]
+    pub crypto: Option<String>,
+    /// @deprecated: streamid（v0.4.0 静态令牌已删）
+    #[serde(default)]
+    pub streamid: Option<String>,
+
     // === 环境变量覆盖标记（内部使用，不从 JSON 读取）===
     #[serde(skip)]
     pub _env_overridden: bool,
@@ -181,6 +192,9 @@ impl Config {
             cert: None,
             key: None,
             max_clients: default_max_clients(),
+            pool_size: None,
+            crypto: None,
+            streamid: None,
             _env_overridden: false,
         };
         config.apply_env();
@@ -318,6 +332,11 @@ impl Config {
             if let Ok(n) = v.parse::<u32>() {
                 self.reconnect.max_retries = n;
             }
+        }
+
+        // 已废弃：pool_size / crypto / streamid（v0.4.0 已删，保留兼容但忽略）
+        if std::env::var("SRT_POOL_SIZE").is_ok() {
+            tracing::warn!("SRT_POOL_SIZE 已废弃（v0.4.0 单 QUIC 连接多路复用，无连接池）");
         }
     }
 

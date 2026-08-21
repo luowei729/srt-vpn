@@ -142,8 +142,8 @@ async fn handle_socks5(
         .map_err(|e| format!("读取 SOCKS5 METHODS 失败: {}", e))?;
 
     // 选择认证方法：总是选 0x00（无认证）
-    // 注意：SOCKS5 用户名密码认证是本地代理认证，与 TUIC 认证不同
-    // TUIC 认证由 QUIC 连接建立时完成，SOCKS5 层不需要额外认证
+    // 本地 SOCKS5 认证与 TUIC 认证不同：TUIC 认证由 QUIC 连接建立时完成
+    // 若需本地 SOCKS5 认证，应在此按 config.socks5.username 决定方法（P1 未接入）
     stream
         .write_all(&[0x05, 0x00])
         .await

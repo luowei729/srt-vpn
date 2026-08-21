@@ -1,18 +1,15 @@
 # SRT-VPN
 
-基于 **SRT 直播流协议** 的 VPN 隧道：**Rust 自研 QUIC 语义传输内核 + 手写 SRT 全仿外壳**
-（2026-08-20 重构落地，v0.3.2，稳定性加固版）。
+基于 **SRT 直播流协议** 的 VPN 隧道：**quinn-proto QUIC 内核 + TUIC 协议语义 + SRT 深度仿真外壳 + 包级 AES 加密**
+（2026-08-21 重构定版，v0.4.0，详见 `docs/refactor/REFACTOR_PLAN_v4.md` 与 `CHANGELOG.md` 2026-08-21 条目）。
 
-> 架构说明（详见 `docs/refactor/REFACTOR_PLAN_v3.md` 与 PROJECT_PLAN 第五节）：
-> 传输层为纯 Rust 自研"借鉴 RFC 9000 传输机制"的内核（多流/ACK/丢包补发/BBR 拥控），
-> 外层手写 SRT 外壳（0x80 握手 + 16B 头 + 特征认证）保持流量伪装；libsrt 已彻底废弃
-> （无 C 依赖、纯 Rust 静态编译）。支持**多设备多客户端并发**（每客户端独立数据通道）。
+> 架构：`quinn-proto`（成熟 QUIC 状态机，无 I/O）+ 自管 `UdpSocket`（tokio `select!` 桥接）+ TUIC 协议层（~500 行，不引入 wind）+ I/O 薄层 AES-128-CTR 加密后套 SRT 0x80 外壳。线路上只看到 SRT 壳+密文，DPI 看不到 QUIC/TLS 明文。单 QUIC 连接 stream 多路复用，无连接池。
 
-- **服务端**：监听 UDP 端口，SRT 特征认证后为多个客户端（设备）提供直连转发出口
-- **客户端**：SOCKS5 + HTTP + HTTPS 三合一代理入口，经加密隧道到服务器
-- **UDP 代理**：SOCKS5 UDP ASSOCIATE 多目标 + 大包分片重组（支持至 65507B）
-- **协议**：单连接 + 多路复用层（会话复用），可靠传输由自研 QUIC 语义内核承担
-- **多设备**：一个服务端可同时服务多个客户端设备（各自独立 UDP 数据端口隔离）
+- **服务端**：监听 UDP 端口，TUIC 认证（UUID+password→TLS exporter token）后为多个客户端提供直连转发
+- **客户端**：SOCKS5 + HTTP + HTTPS 三合一代理入口（首字节嗅探，同端口），经加密隧道到服务器
+- **协议**：TUIC 5 命令（Auth/Connect/Packet/Dissociate/Heartbeat）+ Address（Domain/IPv4/IPv6）+ UDP 分片重组
+- **传输**：quinn-proto 驱动循环（批量收包/非阻塞发包/超时重传/Writable 重试/固定 MTU 1200）
+- **性能**：本机回环 50 MB/s 级（10/100 MB MD5 一致，8 并发下载/4 并发上传全过，30 单测零告警）
 
 ---
 
@@ -189,15 +186,14 @@ docker run -d --name srt-vpn-client --restart=unless-stopped \
 
 ## 三、项目结构
 ```
-srt-1.5.6/       libsrt 官方源码（构建时静态编译，不动它）
+srt-1.5.6/       libsrt 官方源码（保留备查，不参与构建）
 src/
-  srt/           libsrt FFI 封装（bindings + connection 事件循环）
-  tunnel/        多路复用层（帧协议 + 会话路由）
-  auth/          streamid 令牌 + 挑战-应答认证
-  client/        SOCKS5 + HTTP/HTTPS 三合一代理入口
-  server/        监听 + 认证 + 直连转发出口
-  config.rs      JSON 配置（统一 schema）
-configs/        示例配置
+  transport/     quinn-proto 驱动 + SRT 外壳 + 包级 AES 加密（driver.rs / srt_shell.rs / crypto.rs）
+  tuic/          TUIC 协议层（proto.rs / addr.rs / udp.rs，~500 行，不引入 wind）
+  client/        SOCKS5 + HTTP/HTTPS 三合一代理入口（socks5.rs + proxy.rs + mod.rs）
+  server/        监听 + 认证 + 转发（mod.rs + auth.rs + forward.rs）
+  cli.rs / config.rs / logging.rs / main.rs / metrics.rs
+configs/        示例配置（server.conf / client.json）
 deploy/          systemd 单元
 ```
 

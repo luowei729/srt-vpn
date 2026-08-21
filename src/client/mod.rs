@@ -30,16 +30,15 @@ pub async fn run(config: Config, metrics: Arc<Metrics>) {
     let server_addr: SocketAddr = match server_addr.parse() {
         Ok(addr) => addr,
         Err(_) => {
-            // 域名需要 DNS 解析
-            match tokio::net::lookup_host(format!("{}:0", server_addr)).await {
+            // 域名：拆出 host 与 port，用 lookup_host 解析
+            let (host, port_str) = server_addr.rsplit_once(':').unwrap_or((server_addr.as_str(), "9000"));
+            let port: u16 = port_str.parse().unwrap_or(9000);
+            // 去掉 IPv6 中括号（lookup_host 不需要）
+            let host_clean = host.trim_matches(|c| c == '[' || c == ']');
+            match tokio::net::lookup_host((host_clean, port)).await {
                 Ok(mut addrs) => {
                     if let Some(addr) = addrs.next() {
-                        // 用解析到的 IP 替换端口部分
-                        // server_addr 格式可能是 "host:port"，解析端口
-                        let port = server_addr.rsplit(':').next()
-                            .and_then(|p| p.parse::<u16>().ok())
-                            .unwrap_or(9000);
-                        SocketAddr::new(addr.ip(), port)
+                        addr
                     } else {
                         tracing::error!("DNS 解析无结果: {}", server_addr);
                         return;
