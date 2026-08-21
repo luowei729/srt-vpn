@@ -101,6 +101,8 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.version.outputs.TAG }}
             org.opencontainers.image.description=SRT-VPN - 基于 SRT 直播流协议的 VPN 隧道
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: type=gha,scope=docker-${{ matrix.arch }},mode=max
 
   # 纯静态二进制（passwall 组件更新用）
   # 2026-08-20 重构后：纯 Rust + Alpine/musl 静态编译，无 libsrt/OpenSSL 依赖
@@ -133,6 +135,12 @@ jobs:
       # 2026-08-20 重构：纯 Rust 项目（libsrt 已废弃），无需 cmake/openssl/linux-headers；
       # rust:1.97-alpine 自带 cargo，直接编译即得 musl 静态产物
       # 挂载宿主 dist 目录经 Docker 卷写入产物（避免容器退出后文件丢失）
+      # 缓存 cargo registry + git + target，二次编译秒级
+      - name: 缓存 cargo 依赖与编译产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: binaries-${{ matrix.arch }}
+
       - name: 在 Alpine 容器内静态编译
         run: |
           mkdir -p "$PWD/dist"

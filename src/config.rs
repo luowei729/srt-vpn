@@ -340,15 +340,33 @@ impl Config {
         }
     }
 
-    /// 校验配置完整性
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// 校验配置完整性（单密码兼容：uuid/password 为空时自动 fallback）
+    fn validate(&mut self) -> Result<(), ConfigError> {
         if self.passphrase.is_empty() {
             return Err(ConfigError::Validation("passphrase 不能为空".into()));
         }
 
+        // 单密码兼容：uuid/password 未填时自动补齐（日常只填 passphrase 即可开箱）
+        // - uuid 空  -> 默认 00000000-0000-0000-0000-000000000001（与新加坡默认 users[0] 一致）
+        // - password 空 -> fallback = passphrase（线路加密=认证密码，简化配置）
+        // 说明：默认 uuid 多设备复用同一身份不踢人；多用户隔离需各配独立 uuid
+        const DEFAULT_UUID: &str = "00000000-0000-0000-0000-000000000001";
+        if self.mode == Mode::Client {
+            if self.uuid.is_none() {
+                if let Ok(u) = DEFAULT_UUID.parse::<Uuid>() {
+                    self.uuid = Some(u);
+                    tracing::info!("uuid 未配置，使用默认 uuid {}", DEFAULT_UUID);
+                }
+            }
+            if self.password.is_none() || self.password.as_deref().map(|s| s.is_empty()).unwrap_or(true) {
+                self.password = Some(self.passphrase.clone());
+                tracing::info!("password 未配置，fallback 到 passphrase");
+            }
+        }
+
         match self.mode {
             Mode::Client => {
-                // 客户端必须有 server / uuid / password / socks5
+                // 客户端必须有 server / uuid / password / socks5（上方已 fallback）
                 if self.server.is_none() {
                     return Err(ConfigError::Validation("客户端模式缺少 server".into()));
                 }
