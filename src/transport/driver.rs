@@ -68,7 +68,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::transport::crypto::PacketCipher;
-use crate::transport::srt_shell::SrtPacket;
+use crate::transport::srt_shell::{pack_fixed_payload, unpack_fixed_payload, SrtPacket};
 
 /// UDP 接收缓冲区大小（单个 UDP 数据报最大 65507 + 16B SRT 头）
 const RECV_BUF_SIZE: usize = 65535;
@@ -221,6 +221,10 @@ pub struct TransportDriver {
     cached_local_ip: Option<std::net::IpAddr>,
     /// SRT 外壳 SEQ 计数器（替代每包 3 次 rand）
     srt_seq: u32,
+    /// SRT 外壳时间戳（每包 +1ms 递增，拟真 RTP 节奏，避免随机跳变被识别为未知 UDP）
+    srt_timestamp: u32,
+    /// SRT socket ID（每连接随机，拟真多路 SRT 会话）
+    srt_socket_id: u32,
     /// 是否有 socket 可写事件待处理（发送 EAGAIN 后置位）
     send_blocked: bool,
     /// EAGAIN 时重排队的 QUIC 包（QUIC 包不能丢，丢了破坏状态机）
@@ -284,6 +288,8 @@ impl TransportDriver {
             pending_writes: VecDeque::new(),
             cached_local_ip: None,
             srt_seq: 0,
+            srt_timestamp: srt_timestamp(),
+            srt_socket_id: rand::random::<u32>() | 0x10000, // 非零拟真 ID
             send_blocked: false,
             queued_packet: None,
         })
@@ -342,6 +348,8 @@ impl TransportDriver {
             pending_writes: VecDeque::new(),
             cached_local_ip: None,
             srt_seq: 0,
+            srt_timestamp: srt_timestamp(),
+            srt_socket_id: rand::random::<u32>() | 0x10000,
             send_blocked: false,
             queued_packet: None,
         })
@@ -433,7 +441,9 @@ impl TransportDriver {
 
     /// 排空 quinn-proto 事件队列并发送所有待发包
     fn drain_and_flush(&mut self, send_buf: &mut Vec<u8>) {
-        loop {
+        // 迭代上限：防止大量待发包时单次 drain 占满单核导致假死（hk2 单核 1.9G 测出 5MB 卡死）
+        const MAX_ITERS: usize = 32;
+        for _ in 0..MAX_ITERS {
             self.poll_events();
             self.poll_endpoint_events();
             self.retry_pending_writes();
@@ -442,12 +452,15 @@ impl TransportDriver {
             if !sent && !self.has_events() {
                 break;
             }
+            if !sent {
+                break;
+            }
         }
     }
 
     /// 是否还有未处理事件（快速探测）
     fn has_events(&self) -> bool {
-        !self.pending_writes.is_empty()
+        !self.pending_writes.is_empty() && !self.send_blocked
     }
 
     /// 计算下一次超时时间
@@ -457,7 +470,7 @@ impl TransportDriver {
             if t > now {
                 t - now
             } else {
-                Duration::from_millis(1)
+                Duration::from_millis(5)
             }
         } else {
             Duration::from_secs(10)
@@ -494,14 +507,20 @@ impl TransportDriver {
             Err(_) => return, // 非 SRT 包静默丢弃（可能是端口扫描）
         };
 
-        // 2. AES 解密（packet_num 从 SRT 头 msg_no 字段读取）
-        let (ciphertext, packet_num) = match &srt_packet {
-            SrtPacket::Data { msg_no, .. } => (srt_packet.payload(), *msg_no as u64),
-            SrtPacket::Control { msg_no, .. } => (srt_packet.payload(), *msg_no as u64),
+        // 2. AES 解密（packet_num 从 SRT 头 msg_no 字段读取；固定包需按 2B 前缀还原密文）
+        let packet_num = match &srt_packet {
+            SrtPacket::Data { msg_no, .. } => *msg_no as u64,
+            SrtPacket::Control { msg_no, .. } => *msg_no as u64,
+        };
+        let payload_bytes = srt_packet.payload().to_vec();
+        let ciphertext = if payload_bytes.len() == crate::transport::srt_shell::SRT_DATA_PAYLOAD_SIZE {
+            unpack_fixed_payload(&payload_bytes)
+        } else {
+            payload_bytes
         };
         let plaintext = match self
             .cipher
-            .decrypt_with_nonce(ciphertext, self.cipher.conn_prefix(), packet_num)
+            .decrypt_with_nonce(&ciphertext, self.cipher.conn_prefix(), packet_num)
         {
             Ok(p) => p,
             Err(_) => return, // 解密失败静默丢弃
@@ -1142,19 +1161,25 @@ impl TransportDriver {
 
     /// 加密 + 套 SRT 壳 + 非阻塞发送一个 wire 包
     ///
+    /// 固定 wire 长度 1328B（SRT live 常见 1312+16），拟真 RTP/SRT 让防火墙识别为媒体流。
     /// 返回 false 表示 EAGAIN（发送缓冲满，需等 writable）。
     fn send_wire_packet(&mut self, dst: &SocketAddr, quic_packet: &[u8]) -> bool {
         // 1. AES 加密（packet_num 嵌入 SRT 头 msg_no 供接收方解密）
         let (ciphertext, packet_num) = self.cipher.encrypt(quic_packet);
 
-        // 2. 套 SRT 外壳（数据包形式，bit31=0）
+        // 2. 固定长度载荷（2B 长度前缀 + 密文 + 0 填充到 1312B）
+        let fixed_payload = pack_fixed_payload(&ciphertext);
+
+        // 3. 套 SRT 外壳（数据包形式，bit31=0，SEQ 递增、timestamp 每包 +1ms、固定 socket_id）
         self.srt_seq = self.srt_seq.wrapping_add(1) & 0x7FFFFFFF;
+        // 时间戳按包递增 1000µs（1ms）模拟 90kHz RTP 节奏，避免随机跳变被判未知 UDP
+        self.srt_timestamp = self.srt_timestamp.wrapping_add(1000);
         let srt_packet = SrtPacket::data(
             self.srt_seq,
             packet_num as u32, // packet_num 存入 msg_no
-            srt_timestamp(),
-            0, // socket ID（简化为 0，真 SRT 仿真后续完善）
-            ciphertext,
+            self.srt_timestamp,
+            self.srt_socket_id,
+            fixed_payload,
         );
         let wire_data = srt_packet.encode();
 

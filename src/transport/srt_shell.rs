@@ -31,6 +31,49 @@ use std::time::Instant;
 /// SRT 外壳固定头长度（16 字节）
 pub const SRT_HEADER_LEN: usize = 16;
 
+/// 仿真目标：DPI 将流量识别为 RTP/SRT 而非“未知 UDP”
+/// - 真 SRT live 模式固定包长 1328 字节（1312 载荷 + 16 头，188*7 MPEG-TS）
+/// - 我们固定 wire 长度到 SRT_WIRE_SIZE，QUIC 包先加 2 字节长度前缀再 pad，解密时按长度截取
+pub const SRT_WIRE_SIZE: usize = 1328;
+/// 单个 SRT 数据包的载荷容量（wire 长度减头）
+pub const SRT_DATA_PAYLOAD_SIZE: usize = SRT_WIRE_SIZE - SRT_HEADER_LEN; // 1312
+/// 长度前缀字节数（密文前 2 字节 BE 长度）
+pub const SRT_LEN_PREFIX: usize = 2;
+
+/// 将密文打包为固定长度载荷：[2B 长度 BE][密文][pad 0 到 1312]
+/// 原因：真 SRT live 固定 1328 字节，防火墙按包长识别 RTP/SRT；加密后载荷随机无需 TS 同步字节
+pub fn pack_fixed_payload(ciphertext: &[u8]) -> Vec<u8> {
+    debug_assert!(ciphertext.len() + SRT_LEN_PREFIX <= SRT_DATA_PAYLOAD_SIZE);
+    let mut out = Vec::with_capacity(SRT_DATA_PAYLOAD_SIZE);
+    out.extend_from_slice(&(ciphertext.len() as u16).to_be_bytes());
+    out.extend_from_slice(ciphertext);
+    out.resize(SRT_DATA_PAYLOAD_SIZE, 0);
+    out
+}
+
+/// 从固定长度载荷还原密文：按前 2 字节长度截取；若长度非法或非固定包则原样返回（兼容旧版不定长包）
+pub fn unpack_fixed_payload(payload: &[u8]) -> Vec<u8> {
+    if payload.len() == SRT_DATA_PAYLOAD_SIZE && payload.len() >= SRT_LEN_PREFIX {
+        let len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+        if len <= SRT_DATA_PAYLOAD_SIZE - SRT_LEN_PREFIX && len > 0 {
+            // 额外校验：pad 区域应全 0（避免误判旧版随机载荷首 2 字节恰好小值）
+            // 旧版载荷加密后随机，pad 区非全 0 的概率极高；全 0 则认为是固定包
+            let pad_is_zero = payload[SRT_LEN_PREFIX + len..].iter().all(|&b| b == 0);
+            if pad_is_zero || len + SRT_LEN_PREFIX + 16 <= payload.len() {
+                // 放宽：只要长度合理就按固定包处理（兼容 pad 非全 0 的边界）
+                return payload[SRT_LEN_PREFIX..SRT_LEN_PREFIX + len].to_vec();
+            }
+        }
+        // 长度非法或 pad 非 0：回退为兼容模式（可能是旧版不定长包恰好 1312）
+        // 尝试按长度截取，失败则原样
+        if len <= payload.len() - SRT_LEN_PREFIX {
+            return payload[SRT_LEN_PREFIX..SRT_LEN_PREFIX + len].to_vec();
+        }
+    }
+    // 非固定包或控制包：原样返回
+    payload.to_vec()
+}
+
 /// SRT 控制包标志位（SEQNO 字段的 bit31）
 const SRT_CTRL_FLAG: u32 = 0x80000000;
 

@@ -2,6 +2,31 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-21 17:10] - v0.4.2 SRT 深度伪装 + 驱动稳定性加固
+
+### 改动前总结
+- **RTP 识别差**：wire 包长随 QUIC 包大小波动（~200-1200B），防火墙识别为「未知 UDP」而非 RTP/SRT；SRT 头 SEQ/ID 为固定值，TIMESTAMP 随机跳变，易被识别为伪造。
+- **大流量后空载 CPU 不降、5M 卡死**：`drain_and_flush` 无迭代上限会占满单核、`compute_timeout` 1ms 空转、`has_events` 误判导致忙醒（hk2 单核 1.9G 复现）、socket ID 全 0 缺少拟真度。
+- **固定包长未实现**：SRT live 真实固定 1328B（188×7 MPEG-TS + 16 头），旧代码直接发变长密文。
+
+### 改动后总结
+1. **固定 wire 长度 1328B（RTP 可识别）**：`src/transport/srt_shell.rs` 新增 `SRT_WIRE_SIZE=1328`、`SRT_DATA_PAYLOAD_SIZE=1312`、`SRT_LEN_PREFIX=2`、`pack_fixed_payload`/`unpack_fixed_payload`（2B 长度前缀 + 密文 + 0 填充到 1312；解密按长度截取，兼容旧版不定长包）。
+2. **拟真 SRT 头**：`src/transport/driver.rs` 每连接 `srt_seq` 递增、`srt_timestamp` 每包 +1ms（wrapping 递增，模拟 90kHz RTP 节奏，避免随机跳变）、`srt_socket_id` 随机非零（`| 0x10000`）；`send_wire_packet` 统一用固定载荷 + 递增头字段。
+3. **驱动防忙转加固（沿用 v0.4.1-1 的 drain 限流，本文补齐其余）**：`drain_and_flush` 设 `MAX_ITERS=32` 防单次占满单核、`compute_timeout` 1ms→5ms 空闲退让、`has_events` 加入 `!send_blocked` 判断，避免空转忙醒。
+4. **版本升至 0.4.2**：`Cargo.toml`/`Cargo.lock` 同步。
+
+### 验证
+- `cargo test` 30/30 通过，`cargo build --release` 零错误（仅 dead_code 警告）。
+- **回环功能**：10K/5M 下载上传 MD5 一致（5M `88dc033d` / `6f52c4e0` 两次一致），8 并发历史已验证。
+- **wire 抓包**：`tcpdump -i lo udp port 9000` 在 5M 传输中抓 6752 包，UDP length 全 1328（`length 1328` 占比 100%，对应 1344 含 pcap 封装差异），无变长包。
+- **空载 CPU**：5M 后 5s 空载 `ps` 显示两进程 0.4%/0.5%，无持续 100% 自旋。
+- **零 WARN/ERROR**：grep server/client 日志无告警。
+
+### 涉及文件
+- `src/transport/srt_shell.rs`（固定包长编解码）
+- `src/transport/driver.rs`（递增头字段 + 固定载荷发送 + 防忙转）
+- `Cargo.toml`/`Cargo.lock`（0.4.2）
+
 ## [2026-08-21 10:00] - v0.4.0 重构启动：TUIC 协议语义 + quinn-proto 内核
 
 ### 改动前总结

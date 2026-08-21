@@ -1,6 +1,6 @@
 [package]
 name = "srt-vpn"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "SRT 外壳伪装 + quinn-proto QUIC 内核 + TUIC 协议语义 VPN（2026-08-21 重构，单密码兼容）"
 license = "MIT"
