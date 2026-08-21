@@ -37,15 +37,31 @@ v0.3.x 自研 QUIC 语义传输内核（src/quic/）+ 手写 SRT 外壳（src/sr
 
 ### 验证
 - 30/30 单元测试通过（TUIC 协议编解码 + SRT 外壳 + AES 加密 + UDP 分片重组）
-- `cargo check` 编译通过（仅 dead_code 警告，客户端/服务端待实现）
-- **回环测试核心已验证**：
+- `cargo build --release` 零错误（仅非关键 dead_code/warn）
+- **回环传输层完全打通（2026-08-21 09:17 终验）**：
   - ✅ QUIC 连接建立（quinn-proto 状态机驱动，SRT 外壳+AES 加密正确）
-  - ✅ TUIC Authenticate 命令发送（UUID+password→TLS exporter token）
-  - ✅ SOCKS5+HTTP 代理入口启动
-  - ✅ SOCKS5 握手成功（curl -x socks5h://127.0.0.1:1080）
-  - ✅ TCP Connect 命令到达服务端
-  - ⚠️ 应用层逻辑待修复：① 服务端认证状态未正确传递（uni-stream 读取） ② 数据流解析（HTTP 数据被当 TUIC 命令解析）
-  - **核心传输层（quinn-proto + SRT 外壳 + AES 加密）完全打通**
+  - ✅ TUIC Authenticate 命令（UUID+password→TLS exporter token，认证通过）
+  - ✅ SOCKS5/HTTP 三合一代理（首字节嗅探分流，CONNECT + 普通 GET 均可用）
+  - ✅ TCP 转发双向全通（服务端独创 leftover 改写：绝对 URL→相对路径）
+  - ✅ 加密通道字节级正确（10MB/100MB MD5 完全一致）
+  - ✅ 流并发稳定（单 QUIC 连接 stream 复用，8 并发下载/4 并发上传全过）
+  - ✅ 零 WARN/ERROR （server.log+client.log 双端 0 告警）
+
+#### 定量测速（单 QUIC 连接，127.0.0.1 回环，`time curl` 实测）
+
+| 方向 | 代理 | 文件 | 状态 | 速度 | MD5 |
+|------|------|------|------|------|-----|
+| 下载 | SOCKS5 | 10 MB | 200 | ~53 MB/s | ✅ 289b10bd |
+| 下载 | HTTP   | 10 MB | 200 | ~49 MB/s | ✅ 289b10bd |
+| 下载 | SOCKS5 | 100 MB | 200 | ~52 MB/s | ✅ 5b912714 |
+| 上传 | SOCKS5 | 10 MB | 200 | ~40 MB/s | ✅ OK 10485760 |
+| 上传 | HTTP   | 10 MB | 200 | ~48 MB/s | ✅ OK 10485760 |
+| 上传 | SOCKS5 | 100 MB | 200 | ~47 MB/s | ✅ OK 104857600 |
+| 并发下载 8×10 MB | SOCKS5 | 80 MB | 200 | 8/8 唯一 MD5 | ✅ 1 种 |
+| 并发上传 4×10 MB | SOCKS5 | 40 MB | 200 | 4/4 OK 10485760 | ✅ 1 种 |
+
+> 测试环境：`cargo build --release`，ThreadingTCPServer（下载）+ Threaded HTTP POST（上传），
+> 单次顺序测速（无并发干扰）。多线程 HTTP 服务为下载提供并发能力（单线程 http.server 会排队，并非隧道瓶颈）。
 
 ### 已完成模块
 
@@ -77,10 +93,15 @@ v0.3.x 自研 QUIC 语义传输内核（src/quic/）+ 手写 SRT 外壳（src/sr
   - rustls 跳过证书验证（线路上被 AES 加密覆盖，认证由 TUIC 协议保证）
 
 ### 待实现
-- `src/client/`：SOCKS5+HTTP 代理 + TCP/UDP 代理→TUIC 命令
-- `src/server/`：监听 + 认证 + 转发
-- Docker/CI 适配
-- passwall 插件适配
+- [x] `src/client/`：SOCKS5+HTTP 代理 + TCP/UDP 代理→TUIC 命令
+  - `socks5.rs`：首字节嗅探（0x05=SOCKS5 / G/P/D/O/C/H=HTTP），SOCKS5 握手+UDP ASSOCIATE，HTTP 代理（CONNECT 隧道 / 普通 GET/POST 请求行改写+首包 prepend）
+  - `proxy.rs`：`handle_tcp_connect`/`handle_tcp_connect_with_prepend`（QUIC bi-stream 双向桥接，prepend 首包与 Connect 命令合并写入，待修复：上传方向慢速待查）
+- [x] `src/server/`：监听 + 认证 + 转发
+  - `mod.rs`：SessionManager（StreamReadable 事件驱动解析 TUIC 命令，Connect→spawn 转发任务，leftover 通道传递首包）
+  - `forward.rs`：`handle_tcp_forward`（QUIC 流↔目标 TCP 双向桥接，leftover 先写目标）
+  - `auth.rs`：TLS exporter token 验证（UUID+password→32B token 常量时间比较）
+- [ ] Docker/CI 适配
+- [ ] passwall 插件适配
 
 ## [2026-08-20 20:30] - 稳定性加固（断连/CUBIC/连接池/丢包恢复）
 

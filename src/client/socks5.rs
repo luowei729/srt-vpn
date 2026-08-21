@@ -58,14 +58,16 @@ pub async fn serve(
             event = event_rx.recv() => {
                 match event {
                     Some(e) => {
-                        // 传输层事件：v2 驱动器只推送 StreamFinished/StreamStopped/
-                        // Connected/ConnectionLost（流数据由 pending read 机制直达 reader）
+                        // 传输层事件：v2 驱动器事件流（流数据由 pending read 机制直达 reader）
                         match &e {
+                            DriverEvent::StreamReadable { stream_id } => {
+                                tracing::trace!(?stream_id, "传输层流可读事件");
+                            }
                             DriverEvent::StreamFinished { stream_id } => {
-                                tracing::debug!(?stream_id, "传输层流结束事件");
+                                tracing::trace!(?stream_id, "传输层流结束事件");
                             }
                             DriverEvent::StreamStopped { stream_id, error_code } => {
-                                tracing::debug!(?stream_id, error_code, "传输层流重置事件");
+                                tracing::trace!(?stream_id, error_code, "传输层流重置事件");
                             }
                             DriverEvent::Connected => {
                                 tracing::debug!("传输层连接已建立");
@@ -294,9 +296,12 @@ async fn handle_http_proxy(
         // 解析 URL 获取目标地址
         let addr = parse_http_url(target)?;
 
-        // 读取并丢弃剩余 HTTP 头（直到空行）
-        // 注意：这里简化处理，实际应转发完整的 HTTP 请求
-        // 对于 passwall 场景，HTTP 代理需求较少，主要走 CONNECT 隧道
+        // 收集完整请求头（直到空行）
+        // 根治死锁：旧版读掉请求头后直接丢弃，转 handle_tcp_connect 等 TCP 新数据，
+        // 但 curl 发完 GET 后在等响应不会再发数据 -> 永久死锁。
+        // 正确做法：把请求行+请求头收集起来，重构后作为首包数据写入 QUIC 流
+        //（服务端 Connect 命令后的 leftover 通道会把它先写入目标 TCP）。
+        let mut request_bytes = rewrite_request_line(&buf, target); // 请求行改写为相对路径
         loop {
             let mut line_buf = Vec::new();
             loop {
@@ -312,15 +317,48 @@ async fn handle_http_proxy(
                     return Err("HTTP 头过长".into());
                 }
             }
+            request_bytes.extend_from_slice(&line_buf);
             // 空行(\r\n)表示头结束
             if line_buf.len() == 2 {
                 break;
             }
         }
 
-        // 回复 200 后透传（简化：转为 TCP 隧道）
         metrics.inc_sessions();
-        crate::client::proxy::handle_tcp_connect(stream, addr, req_tx, metrics).await
+        // 带首包数据进入 TCP 代理转发（请求头作为 prepend 数据先写入 QUIC 流）
+        crate::client::proxy::handle_tcp_connect_with_prepend(
+            stream,
+            addr,
+            req_tx,
+            metrics,
+            request_bytes,
+        )
+        .await
+    }
+}
+
+/// 改写 HTTP 请求行为相对路径形式（代理 -> 源服务器语义转换）
+///
+/// 代理收到的请求行是绝对 URL：`GET http://host:port/path HTTP/1.1\r\n`
+/// 转发给源服务器必须改为相对路径：`GET /path HTTP/1.1\r\n`
+/// （RFC 7230 §5.3.2：绝对形式仅用于代理；源服务器期望 origin-form）
+fn rewrite_request_line(request_line: &[u8], absolute_target: &str) -> Vec<u8> {
+    let line = String::from_utf8_lossy(request_line);
+    let parts: Vec<&str> = line.trim_end().splitn(3, ' ').collect();
+    if parts.len() == 3 {
+        // 提取 URL 的 path+query 部分
+        let path = if let Some(pos) = absolute_target.find("://") {
+            let after_scheme = &absolute_target[pos + 3..];
+            match after_scheme.find('/') {
+                Some(slash) => &after_scheme[slash..],
+                None => "/", // 无路径（如 http://host:port）
+            }
+        } else {
+            absolute_target
+        };
+        format!("{} {} {}\r\n", parts[0], path, parts[2]).into_bytes()
+    } else {
+        request_line.to_vec() // 格式异常原样返回
     }
 }
 

@@ -32,6 +32,23 @@ impl Metrics {
         self.active_sessions.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// 减少活跃会话数（饱和减法，防下溢）
+    ///
+    /// 历史教训：forward 任务退出与 SessionManager 的 StreamFinished/StreamStopped
+    /// 事件处理都会 dec，双重递减使 u64 下溢成 18446744073709551615，
+    /// max_clients 检查永远为真 -> 新连接全部被"超过最大客户端数"拒绝。
+    pub fn dec_sessions_saturating(&self) {
+        let _ = self
+            .active_sessions
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                if v > 0 {
+                    Some(v - 1)
+                } else {
+                    None // 已是 0：保持不变（饱和）
+                }
+            });
+    }
+
     /// 减少活跃会话数
     pub fn dec_sessions(&self) {
         self.active_sessions.fetch_sub(1, Ordering::Relaxed);

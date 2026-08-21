@@ -158,7 +158,9 @@ pub async fn handle_tcp_forward(
         _ = down_handle => {}
     }
 
-    metrics.dec_sessions();
+    // 会话计数由 SessionManager 统一负责（StreamFinished/StreamStopped 事件
+    // tcp_sessions.remove 命中时 dec）。此处不再 dec：双重递减曾使 u64 下溢
+    // 成 18446744073709551615，max_clients 检查永远为真 -> 全部新连接被拒。
     tracing::debug!(?stream_id, "TCP 转发结束");
     Ok(())
 }

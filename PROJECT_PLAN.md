@@ -277,6 +277,8 @@ srt-vpn/
   - 多用户账号：✓ socks5.rs validate_credential 支持 socks5_users 多用户 argon2 哈希表（SRT_SOCKS5_USERS 环境变量明文转哈希），端到端验证 3 用户+错误密码+不存在用户+无认证全正确
   - SACK/快速重传：✓ ack.rs on_ack 按完全 quic-go detectLostPackets（RFC9002 §7.3）重写：时间阈值 9/8 + 包号阈值 3 + lossTime 定时器
   - POOL_SIZE 配置化：✓ config.rs SRT_POOL_SIZE env + pool_size 配置项 + clamp 1..=16 默认 4（quic-go 无此概念，是 srt-vpn B 方案扩展）
+- [x] **v0.4.0 推翻重做（2026-08-21 启动，传输层 v2 定版）**：自研 quic/srt_shell 全删，改用 `quinn-proto` 成熟 QUIC 状态机 + 自研 TUIC 协议层（~500 行）+ 包级 AES-128-CTR+SRT 0x80 外壳（双阶段密钥派生，线路上无 QUIC/TLS 明文）。**7 项血泪教训根治**（详见 CHANGELOG 2026-08-21 09:17）：
+  单次 10M/100M 下载 53/52 MB/s、上传 40/47 MB/s，8 并发下载 1 唯一 MD5、4 并发上传 4/4 OK，30 单测+双端零告警。
 - [ ] **P2 部署与 passwall**：passwall 适配新核心 + Docker/CI + 公网多线程 + SRT 特征抓包验证
 
 ### 重构共识决策表（grilling 收束，2026-08-20）

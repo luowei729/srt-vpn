@@ -132,6 +132,8 @@ pub enum DriverRequest {
 /// 驱动层向应用层推送的事件
 #[derive(Debug)]
 pub enum DriverEvent {
+    /// 流有数据可读（driver 内缓冲已有数据，应用层发 StreamRead 立即返回）
+    StreamReadable { stream_id: StreamId },
     /// 流已结束（FIN，无更多数据；读流会得到 None）
     StreamFinished { stream_id: StreamId },
     /// 流被对端重置
@@ -791,47 +793,161 @@ impl TransportDriver {
         let event_tx = self.event_tx.clone();
 
         for ch in handles {
-            if let Some(conn) = self.connections.get_mut(&ch) {
-                // 先接受流（避免借用冲突，事件先收集后处理）
-                {
+            // 收集 accept 到的流（借用作用域独立，避免与后续读操作双重借用）
+            let mut accepted: Vec<StreamId> = Vec::new();
+            {
+                if let Some(conn) = self.connections.get_mut(&ch) {
                     let mut streams = conn.streams();
                     while let Some(stream_id) = streams.accept(Dir::Uni) {
                         self.stream_route.insert(stream_id, ch);
+                        accepted.push(stream_id);
                         tracing::debug!(?stream_id, "接受对端 uni-stream");
                     }
                     while let Some(stream_id) = streams.accept(Dir::Bi) {
                         self.stream_route.insert(stream_id, ch);
+                        accepted.push(stream_id);
                         tracing::debug!(?stream_id, "接受对端 bi-stream");
                     }
                 }
+            }
 
-                // 收集本连接的所有事件（先取事件再处理，避免双重可变借用）
-                let mut events = Vec::new();
-                while let Some(event) = conn.poll() {
-                    events.push(event);
-                }
-                for event in events {
-                    use quinn_proto::Event::*;
-                    match event {
-                        HandshakeDataReady => {}
-                        Connected => {
-                            tracing::info!("QUIC 连接已建立");
-                            let _ = event_tx.send(DriverEvent::Connected);
-                        }
-                        ConnectionLost { reason } => {
-                            tracing::warn!(?reason, "连接丢失");
-                            let _ = event_tx.send(DriverEvent::ConnectionLost {
-                                reason: format!("{:?}", reason),
-                            });
-                        }
-                        Stream(stream_event) => {
-                            self.handle_stream_event(ch, stream_event);
-                        }
-                        DatagramReceived => {}
-                        DatagramsUnblocked => {}
+            // 关键：quinn-proto 新流首批数据不触发 Readable 事件
+            //（on_stream_frame 只置 opened 标志），accept 后必须主动读
+            for stream_id in accepted {
+                self.read_stream_into_buffer(ch, stream_id);
+            }
+
+            // 收集本连接的所有事件（先取事件再处理，避免双重可变借用）
+            let mut events = Vec::new();
+            {
+                if let Some(conn) = self.connections.get_mut(&ch) {
+                    while let Some(event) = conn.poll() {
+                        events.push(event);
                     }
                 }
             }
+            for event in events {
+                use quinn_proto::Event::*;
+                match event {
+                    HandshakeDataReady => {}
+                    Connected => {
+                        tracing::info!("QUIC 连接已建立");
+                        let _ = event_tx.send(DriverEvent::Connected);
+                    }
+                    ConnectionLost { reason } => {
+                        tracing::warn!(?reason, "连接丢失");
+                        let _ = event_tx.send(DriverEvent::ConnectionLost {
+                            reason: format!("{:?}", reason),
+                        });
+                    }
+                    Stream(stream_event) => {
+                        self.handle_stream_event(ch, stream_event);
+                    }
+                    DatagramReceived => {}
+                    DatagramsUnblocked => {}
+                }
+            }
+        }
+    }
+
+    /// 从连接读流数据入 per-stream 缓冲（accept 后主动读 + Readable 事件读共用）
+    ///
+    /// 根治 "too many gaps in stream buffer"（旧版每次只读一块，读取速度跟不上
+    /// 到达速度 -> assembler 堆积超 1024 chunks -> 连接自杀）：
+    /// 循环读尽当前可用数据（直到 Blocked），一次事件清空接收缓冲，
+    /// 及时 finalize 释放流控窗口（MAX_STREAM_DATA 才能持续增长）。
+    fn read_stream_into_buffer(&mut self, conn_handle: ConnectionHandle, id: StreamId) {
+        // 单次事件最大读取量（4MB 防单流饿死其他流/事件循环）
+        const MAX_EVENT_READ: usize = 4 * 1024 * 1024;
+
+        // 循环读尽（限定借用作用域，避免与 stream_recv 双重可变借用）
+        // 返回值：(本次读到的所有数据块, 是否读到 FIN)
+        let (mut chunks_read, mut got_fin) = {
+            let conn = match self.connections.get_mut(&conn_handle) {
+                Some(c) => c,
+                None => return,
+            };
+            let mut chunks_read: Vec<Vec<u8>> = Vec::new();
+            let mut got_fin = false;
+            let mut total = 0usize;
+
+            loop {
+                // 单块读取（Chunks 借用 recv_stream，借用收敛在函数内）
+                let outcome = {
+                    let mut recv_stream = conn.recv_stream(id);
+                    let read_outcome = recv_stream.read(true);
+                    let mut chunks = match read_outcome {
+                        Ok(c) => c,
+                        Err(_) => break, // 流不可读（已关闭等）
+                    };
+                    let chunk_outcome = chunks.next(STREAM_READ_CHUNK);
+                    let result = match chunk_outcome {
+                        Ok(Some(chunk)) => Ok(Some(chunk.bytes.to_vec())),
+                        Ok(None) => Ok(None), // FIN
+                        Err(_) => Err(()),    // Blocked（暂无数据）
+                    };
+                    let _ = chunks.finalize(); // 释放流控窗口
+                    result
+                };
+
+                match outcome {
+                    Ok(Some(data)) => {
+                        total += data.len();
+                        chunks_read.push(data);
+                        if total >= MAX_EVENT_READ {
+                            // 达到单次上限：剩余数据下次 Readable 事件再读
+                            //（quinn-proto 会在还有未读数据时继续发 Readable）
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        // 流结束（FIN）
+                        got_fin = true;
+                        break;
+                    }
+                    Err(()) => {
+                        // Blocked：当前可用数据已读尽
+                        break;
+                    }
+                }
+            }
+            (chunks_read, got_fin)
+        };
+
+        // 数据入缓冲 + 回复挂起读取（先入缓冲再回复，reply 一次取走全部合并数据）
+        if !chunks_read.is_empty() {
+            // 合并为单个缓冲块（应用层一次 StreamRead 拿到全部，减少 channel 往返）
+            let merged: Vec<u8> = if chunks_read.len() == 1 {
+                chunks_read.pop().unwrap()
+            } else {
+                let total: usize = chunks_read.iter().map(|c| c.len()).sum();
+                let mut merged = Vec::with_capacity(total);
+                for c in chunks_read {
+                    merged.extend_from_slice(&c);
+                }
+                merged
+            };
+            let data_len = merged.len();
+            let state = self
+                .stream_recv
+                .entry(id)
+                .or_insert_with(StreamRecvState::new);
+            state.buffer.push_back(merged);
+            // 回复挂起的读取请求（数据已就绪）
+            self.flush_pending_reply(id);
+            // 通知应用层：新数据可解析（TUIC 命令/转发数据）
+            tracing::trace!(?id, len = data_len, "流数据入缓冲");
+            let _ = self.event_tx.send(DriverEvent::StreamReadable { stream_id: id });
+        }
+
+        if got_fin {
+            let state = self
+                .stream_recv
+                .entry(id)
+                .or_insert_with(StreamRecvState::new);
+            state.finished = true;
+            self.flush_pending_reply(id);
+            let _ = self.event_tx.send(DriverEvent::StreamFinished { stream_id: id });
         }
     }
 
@@ -843,68 +959,17 @@ impl TransportDriver {
         match event {
             Opened { dir: _ } => {}
             Readable { id } => {
-                // 就地从连接读取流数据，存入 per-stream 缓冲
-                // 先从连接取出数据（限定借用作用域），再操作 stream_recv
-                let read_result: Result<Option<Vec<u8>>, ()> = {
-                    let conn = match self.connections.get_mut(&conn_handle) {
-                        Some(c) => c,
-                        None => return,
-                    };
-                    let mut recv_stream = conn.recv_stream(id);
-                    // 注意：Chunks 借用 recv_stream，必须在同一作用域内完成
-                    // finalize 并取出数据，作用域结束时所有借用已释放
-                    let inner = recv_stream.read(true);
-                    match inner {
-                        Ok(mut chunks) => match chunks.next(STREAM_READ_CHUNK) {
-                            Ok(Some(chunk)) => {
-                                let data = chunk.bytes.to_vec(); // 先取数据
-                                let _ = chunks.finalize(); // 再释放流控窗口
-                                Ok(Some(data))
-                            }
-                            Ok(None) => {
-                                let _ = chunks.finalize();
-                                Ok(None) // FIN
-                            }
-                            Err(quinn_proto::ReadError::Blocked) => {
-                                let _ = chunks.finalize();
-                                Err(())
-                            }
-                            Err(_) => {
-                                let _ = chunks.finalize();
-                                Err(())
-                            }
-                        },
-                        Err(_) => Err(()),
-                    }
-                };
-
-                match read_result {
-                    Ok(Some(data)) => {
-                        let state = self
-                            .stream_recv
-                            .entry(id)
-                            .or_insert_with(StreamRecvState::new);
-                        state.buffer.push_back(data);
-                        // 回复挂起的读取请求（数据已就绪）
-                        self.flush_pending_reply(id);
-                    }
-                    Ok(None) => {
-                        // 流结束（FIN）
-                        let state = self
-                            .stream_recv
-                            .entry(id)
-                            .or_insert_with(StreamRecvState::new);
-                        state.finished = true;
-                        self.flush_pending_reply(id);
-                        let _ = event_tx.send(DriverEvent::StreamFinished { stream_id: id });
-                    }
-                    Err(()) => {
-                        // Blocked（暂无数据）或读取错误：无数据入缓冲
-                    }
-                }
+                // 后续数据到达（流已被 accept）：读入缓冲并通知应用层
+                self.read_stream_into_buffer(conn_handle, id);
             }
-            Writable { id: _ } => {
-                // 之前 Blocked 的流现在可写（重试队列在 retry_pending_writes 处理）
+            Writable { id } => {
+                // 该流的流控窗口已释放（对端 MAX_STREAM_DATA 增长）：
+                // 立即重试 pending_writes 中该流的阻塞写入。
+                // 根治上传死锁：旧版此分支为空，Blocked 写入永远无人唤醒
+                //（事件循环只在收包/请求/超时后才跑 retry_pending_writes，
+                // 而流控窗口释放本身不产生新事件 -> select 永远挂起）。
+                tracing::trace!(?id, "流可写事件，重试阻塞写入");
+                self.retry_pending_writes();
             }
             Finished { id } => {
                 let state = self

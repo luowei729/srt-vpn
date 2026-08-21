@@ -151,30 +151,69 @@ srt-vpn/
 
 ## 五、开发里程碑
 
-### P0 · 传输层（回环验收）
-- [ ] quinn-proto 驱动循环（tokio select! 桥接）
-- [ ] SRT 0x80 外壳编解码（握手/数据头/ACK）
-- [ ] 双阶段 AES-128-CTR 包级加密
-- [ ] 回环验收：QUIC 连接建立 + 数据传输
+### P0 · 传输层（回环验收）✅ 2026-08-21 定版
+- [x] quinn-proto 驱动循环（tokio select! 桥接 UdpSocket + 定时器 + 应用请求）
+  - 批量排空接收（try_recv_from 循环）、非阻塞发送（try_send_to + queued_packet + writable 事件）、超时驱动（handle_timeout → conn.handle_timeout）
+  - StreamRecvState pending_reply 机制（无数据挂起，有数据立即回复，消除 10ms 轮询）
+  - 循环读尽合并（单次 Readable 事件读尽 4MB 合并为单块，及时 finalize 释放流控窗口）
+  - Writable 事件驱动 pending_writes 重试（根治上传 Blocked 死锁）
+  - accept 后主动读（quinn-proto 新 bi-stream 首包不发 Readable 的语义黑洞）
+  - 固定 MTU 1200 + 禁用 mtu_discovery（回环 MTU 65536 探测失控导致 too many gaps）
+- [x] SRT 0x80 外壳编解码（握手/数据头/ACK，16B 固定头 SEQ/MSGNO/TS/ID）
+- [x] 双阶段 AES-128-CTR 包级加密（passphrase→PBKDF2 临时密钥 → TLS exporter 会话密钥，Nonce=[8B前缀+8B包号]）
+- [x] 回环验收：QUIC 连接建立 + 数据传输（10MB/100MB MD5 一致，双端零 WARN/ERROR）
 
-### P1 · TUIC 协议层 + 客户端
-- [ ] TUIC Command 编解码（5 种命令）
-- [ ] Address 编解码（Domain/IPv4/IPv6）
-- [ ] UDP 分片重组
-- [ ] 客户端 SOCKS5 + HTTP 代理薄层
-- [ ] TCP/UDP 代理 → TUIC 命令
+### P1 · TUIC 协议层 + 客户端 ✅ 2026-08-21 完成
+- [x] TUIC Command 编解码（5 种命令，VER=0x05）
+- [x] Address 编解码（Domain/IPv4/IPv6）
+- [x] UDP 分片重组（FragmentReassemblyBuffer）
+- [x] 客户端 SOCKS5 + HTTP 代理薄层（三合一同端口，首字节嗅探；普通 HTTP 请求行绝对 URL→相对路径改写 + 首包 prepend）
+- [x] TCP/UDP 代理 → TUIC 命令（handle_tcp_connect / handle_tcp_connect_with_prepend，与 Connect 合并写入，经 leftover 通道先写目标）
 
-### P2 · 服务端 + 端到端
-- [ ] 服务端监听 + 连接管理
-- [ ] TUIC 认证（UUID+TLS exporter）
-- [ ] TCP/UDP 转发出口
-- [ ] 端到端回环测试
+### P2 · 服务端 + 端到端 ✅ 2026-08-21 完成
+- [x] 服务端监听 + 连接管理（SessionManager，StreamReadable 事件驱动解析，Connect→spawn 转发）
+- [x] TUIC 认证（UUID+password→TLS exporter token，常量时间比较）
+- [x] TCP/UDP 转发出口（handle_tcp_forward 双向桥接，leftover 先写目标；dec 归 SessionManager 统一，避免 u64 下溢）
+- [x] 端到端回环测试（见 §6 定量测速）
 
-### P3 · 部署与 passwall
-- [ ] Docker/CI 适配
-- [ ] passwall 插件适配
-- [ ] 公网验证 + SRT 特征抓包
+### P3 · 部署与 passwall ⬜ 待办
+- [ ] Docker/CI 适配（多阶段 Alpine，镜像 <50MB，--net=host）
+- [ ] passwall 插件适配（com.lua / util_srt-vpn.lua / app.sh，契约见 §7）
+- [ ] 公网验证 + SRT 特征抓包（多线程真实链路）
 
 ---
 
-*本文档随重构推进持续更新。*
+*本文档随重构推进持续更新。最后更新：2026-08-21 09:17 北京时间。*
+
+---
+
+## 六、定量测速（单 QUIC 连接，127.0.0.1 回环，`time curl` 实测）
+
+| 方向 | 代理 | 文件 | 状态 | 速度 | 校验 |
+|------|------|------|------|------|------|
+| 下载 | SOCKS5 | 10 MB | 200 | ~53 MB/s | MD5 289b10bd ✅ |
+| 下载 | HTTP   | 10 MB | 200 | ~49 MB/s | MD5 289b10bd ✅ |
+| 下载 | SOCKS5 | 100 MB | 200 | ~52 MB/s | MD5 5b912714 ✅ |
+| 上传 | SOCKS5 | 10 MB | 200 | ~40 MB/s | OK 10485760 ✅ |
+| 上传 | HTTP   | 10 MB | 200 | ~48 MB/s | OK 10485760 ✅ |
+| 上传 | SOCKS5 | 100 MB | 200 | ~47 MB/s | OK 104857600 ✅ |
+| 并发下载 8×10 MB | SOCKS5 | 80 MB | 200 | 8/8 唯一 MD5 | 1 种 ✅ |
+| 并发上传 4×10 MB | SOCKS5 | 40 MB | 200 | 4/4 OK 10485760 | 1 种 ✅ |
+
+测试环境：`cargo build --release`，ThreadingTCPServer（下载）+ Threaded HTTP POST（上传），顺序单次测速（无并发干扰）。单线程 http.server 会排队，并非隧道瓶颈。30 单测 + 双端零 WARN/ERROR。
+
+## 七、SRT 伪装验证（现网抓包，UDP 9000）
+
+- 格式：`[SEQ(4) MSG(4) TS(4) ID(4)] + [AES-128-CTR 密文]`，首字节 `0x00-0x7f` = SRT 数据包特征
+- 线路上无 QUIC/TLS 明文（`ClientHello` / `0xC0` Initial / `0x16 0x03` TLS record 均未在 UDP payload 内出现；曾出现的 `0x16 0x03` 位于 SRT 16B 头内 `msg_no=0x16` 的巧合，非泄露）
+- 载荷高熵随机（AES 密文，无结构），符合 SRT 加密流特征
+
+## 八、抗丢包能力（继承 quinn-proto）
+
+当前协议**已具备 TUIC 同等的丢包补发与抗丢包能力**，且更强：
+
+- **拥控**：quinn-proto 默认 Cubic（`congestion_controller_factory`），与 TUIC 同源
+- **丢包检测/重传**：`handle_timeout → conn.handle_timeout` 驱动 PTO/RTO/丢包检测；`drain_and_flush → poll_transmit` 重发（与首发同路径，自动加密+套壳）
+- **流控恢复**：`Writable → retry_pending_writes`（对端 `MAX_STREAM_DATA` 增长后立即重试 Blocked 写入，根治上传死锁）
+- **背压**：`try_send_to` + `queued_packet` + `writable` 事件（wmem 满时排队等可写，不丢包）
+- 相比自研版本：省去手工 BBR/CUBIC/ack.rs 维护，生产级可靠性由 quinn-proto 保证。

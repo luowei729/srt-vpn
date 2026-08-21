@@ -27,19 +27,51 @@ const MAX_PACKET_PAYLOAD: usize = 1300;
 /// 1. 通过 QUIC bi-stream 发送 Connect 命令（含目标地址）
 /// 2. 双向桥接本地 TCP 流 ↔ QUIC bi-stream
 pub async fn handle_tcp_connect(
+    local_stream: TcpStream,
+    target_addr: Address,
+    req_tx: mpsc::UnboundedSender<DriverRequest>,
+    metrics: Arc<Metrics>,
+) -> Result<(), String> {
+    handle_tcp_connect_inner(local_stream, target_addr, req_tx, metrics, None).await
+}
+
+/// 带首包数据的 TCP 代理转发（普通 HTTP 代理模式用）
+///
+/// 与 handle_tcp_connect 相同，但 prepend 数据（重构后的 HTTP 请求头）
+/// 会在 Connect 命令后立即写入 QUIC 流，服务端通过 leftover 通道先写入目标。
+pub async fn handle_tcp_connect_with_prepend(
+    local_stream: TcpStream,
+    target_addr: Address,
+    req_tx: mpsc::UnboundedSender<DriverRequest>,
+    metrics: Arc<Metrics>,
+    prepend: Vec<u8>,
+) -> Result<(), String> {
+    handle_tcp_connect_inner(local_stream, target_addr, req_tx, metrics, Some(prepend)).await
+}
+
+/// TCP CONNECT 代理内部实现
+///
+/// # 参数
+/// - `prepend`: 建 QUIC 流后立即发送的首包数据（普通 HTTP 代理的请求头）
+async fn handle_tcp_connect_inner(
     mut local_stream: TcpStream,
     target_addr: Address,
     req_tx: mpsc::UnboundedSender<DriverRequest>,
     metrics: Arc<Metrics>,
+    prepend: Option<Vec<u8>>,
 ) -> Result<(), String> {
     tracing::debug!(?target_addr, "TCP CONNECT 代理开始");
 
     // 1. 打开 QUIC 双向流
     let stream_id = request_open_bi_stream(&req_tx).await?;
 
-    // 2. 发送 TUIC Connect 命令（含目标地址）
-    let connect_cmd = Command::Connect { addr: target_addr };
-    let cmd_data = bytes::Bytes::from(connect_cmd.encode_to_vec());
+    // 2. 发送 TUIC Connect 命令（含目标地址）+ 首包数据（如有）
+    //    Connect 命令与首包合并在一次写入：服务端 leftover 解析自然拿到首包
+    let mut wire_data = Command::Connect { addr: target_addr }.encode_to_vec();
+    if let Some(p) = &prepend {
+        wire_data.extend_from_slice(p);
+    }
+    let cmd_data = bytes::Bytes::from(wire_data);
     request_stream_write(&req_tx, stream_id, cmd_data).await?;
 
     // 3. 双向桥接：本地 TCP ↔ QUIC 流

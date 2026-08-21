@@ -173,6 +173,10 @@ impl SessionManager {
             DriverEvent::Connected => {
                 tracing::info!("客户端 QUIC 连接已建立");
             }
+            DriverEvent::StreamReadable { stream_id } => {
+                // 流有数据可读（driver 已读入缓冲）：解析 TUIC 命令或分发给转发任务
+                self.handle_stream_readable(stream_id).await?;
+            }
             DriverEvent::StreamFinished { stream_id } => {
                 tracing::debug!(?stream_id, "流结束");
                 // 只有真正的 TCP 会话流才减计数（防止 uni-stream 的下溢）
