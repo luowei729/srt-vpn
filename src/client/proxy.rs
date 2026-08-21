@@ -83,9 +83,11 @@ async fn handle_tcp_connect_inner(
     let metrics_down = metrics.clone();
 
     // 上行任务：读取本地 TCP 数据 → 写入 QUIC 流
+    // 原因：原 8192 导致高带宽下每 8K 一次驱动往返，小包放大（固定 1328）且系统调用频繁；
+    // 改 64K 批量大幅降低往返次数，配合 32M 窗口可跑满几十 MB/s（对标 hy1）
     let stream_id_up = stream_id;
     let up_handle = tokio::spawn(async move {
-        let mut buf = vec![0u8; 8192];
+        let mut buf = vec![0u8; 65536];
         let mut tcp_read = tcp_read;
         loop {
             match tcp_read.read(&mut buf).await {

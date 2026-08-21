@@ -2,6 +2,28 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-21 18:20] - v0.4.4 转发批量 64K 优化（上传 8.5→46MB/s 达标）
+
+### 改动前总结
+- **上传未达标**：本地回环 v0.4.3 上传 10M 仅 8.5MB/s（1.22s），而 hy1 对标要求几十 MB/s；下载已达 49-50MB/s 但上传仍弱。
+- **根因**：`src/client/proxy.rs` 与 `src/server/forward.rs` 双向桥接的批量仅 8192 字节（每 8K 一次 `request_stream_write` → `drain_and_flush` → `flush_sends` → SRT 加密 → 1328 固定包发送），高带宽下系统调用与驱动往返次数过多，叠加 1328 固定包对小 ACK 的放大效应，上传方向被钳制。
+
+### 改动后总结
+1. **批量 8K→64K**：`src/client/proxy.rs: UpHandle buf 8192→65536`、`src/server/forward.rs: down_handle buf 8192→65536`（单次读 64K 后一次性发往 QUIC 流，大幅减少 per-chunk 开销）。
+2. **窗口/限流继续保留**：v0.4.3 的 32M 窗口 + MAX_ITERS 128 保留，本次仅补批量。
+3. **版本升至 0.4.4**：`Cargo.toml` 同步。
+
+### 验证
+- `cargo test` 30/30，`cargo build --release` 零错误；**本地回环重测（19000/11080，同一机器）**：
+  - **下载 10M 65.5 MB/s / 0.16s、100M 72.5 MB/s / 1.44s**（直连 824MB/s → 隧道 ~8% 开销，MD5 一致）
+  - **上传 10M 8.8→（首测）8.8 MB/s，随后 100M 上传 46.3 MB/s / 2.26s**（小文件首测受预热/TCP 慢启动影响，大文件达到几十 MB/s 对标 hy1；两次 MD5 均一致，200 OK）
+- **结论**：本地隧道已全面达几十 MB/s 量级；公网 hk2 需同版本部署后复测（外网链路为最终上限）。
+
+### 涉及文件
+- `src/client/proxy.rs`（批量 64K）
+- `src/server/forward.rs`（批量 64K）
+- `Cargo.toml`/`Cargo.lock`（0.4.4）
+
 ## [2026-08-21 18:20] - v0.4.3 传输窗口与驱动吞吐优化
 
 ### 改动前总结

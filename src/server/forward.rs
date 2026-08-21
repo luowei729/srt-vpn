@@ -95,7 +95,7 @@ pub async fn handle_tcp_forward(
 
     // 下行任务：目标 TCP → QUIC 流
     let down_handle = tokio::spawn(async move {
-        let mut buf = vec![0u8; 8192];
+        let mut buf = vec![0u8; 65536];
         let mut tcp_read = tcp_read;
         loop {
             match tcp_read.read(&mut buf).await {
