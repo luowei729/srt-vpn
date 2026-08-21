@@ -1,18 +1,14 @@
 {
   "mode": "client",
   "server": "127.0.0.1:9000",
-  "passphrase": "change-me-strong-passphrase-2026",
-  "crypto": "aes-128",
-  "streamid": "#!::r=live/srtvpn,m=video",
+  "passphrase": "test-passphrase-2026",
+  "uuid": "00000000-0000-0000-0000-000000000001",
+  "password": "test-password",
   "socks5": {
-    "listen": "127.0.0.1:1080",
-    "username": "user1",
-    "password": "password123"
+    "listen": "127.0.0.1:1080"
   },
-  "reconnect": {
-    "interval_secs": 5,
-    "max_retries": 10
-  },
+  "reconnect": {"interval_secs": 3, "max_retries": 3},
   "heartbeat_secs": 5,
-  "metrics_port": 9091
+  "metrics_port": 9091,
+  "log_level": "info"
 }

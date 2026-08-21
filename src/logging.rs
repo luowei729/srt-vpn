@@ -1,35 +1,33 @@
-//! logging.rs — JSON 结构化日志初始化
+//! JSON 结构化日志模块
 //!
-//! 设计决策（Q22）：JSON 结构化日志（tracing-subscriber json 格式）
-//! - 输出到 stdout（生产用 systemd/journald 采集）
-//! - 级别由 -v 控制（0=ERROR, 1=WARN, 2=INFO, 3=DEBUG, 4=TRACE）
+//! 设计原因：passwall 通过 stdout 重定向收集日志（ln_run 的 >$log_file 2>&1），
+//! 所以日志必须输出到 stdout。JSON 格式便于 passwall 或其他日志系统解析。
+//! 容器日志大小由 Docker --log-opt 控制（详见 DOCKER.md）。
 
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// 初始化 JSON 结构化日志
-/// verbose: 0-4（对应 error/warn/info/debug/trace）
 ///
-/// M4 修复（2026-08-19）：不再读 RUST_LOG 环境变量。
-/// 旧实现 EnvFilter::try_from_default_env() 优先级高于 -v CLI 参数，
-/// 只要环境里残留 RUST_LOG 就静默覆盖用户显式指定的日志级别，
-/// 违背"CLI > 环境变量 > 配置文件"的优先级承诺。
-/// 现日志级别只由调用方（main.rs 已按 CLI>配置 优先级解析出的 verbose）决定。
-pub fn init(verbose: u8) {
-    // 将 verbose 数值映射为日志级别字符串
-    let level = match verbose {
-        0 => "error",
-        1 => "warn",
-        2 => "info",
-        3 => "debug",
-        _ => "trace",
-    };
-    // 过滤器（M4：显式构造，不读 RUST_LOG；SRT 库日志经 log 桥接输出）
-    let filter = EnvFilter::new(format!("srt_vpn={level},srt_vpn::srt={level}"));
+/// # 参数
+/// - `level_str`: 日志级别字符串（"info"/"debug"/"trace"/"warn"/"error"）
+///
+/// # 设计
+/// 使用 tracing + tracing-subscriber，输出 JSON 格式到 stdout。
+/// 优先级：环境变量 RUST_LOG > 参数 level_str > 默认 "info"。
+pub fn init(level_str: &str) {
+    // 解析日志级别，优先读环境变量 RUST_LOG，无则用传入参数
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(level_str));
 
-    // JSON 格式输出到 stdout，附时间戳
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(filter)
-        .with_target(true)
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(
+            fmt::layer()
+                .json() // JSON 格式，便于日志系统解析
+                .with_target(true) // 包含模块路径
+                .with_thread_ids(false) // 不含线程 ID（减少日志量）
+                .with_file(false) // 不含源码文件名（减少日志量）
+                .with_line_number(false), // 不含行号（减少日志量）
+        )
         .init();
 }
