@@ -442,7 +442,8 @@ impl TransportDriver {
     /// 排空 quinn-proto 事件队列并发送所有待发包
     fn drain_and_flush(&mut self, send_buf: &mut Vec<u8>) {
         // 迭代上限：防止大量待发包时单次 drain 占满单核导致假死（hk2 单核 1.9G 测出 5MB 卡死）
-        const MAX_ITERS: usize = 32;
+        // 32 在公网高吞吐下成为瓶颈，放宽到 128（单轮最多 128 包，仍让出 select! 但保证 50MB/s+）
+        const MAX_ITERS: usize = 128;
         for _ in 0..MAX_ITERS {
             self.poll_events();
             self.poll_endpoint_events();
@@ -1251,6 +1252,7 @@ impl TransportDriver {
 /// - mtu_discovery_config(None)：禁用 MTU 探测（"too many gaps" 根因）
 /// - initial_mtu=1200：QUIC 包最大 1200B + 16B SRT 头 = 1216B wire，
 ///   以太网 MTU 1500 内不分片
+/// v0.4.3 优化：窗口从 10M->32M/8M，提升高 RTT 链路带宽（本地 52->50MB/s 保量，公网 40ms RTT 下 BDP 需大窗口）
 fn build_transport_config() -> TransportConfig {
     let mut config = TransportConfig::default();
     config
@@ -1259,9 +1261,9 @@ fn build_transport_config() -> TransportConfig {
         .max_idle_timeout(Some(
             quinn_proto::IdleTimeout::try_from(Duration::from_secs(60)).unwrap(),
         ))
-        .send_window(10 * 1024 * 1024)
-        .receive_window(VarInt::from_u32(10 * 1024 * 1024))
-        .stream_receive_window(VarInt::from_u32(2 * 1024 * 1024))
+        .send_window(32 * 1024 * 1024)
+        .receive_window(VarInt::from_u32(32 * 1024 * 1024))
+        .stream_receive_window(VarInt::from_u32(8 * 1024 * 1024))
         // 禁用 MTU 探测（回环 MTU 65536 会探测出巨型包导致对端接收截断）
         .mtu_discovery_config(None)
         .initial_mtu(1200)

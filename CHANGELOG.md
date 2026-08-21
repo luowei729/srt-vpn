@@ -2,6 +2,28 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-21 18:20] - v0.4.3 传输窗口与驱动吞吐优化
+
+### 改动前总结
+- **带宽瓶颈**：hk2 公网 10M 下载超时（exit 52，5.8M 截断）、上传 10M 几乎 0 速度；用户对比 hy1 期望 **几十 MB/s**，当前固定包 1328 + 小窗口不满足。
+- **根因**：① `send_window/receive_window=10M`、`stream_receive_window=2M` 在 40ms RTT 下 BDP 不足（理论 BDP≈带宽×RTT，几十 MB/s 需 30M+ 窗口）；② `drain_and_flush MAX_ITERS=32` 单轮最多 32 包，在 50MB/s+ 下吞吐受限；③ hk2 下载服务长期用单线程 `http.server`（阻塞），多并发/大文件下服务端成为瓶颈（已切 `ThreadingHTTPServer`）。
+- 本地回环当时 52MB/s 已接近目标，但公网链路需更大窗口才不被钳制。
+
+### 改动后总结
+1. **窗口扩容（src/transport/driver.rs build_transport_config）**：`send_window 10M→32M`、`receive_window 10M→32M`、`stream_receive_window 2M→8M`（BDP 匹配高 RTT 公网）。
+2. **驱动限流放宽**：`drain_and_flush MAX_ITERS 32→128`（单轮最多 128 包，仍让出 `select!` 但保证 50MB/s+ 带宽）。
+3. **版本升至 0.4.3**：`Cargo.toml` 同步；本地回环重测通过才发版。
+
+### 验证
+- `cargo build --release` 零错误；本地回环（19000/11080）：
+  - **10M 下载 49.6 MB/s / 0.21s，100M 下载 50.3 MB/s / 2.08s**（直连 824 MB/s → 隧道开销仅 ~6%，MD5 一致）；
+  - **10M 上传 8.5 MB/s / 1.22s**（200 OK）；
+- **本地结论**：隧道本身已达几十 MB/s 量级，满足 hy1 对标；公网最终带宽受 hk2 外网链路带宽上限与下载服务线程模型影响，需 hk2 端 ThreadingHTTPServer + 32M 窗口后复测。
+
+### 涉及文件
+- `src/transport/driver.rs`（窗口 + MAX_ITERS）
+- `Cargo.toml`/`Cargo.lock`（0.4.3）
+
 ## [2026-08-21 17:10] - v0.4.2 SRT 深度伪装 + 驱动稳定性加固
 
 ### 改动前总结
