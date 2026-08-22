@@ -282,6 +282,7 @@ srt-vpn/
 - [x] **v0.4.5 变长包定论 + 断连重连修复（2026-08-22 18:24）**：hk2 A/B 实验证明固定 1328 包是公网带宽杀手（ACK 放大 23.6 倍，54.6s 超时 vs 直连 1.15s），默认改回变长直发（贴近 quinn/TUIC 原生），`SRT_FIXED_PAYLOAD=1` 可选拟真。同时修复断连感知链三处：驱动 Drained 清理 / socks5 ConnectionLost 退出 / connect_and_serve 返回 Err（auth 失败自动重连闭环验证 attempt 1→4）。本地回环回归 76MB/s MD5 一致。详见 CHANGELOG 2026-08-22 18:24。
 - [x] **v0.4.6 conn_handle 路由 bug 根治（2026-08-22 19:01）**：服务端二次接入 token 不匹配根因为 NewConnection 分支只在 is_none() 时更新 conn_handle → ExportKeyingMaterial 路由到旧连接 TLS session。修复为总是指向最新连接。本地 100% 复现→修复→验证闭环（两次接入均成功，76.5MB/s MD5 一致）。详见 CHANGELOG。
 - [x] **v0.4.7 RTP 外壳伪装（2026-08-22 20:37）**：抓包研究真 RTP 视频流特征（首字节 0x80/V=2、PT=96、SEQ 连续、TS 3000/帧、M 帧尾、SSRC 固定）后，将外壳从 SRT 数据包升级为 RFC3550 RTP 头（12B），载荷 [8B包号|AES密文] 复用现有 nonce 机制。抓包验证 11416 包全 V=2、按 SSRC 分组 SEQ 连续 100%、握手也套壳。67.8MB/s MD5 一致，33 单测全过。详见 CHANGELOG。
+- [x] **v0.4.8 RTCP SR 注入（2026-08-22 21:10）**：标准 nDPI 验证 RTP 壳达标后，针对软路由简化 DPI 要求 RTP+RTCP 成对的差异，每 500ms 注入 RTCP Sender Report（PT=200，28B，SSRC 与 RTP 一致）。本地抓包确认 11504 RTP + 4 RTCP SR，nDPI 识别 RTP，61MB/s MD5 一致，34 单测全过。端口建议迁移 18000（RTP 视频动态区间）。详见 CHANGELOG。
 - [ ] **P2 部署与 passwall**：passwall 适配新核心 + Docker/CI + 公网多线程 + SRT 特征抓包验证
 
 ### 重构共识决策表（grilling 收束，2026-08-20）

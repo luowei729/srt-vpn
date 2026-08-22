@@ -46,6 +46,50 @@ pub const RTP_TS_PER_FRAME: u32 = 3000;
 /// 包号前缀长度（载荷前 8B 存加密包号）
 pub const RTP_PKTNUM_LEN: usize = 8;
 
+/// RTCP Sender Report 包长（RFC3550 §6.4.1，无 report block 的最小 SR = 28B）
+pub const RTCP_SR_LEN: usize = 28;
+
+/// RTCP Sender Report (SR) 载荷类型（PT=200，nDPI is_valid_rtcp 192-213 有效）
+pub const RTCP_PT_SR: u8 = 200;
+
+/// 构造 RTCP Sender Report 包（28B，无 report block）
+///
+/// 设计原因：真实 RTP 视频会话标配 RTCP SR 控制通道（周期上报发送统计），
+/// 部分简化 DPI（如爱快/OpenWrt 面板）要求 RTP+RTCP 成对才识别为视频流。
+/// 周期注入一个合法 SR 包能显著提升这类 DPI 的识别率。
+///
+/// 字段（RFC3550 §6.4.1）：
+/// - byte0: V=2(10) P=0 RC=0 → 0x80
+/// - byte1: PT=200 (SR)
+/// - byte2-3: length = (28/4)-1 = 6（word 计数 - 1）
+/// - byte4-7: sender SSRC（与 RTP 流同 SSRC，保持一致）
+/// - byte8-15: NTP 时间戳（64bit，秒+分数）
+/// - byte16-19: RTP 时间戳（与最近发送的 RTP TS 对齐）
+/// - byte20-23: 发送方累计包数
+/// - byte24-27: 发送方累计字节数
+pub fn build_rtcp_sr(ssrc: u32, rtp_timestamp: u32, packet_count: u32, octet_count: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(RTCP_SR_LEN);
+    buf.push(0x80); // V=2, P=0, RC=0
+    buf.push(RTCP_PT_SR); // PT=200
+    buf.extend_from_slice(&6u16.to_be_bytes()); // length
+    buf.extend_from_slice(&ssrc.to_be_bytes());
+    // NTP 时间戳（简化：用固定高秒 + 递增低分）
+    buf.extend_from_slice(&0x12345678u32.to_be_bytes());
+    buf.extend_from_slice(&0x9abcdef0u32.to_be_bytes());
+    buf.extend_from_slice(&rtp_timestamp.to_be_bytes());
+    buf.extend_from_slice(&packet_count.to_be_bytes());
+    buf.extend_from_slice(&octet_count.to_be_bytes());
+    buf
+}
+
+/// 判断一段 UDP 载荷是否为合法 RTCP SR 包（供驱动接收端识别控制包）
+pub fn is_rtcp_sr(data: &[u8]) -> bool {
+    data.len() >= RTCP_SR_LEN
+        && (data[0] >> 6) & 0x3 == 2
+        && data[1] == RTCP_PT_SR
+        && u16::from_be_bytes([data[2], data[3]]) == 6
+}
+
 /// RTP 外壳包
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RtpPacket {
@@ -207,6 +251,20 @@ mod tests {
         assert_eq!(dec.marker, true);
         assert_eq!(dec.packet_num(), Some(42));
         assert_eq!(dec.ciphertext(), &[0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn test_rtcp_sr_build_and_detect() {
+        // 构造 RTCP SR，验证字段合法且能被 is_rtcp_sr 识别
+        let sr = build_rtcp_sr(0xcfeb9550, 3000, 100, 120000);
+        assert_eq!(sr.len(), RTCP_SR_LEN);
+        assert_eq!(sr[0], 0x80); // V=2
+        assert_eq!(sr[1], RTCP_PT_SR); // PT=200
+        assert_eq!(u16::from_be_bytes([sr[2], sr[3]]), 6); // length
+        assert!(is_rtcp_sr(&sr));
+        // 非 RTCP 包应识别失败
+        assert!(!is_rtcp_sr(&[0x80, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+        assert!(!is_rtcp_sr(&[0x80, 200, 0, 6, 0])); // 太短
     }
 
     #[test]

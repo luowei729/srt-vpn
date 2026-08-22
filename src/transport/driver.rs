@@ -232,6 +232,11 @@ pub struct TransportDriver {
     srt_seq: u32,
     /// RTP SSRC（同步源 ID，每连接随机固定，RTP 会话内不变）
     rtp_ssrc: u32,
+    /// 最近一次注入 RTCP SR 的时间（周期注入控制通道，满足要求 RTP+RTCP 成对的 DPI）
+    last_rtcp_at: Option<Instant>,
+    /// RTCP SR 累计发送包数/字节数（SR 载荷字段，模拟真实发送统计）
+    rtcp_pkt_count: u32,
+    rtcp_octet_count: u32,
     /// 是否有 socket 可写事件待处理（发送 EAGAIN 后置位）
     send_blocked: bool,
     /// EAGAIN 时重排队的 QUIC 包（QUIC 包不能丢，丢了破坏状态机）
@@ -296,6 +301,9 @@ impl TransportDriver {
             cached_local_ip: None,
             srt_seq: 0,
             rtp_ssrc: rand::random::<u32>() | 0x8000_0000, // SSRC 高位通常非 0 拟真
+            last_rtcp_at: None,
+            rtcp_pkt_count: 0,
+            rtcp_octet_count: 0,
             send_blocked: false,
             queued_packet: None,
         })
@@ -355,6 +363,9 @@ impl TransportDriver {
             cached_local_ip: None,
             srt_seq: 0,
             rtp_ssrc: rand::random::<u32>() | 0x8000_0000,
+            last_rtcp_at: None,
+            rtcp_pkt_count: 0,
+            rtcp_octet_count: 0,
             send_blocked: false,
             queued_packet: None,
         })
@@ -504,12 +515,18 @@ impl TransportDriver {
     ///
     /// 兼容双模式：
     /// - RTP 外壳（新，v0.4.7+）：首字节 V=2（0x80），负载 [8B 包号][密文]
+    /// - RTCP SR（伪装控制包，PT=200）：对端注入的假视频控制通道，无 QUIC 数据，静默丢弃
     /// - SRT 外壳（旧，历史）：首字节 bit31=0/1，packet_num 在 msg_no 字段，
     ///   固定包按 2B 长度前缀还原（升级期间双端版本可能交错，必须兼容）
     fn handle_recv(&mut self, data: &[u8], src_addr: SocketAddr, send_buf: &mut Vec<u8>) {
         // 服务端学习对端地址（用于 accept 时路由；客户端固定）
         if self.is_server && self.peer_addr.is_none() {
             self.peer_addr = Some(src_addr);
+        }
+
+        // 0. RTCP SR 伪装包：仅用于让 DPI 看到 RTP+RTCP 成对会话，无业务数据，直接忽略
+        if crate::transport::rtp_shell::is_rtcp_sr(data) {
+            return;
         }
 
         // 1. 优先按 RTP 外壳解析（V=2，首字节 0x80-0xBF）
@@ -1222,7 +1239,25 @@ impl TransportDriver {
         let rtp_packet = RtpPacket::data(self.srt_seq as u16, self.rtp_ssrc, payload);
         let wire_data = rtp_packet.encode();
 
-        // 4. 非阻塞发送（EAGAIN 返回 false，绝不阻塞 driver）
+        // 4. 周期注入 RTCP Sender Report（真实视频会话标配控制通道）。
+        //    简化 DPI（如爱快/OpenWrt 面板）常要求 RTP+RTCP 成对才识别为视频流。
+        //    每 500ms 在数据包之间夹一个 SR 包（SSRC 与 RTP 一致，模拟真实发送统计）。
+        let now = Instant::now();
+        if self.last_rtcp_at.map_or(true, |t| now.duration_since(t) >= Duration::from_millis(500)) {
+            self.last_rtcp_at = Some(now);
+            self.rtcp_pkt_count = self.rtcp_pkt_count.wrapping_add(1);
+            self.rtcp_octet_count = self.rtcp_octet_count.wrapping_add(wire_data.len() as u32);
+            let sr = crate::transport::rtp_shell::build_rtcp_sr(
+                self.rtp_ssrc,
+                rtp_packet.timestamp,
+                self.rtcp_pkt_count,
+                self.rtcp_octet_count,
+            );
+            // RTCP 用独立 UDP 包发送（不占 RTP 序号，nDPI 会识别为 RTCP 通道）
+            let _ = self.socket.try_send_to(&sr, *dst);
+        }
+
+        // 5. 非阻塞发送（EAGAIN 返回 false，绝不阻塞 driver）
         match self.socket.try_send_to(&wire_data, *dst) {
             Ok(_) => true,
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false,

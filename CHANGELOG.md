@@ -2,6 +2,42 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-22 21:10] - v0.4.8 RTCP SR 注入（满足软路由 DPI 的 RTP+RTCP 成对识别）
+
+### 改动前总结
+- **v0.4.7 RTP 外壳已达标**：标准 nDPI（5.1.0）实测本地 11416 包、hk2 公网 1159
+ 包全部识别为 RTP（对照：真 SRT 反被标 Unknown）。
+- **但软路由仍显示"未知 UDP/未知协议"**（10.0.100.2 → 103.244.89.78:9000）。
+ 分析：软路由 DPI 引擎（爱快/OpenWrt 面板/OpenClash 简化引擎）判定规则与标准
+ nDPI 不同，常见差异是**要求 RTP 与 RTCP 控制通道成对出现**（真实视频通话标配
+ RTP+RTCP），而我们 v0.4.7 只有纯 RTP 数据包。
+- 另有端口因素：9000 不在简化 DPI 的 RTP 视频常用端口白名单（16384-32767 等）。
+
+### 改动后总结
+1. **RTCP Sender Report 周期注入**：
+   - `src/transport/rtp_shell.rs` 新增 `build_rtcp_sr()`（RFC3550 §6.4.1，28B）与
+     `is_rtcp_sr()`。SR 包：V=2、PT=200、SSRC 与 RTP 流一致、含 NTP/RTP 时间戳、
+     累计包数/字节数（模拟真实发送统计）。
+   - `driver.rs send_wire_packet`：每 500ms 在数据包之间注入一个 RTCP SR 包
+     （独立 UDP 包，不占 RTP 序号）；`handle_recv` 对 RTCP SR 包静默忽略（无业务
+     数据，仅伪装控制通道）。
+2. **端口建议**：将服务端监听端口迁移到标准 RTP 视频动态区间（如 **18000**，
+   RTP 常用 16384-32767 且偶数端口/RTCP 奇数端口成对逻辑匹配），可进一步提高简化
+   DPI 识别率（部署配置项，非代码硬编码）。
+3. 版本升至 **0.4.8**。
+
+### 验证
+- `cargo test` **34/34 全过**（新增 RTCP SR 构造/识别单测）。
+- 本地端到端：10M 下载 **61MB/s**、MD5 一致。
+- 抓包：11504 RTP 数据包 + **4 个 RTCP SR 包**（每 500ms，双向各注入），nDPI
+  仍识别 RTP。→ 会话结构为 RTP+RTCP，满足要求成对的 DPI。
+- hk2 部署 v0.4.8 + 端口迁移后需软路由侧复看。
+
+### 涉及文件
+- `src/transport/rtp_shell.rs`（RTCP SR 构造/识别）
+- `src/transport/driver.rs`（RTCP 周期注入 + 接收忽略）
+- `Cargo.toml`（0.4.8）
+
 ## [2026-08-22 20:37] - v0.4.7 RTP 外壳伪装（DPI 识别为 RTP 视频流）
 
 ### 改动前总结
