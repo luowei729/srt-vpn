@@ -9,7 +9,7 @@
 - **客户端**：SOCKS5 + HTTP + HTTPS 三合一代理入口（首字节嗅探，同端口），经加密隧道到服务器
 - **协议**：TUIC 5 命令（Auth/Connect/Packet/Dissociate/Heartbeat）+ Address（Domain/IPv4/IPv6）+ UDP 分片重组
 - **传输**：quinn-proto 驱动循环（批量收包/非阻塞发包/超时重传/Writable 重试/固定 MTU 1200）
-- **性能**：本机回环 50 MB/s 级（10/100 MB MD5 一致，8 并发下载/4 并发上传全过，30 单测零告警）
+- **性能**：本机回环 `93.2 MB/s（16DL）/55.6 MB/s（16UL）/双向同时 85.3 MB/s 32/32 无互踩`（10M/100M MD5 一致，`4×100M DL 92.7/UL 70.3 双向 83.2` 全过，30 单测零告警，`release 5.0M`）
 
 ---
 
@@ -186,10 +186,11 @@ docker run -d --name srt-vpn-client --restart=unless-stopped \
 
 ## 三、项目结构
 ```
-srt-1.5.6/       libsrt 官方源码（保留备查，不参与构建）
+srt-1.5.6/       libsrt 1.5.6 官方源码（`build.rs` CMake 静态编译，不动源码树）
 src/
-  transport/     quinn-proto 驱动 + SRT 外壳 + 包级 AES 加密（driver.rs / srt_shell.rs / crypto.rs）
-  tuic/          TUIC 协议层（proto.rs / addr.rs / udp.rs，~500 行，不引入 wind）
+  srt/           libsrt FFI 封装（bindings.rs / connection.rs 单发单收 + FileCC 16M）
+  tunnel/        多路复用层（multiplex.rs 15B 帧头 + dispatch.rs 会话事件型 + 讣告）
+  auth/          三件套认证（challenge.rs 对时握手 90s 窗 + mod.rs argon2）
   client/        SOCKS5 + HTTP/HTTPS 三合一代理入口（socks5.rs + proxy.rs + mod.rs）
   server/        监听 + 认证 + 转发（mod.rs + auth.rs + forward.rs）
   cli.rs / config.rs / logging.rs / main.rs / metrics.rs

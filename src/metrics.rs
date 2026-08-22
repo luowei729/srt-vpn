@@ -1,132 +1,88 @@
-//! 回环 HTTP 指标端口模块
+//! metrics.rs — 运行指标（回环 HTTP 端口）
 //!
-//! 设计原因：提供运行时可观测性（活跃会话数、收发字节数等）。
-//! 指标通过 HTTP 暴露在回环地址，不占外部端口，不影响 passwall 配置。
+//! 设计决策（Q22）：回环 HTTP 指标端口（仅监听 127.0.0.1）
+//! - 暴露连接数、吞吐、丢包率、会话数等运行状态
+//! - P1 实现简单计数器，P2 扩展实时统计
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 
-/// 全局运行时指标（原子计数器，无锁高性能）
+use tokio::io::AsyncWriteExt;
+
+/// 全局指标（进程级单例）
 #[derive(Debug, Default)]
 pub struct Metrics {
-    /// 活跃会话数（TCP+UDP）
-    pub active_sessions: AtomicU64,
-    /// 累计接收字节数（从隧道收到的）
-    pub rx_bytes: AtomicU64,
-    /// 累计发送字节数（发往隧道的）
-    pub tx_bytes: AtomicU64,
-    /// 累计连接数（客户端连接/重连次数）
+    /// 当前活跃 SRT 连接数
+    pub active_connections: AtomicU64,
+    /// 累计连接次数
     pub total_connections: AtomicU64,
+    /// 当前活跃会话数（隧道复用层）
+    pub active_sessions: AtomicU64,
+    /// 累计会话次数
+    pub total_sessions: AtomicU64,
+    /// 发送字节数（隧道载荷）
+    pub tx_bytes: AtomicU64,
+    /// 接收字节数（隧道载荷）
+    pub rx_bytes: AtomicU64,
+    /// 认证失败次数
+    pub auth_failures: AtomicU64,
+    /// 心跳超时次数
+    pub heartbeat_timeouts: AtomicU64,
+    /// 最近一次心跳 RTT（毫秒，M8 2026-08-19 新增：pong 时间戳差值）
+    pub last_rtt_ms: AtomicU64,
+}
+
+/// 全局指标实例（OnceLock 懒初始化）
+static METRICS: std::sync::OnceLock<Arc<Metrics>> = std::sync::OnceLock::new();
+
+/// 获取全局指标
+pub fn metrics() -> Arc<Metrics> {
+    METRICS
+        .get_or_init(|| Arc::new(Metrics::default()))
+        .clone()
 }
 
 impl Metrics {
-    /// 创建新的指标实例
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// 增加活跃会话数
-    pub fn inc_sessions(&self) {
-        self.active_sessions.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// 减少活跃会话数（饱和减法，防下溢）
-    ///
-    /// 历史教训：forward 任务退出与 SessionManager 的 StreamFinished/StreamStopped
-    /// 事件处理都会 dec，双重递减使 u64 下溢成 18446744073709551615，
-    /// max_clients 检查永远为真 -> 新连接全部被"超过最大客户端数"拒绝。
-    pub fn dec_sessions_saturating(&self) {
-        let _ = self
-            .active_sessions
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                if v > 0 {
-                    Some(v - 1)
-                } else {
-                    None // 已是 0：保持不变（饱和）
-                }
+    /// 启动回环 HTTP 指标服务（阻塞式，由调用方 spawn）
+    /// 仅监听 127.0.0.1，不对外暴露
+    pub async fn serve_http(port: u16) -> Result<(), String> {
+        let addr = format!("127.0.0.1:{port}");
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .map_err(|e| format!("指标端口绑定失败 {addr}: {e}"))?;
+        tracing::info!(addr = %addr, "指标 HTTP 服务已启动");
+        loop {
+            let (mut sock, _) = listener
+                .accept()
+                .await
+                .map_err(|e| format!("指标 HTTP accept 失败: {e}"))?;
+            // 每个连接独立任务，响应 JSON 指标
+            tokio::spawn(async move {
+                let body = render_metrics_json();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
             });
-    }
-
-    /// 减少活跃会话数
-    pub fn dec_sessions(&self) {
-        self.active_sessions.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    /// 增加接收字节数
-    pub fn add_rx(&self, n: u64) {
-        self.rx_bytes.fetch_add(n, Ordering::Relaxed);
-    }
-
-    /// 增加发送字节数
-    pub fn add_tx(&self, n: u64) {
-        self.tx_bytes.fetch_add(n, Ordering::Relaxed);
-    }
-
-    /// 增加连接计数
-    pub fn inc_connections(&self) {
-        self.total_connections.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// 渲染为 JSON 字符串（HTTP 响应体）
-    fn to_json(&self) -> String {
-        format!(
-            r#"{{"active_sessions":{},"rx_bytes":{},"tx_bytes":{},"total_connections":{}}}"#,
-            self.active_sessions.load(Ordering::Relaxed),
-            self.rx_bytes.load(Ordering::Relaxed),
-            self.tx_bytes.load(Ordering::Relaxed),
-            self.total_connections.load(Ordering::Relaxed),
-        )
+        }
     }
 }
 
-/// 启动指标 HTTP 服务
-///
-/// # 参数
-/// - `metrics`: 共享指标实例
-/// - `port`: 监听端口（回环地址 127.0.0.1:port）
-///
-/// # 设计
-/// 用最简 HTTP 响应（不引入 axum/actix 框架），直接裸 TCP 返回 JSON。
-/// 只监听 127.0.0.1，不暴露到外部网络。
-pub async fn serve(metrics: Arc<Metrics>, port: u16) {
-    let listener = match TcpListener::bind(("127.0.0.1", port)).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(error = %e, port, "指标端口监听失败");
-            return;
-        }
-    };
-    tracing::info!(port, "指标服务已启动");
-
-    loop {
-        // 接受连接，每连接返回一次指标 JSON
-        let (mut sock, addr) = match listener.accept().await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "指标端口 accept 失败");
-                continue;
-            }
-        };
-
-        let metrics = metrics.clone();
-        tokio::spawn(async move {
-            // 读取 HTTP 请求行（忽略内容，只关心返回响应）
-            let mut buf = [0u8; 256];
-            let _ = sock.read(&mut buf).await;
-
-            // 构造 HTTP 响应
-            let body = metrics.to_json();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-
-            let _ = sock.write_all(response.as_bytes()).await;
-            let _ = sock.flush().await;
-            let _ = addr; // 仅记录，不使用
-        });
-    }
+/// 渲染指标为 JSON 字符串（text/plain 简单格式）
+fn render_metrics_json() -> String {
+    let m = metrics();
+    serde_json::json!({
+        "active_connections": m.active_connections.load(Ordering::Relaxed),
+        "total_connections": m.total_connections.load(Ordering::Relaxed),
+        "active_sessions": m.active_sessions.load(Ordering::Relaxed),
+        "total_sessions": m.total_sessions.load(Ordering::Relaxed),
+        "tx_bytes": m.tx_bytes.load(Ordering::Relaxed),
+        "rx_bytes": m.rx_bytes.load(Ordering::Relaxed),
+        "auth_failures": m.auth_failures.load(Ordering::Relaxed),
+        "heartbeat_timeouts": m.heartbeat_timeouts.load(Ordering::Relaxed),
+        "last_rtt_ms": m.last_rtt_ms.load(Ordering::Relaxed),
+    })
+    .to_string()
 }

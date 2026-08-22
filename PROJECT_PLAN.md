@@ -262,7 +262,7 @@ srt-vpn/
 > - **SOCKS5 认证强制**：配置了认证时只接受 0x02 方法（has_auth 判定），修复认证可绕过漏洞
 > - passwall 侧接入：组件更新（com.lua）+ 节点类型（7_srt-vpn.lua）+ app.sh srtvpn 分支 + util_srt-vpn.lua，见 openwrt-passwall-srt-vpn 仓库
 
-### PX（重构，2026-08-20 启动）：Rust 自研 QUIC 语义内核 + 手写 SRT 全仿外壳
+### PX（重构，2026-08-20 启动，已归档，自研已推翻）：Rust 自研 QUIC 语义内核 + 手写 SRT 全仿外壳（历史，见 docs/refactor/REFACTOR_PLAN_v3/v4，v0.5.0 已回归 libsrt）
 
 > 触发：libsrt 拥塞控制是单连接级单窗口（FileCC/LiveCC），多线程并发共享窗口，公网高 RTT 下单连接带宽结构性封顶，多轮无法根治。
 > 决策经 grilling 盘问达成（详细设计见 docs/refactor/REFACTOR_PLAN_v3.md），用户已认可。
@@ -297,6 +297,39 @@ srt-vpn/
 | F | 流控 | 单连接共享拥塞窗口（学 QUIC 流控即跑满带宽） |
 | G | 前端 | socks5/HTTP/UDP 代理功能一致，复用现有分层接口 |
 | H | passwall | 重构后按新核心再适配（不锁定旧套壳） |
+
+
+### v0.5.0 回归 libsrt 1.5.6 单连接多路复用（2026-08-22 22:40，推翻自研，见 docs/refactor/REFACTOR_PLAN_v5.md）
+
+> 触发：自研多轮修复无法根治（用户 grilling 15 题），首版 libsrt 多线上传卡死坑未结构性解决；用户提醒 SRT 单向推送优化，回包未知。
+
+- [x]  grilling 15 题收敛（Q1-Q15 全 A，Q15 双工：加 16DL+16UL 同时压测，互踩再考虑双连接隔离）
+- [x]  删除 `src/transport` `src/tuic` 及 TLS 证书污染，`fc426c4` 基线恢复 `build.rs`/`Cargo.toml 0.5.0`/`src/srt`/`tunnel`/`auth`
+- [x]  单连接+变长帧 `ver|type|sid|len` + `SND32M/RCV11M≤FC65536/UDP4M/8M` + `SRTT_FILE+TSBPD0+inorder1` + 单发单收串行化（`MJ_AGAIN 100μs 重试`）+ `S1/S5/S6` 三件套
+- [x]  本地回环 `30` 单测 + `release 5.0M` + 16 线并发与双向同时验证全过：
+  - 单线程 10M DL `0.13s` UL `1.20s` 100M DL `1.04s` 全 MD5 一致
+  - 16DL `1.80s 93.2 MB/s` 16UL `3.02s 55.6 MB/s` 全过（多线卡死根治）
+  - 双向同时 `16DL+16UL 3.94s 85.3 MB/s 32/32` 无互踩（`Q15` 未触发）
+  - `4×100M DL 92.7/UL 70.3` 双向同时 `83.2` 全过
+
+> 结论：SRT 双向经独立 `RcvQueue + per-socket FileCC` 未互踩，单连接公平，`Q15` 无需双连接隔离。
+
+| # | 决策 | 结论（v0.5.0 15 题） |
+|---|------|---------------------|
+| Q1 | 重构方向 | 推翻自研，回归 libsrt |
+| Q2 | 集成 | 源码内嵌静态编译 `srt-1.5.6` |
+| Q3/Q12 | 伪装 | 原生 libsrt 即 SRT，不叠 RTP |
+| Q4 | 并发 | 单连接 256 会话多路复用 |
+| Q5 | 删除范围 | 全删 `transport/tuic` |
+| Q6 | 参数 | `SRTT_FILE+TSBPD0+16M` 等 |
+| Q7 | 帧 | 变长 `ver|type|sid|len` |
+| Q8 | 线程 | 单发单收 `mpsc` 串行化 |
+| Q9 | 调度 | 轮询 `256K` 窗口 + 讣告 |
+| Q10 | 有序 | `inorder=1` |
+| Q11 | 认证 | `passphrase+streamid+HMAC 90s` |
+| Q13 | 验收 | `16×100M 全 MD5 + 50MB/s+` |
+| Q14 | 节奏 | 本地→hk2→passwall 分层 |
+| Q15 | 双工 | 加双向同时压测（已验无互踩） |
 
 ### P2（规划：重构后更新）：TUN 模式 + iptables NAT + 动态 PID + 黑名单
 

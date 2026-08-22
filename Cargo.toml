@@ -1,42 +1,35 @@
 [package]
 name = "srt-vpn"
-version = "0.4.8"
+version = "0.5.0"
 edition = "2021"
-description = "SRT 外壳伪装 + quinn-proto QUIC 内核 + TUIC 协议语义 VPN（2026-08-21 重构，单密码兼容）"
+description = "回归 libsrt 1.5.6 单连接多路复用 VPN（专注稳定高多线带宽，不叠 RTP）"
 license = "MIT"
+build = "build.rs"
 
 [dependencies]
-# CLI 参数解析（-c / -V / -h，保持 passwall 契约：-V 输出 "srt-vpn <version>"）
+# CLI 参数解析（-c / -m / -v / -h + SOCKS5 完整参数）
 clap = { version = "4", features = ["derive"] }
-# 配置加载（JSON 语法，TUIC 原生字段名）
+# 配置加载（JSON 语法，server.conf / client.json 统一 schema）
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# 异步运行时（I/O 驱动循环 + SOCKS5 入口）
+# 异步运行时（客户端/服务器事件循环）
 tokio = { version = "1", features = ["full"] }
-# QUIC 传输内核（成熟状态机，无 I/O；自管 UdpSocket + tokio select! 桥接）
-quinn-proto = "0.11"
-# QUIC 依赖的 TLS 实现（rustls，用于 TLS 1.3 握手 + RFC5705 exporter 认证）
-rustls = "0.23"
-rustls-pemfile = "2"
-# QUIC UDP 收发（quinn-proto 的 Transmit/RecvMeta 类型来源）
-quinn-udp = "0.5"
-# 字节缓冲（协议帧编解码、流读写）
-bytes = "1"
-# UUID（TUIC 认证：UUID 标识用户，serde 支持配置文件序列化）
-uuid = { version = "1", features = ["v4", "serde"] }
-# 数据面包级加密（AES-128-CTR，AES-NI 硬件加速；加密 QUIC 包后套 SRT 壳）
-aes = "0.8"
-ctr = "0.9"
-# 密钥派生（passphrase → 临时密钥，PBKDF2）
-pbkdf2 = { version = "0.12", features = ["simple"] }
+# 多线程流控/队列
+crossbeam-channel = "0.5"
+# 密码学（argon2 哈希 + HMAC-SHA256 挑战-应答）
+argon2 = "0.5"
 hmac = "0.12"
 sha2 = "0.10"
-# 随机数（nonce 生成、临时密钥派生盐值）
 rand = "0.8"
-# SOCKS5 用户密码 argon2 哈希（服务端多用户认证）
-argon2 = "0.5"
-# 日志（JSON 结构化日志 → stdout，passwall 重定向 stdout 到日志文件）
+# 日志（JSON 结构化日志）
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-# UDP socket 缓冲调优（SO_RCVBUF/SO_SNDBUF，高吞吐防接收缓冲溢出）
+# libc（sockaddr 等系统类型，SRT FFI 依赖）
 libc = "0.2"
+# 十六进制编码（令牌/校验）
+hex = "0.4"
+# 2026-08-19 L 级清理：移除 chrono/byteorder（全项目零引用：
+# 时间戳用 SystemTime，字节序用 to_be_bytes/from_be_bytes），减少编译依赖
+
+[build-dependencies]
+cc = "1"

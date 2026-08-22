@@ -2,6 +2,41 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-22 22:40] - v0.5.0 回归 libsrt 1.5.6 单连接多路复用（推翻自研，根治多线上传卡死）
+
+### 改动前总结
+- **自研传输层多轮修复无法根治**（用户原话，grilling 盘问 15 题收敛）：v0.3 自研 QUIC+SRT 壳 → v0.4 quinn-proto+TUIC+RTP/RTCP，经 BBR→CUBIC、丢包恢复、连接池、RTP/RTCP 伪装等多轮，标准 nDPI 已达标但首版 libsrt 时代“多线上传卡死（单线正常、下载正常）”的坑未在自研上得到结构性解决。
+- **现状 v0.4.8**：`src/transport`（quinn 驱动+AES+SRT/RTP 壳）+ `src/tuic`（TUIC 协议）已验证 nDPI RTP，但用户要求“删除自研核心所有代码重新开始，基于 srt 核心去修改 srt 流量外壳”，并提问“srt 是单向推送优化的，回包有没有优化我不知道”。
+- **SRT 单向性已验证**：`srt-1.5.6/srtcore` 为 `SndQueue/RcvQueue` 双队列 + `CSnd/RcvBuffer/LossList` 独立，但拥控 `SrtCongestion/FileCC/LiveCC/m_CongestionWindow/m_iFlowWindowSize` 仅约束发送侧 `packData/packUniqueData`，接收侧仅通过 ACK 的 `bufferLeft` 反压，对 VPN 全双工（下载+上传同时高吞吐）是否互踩未知。
+
+### 改动后总结
+1. **彻底推翻自研，回归 libsrt**（15 题全 A）：
+   - 删除 `src/transport/**` `src/tuic/**` 及 TUIC 证书 `configs/server.crt/key`。
+   - 恢复 `build.rs`（CMake 编译 `srt-1.5.6` 静态库，Alpine 依赖 `linux-headers+openssl-libs-static`，`std=c++`/`crypto`/`ssl`/`pthread`/`m`，`openssl_lib_dirs` 多路径兜底）。
+   - 精简 `Cargo.toml`：删 `quinn-proto/quinn-udp/rustls/aes/ctr/pbkdf2/uuid/bytes`，保留 `crossbeam-channel/argon2/hmac/sha2` 等，版本升 **0.5.0**（`srt-vpn 0.5.0`，释放后 `cargo build --release` 5.0M）。
+   - 目录回归 `src/srt/`（`bindings.rs`/`connection.rs`/`mod.rs`）+ `src/tunnel/`（`multiplex.rs` 15B 帧头 `SRTV`/`dispatch.rs`）+ `src/auth/`（`challenge.rs` 对时握手 `HMAC` 90s 窗）+ `src/client/server` 薄层。
+2. **单连接多路复用 + 变长帧 + 单发单收串行化（规避多线卡死）**：
+   - 帧格式 `ver1B|type1B|sid2B|len2B` + `payload≤1316`（`FRAME_DATA_MAX=1301`），变长直发（v0.4.5 定论，188B TS/1328B 固定包均放大带宽）。
+   - `srt/connection.rs`：`SRTT_FILE+TSBPD=0+MESSAGEAPI=1`（`FileCC` 最适突发），`SNDBUF=32M/RCVBUF=11M（约束 FC=65536≤12.3M）/UDP 4M/8M`，`srt_sendmsg(inorder=1)`，`run_send_loop` 单发线程 `mpsc unbounded → srt_sendmsg` 遇 `MJ_AGAIN` 100μs 重试不退线程（禁多线程并发抢 `SNDBUF`），`run_recv_loop` `epoll IN|ERR` 批量 `srt_recvmsg` → `tokio mpsc Unbounded`，`S1/S5/S6` 三件套（`AtomicBool CAS`/`eid` 归接收线程/`Once+atexit srt_cleanup+join`）。
+   - 调度：轮询 + 每 `sid 256K` 窗口背压 + 讣告（`Close/Rst` 必达，防僵尸会话白灌，2026-08-20 03:05）。
+3. **配置与 passwall 契约保持**：`configs/server.conf`（`listen/passphrase/crypto/udp_mode/max_clients/metrics_port/socks5_users`，`0.0.0.0:9000` 模板）`configs/client.json`（`server/passphrase/crypto/streamid/socks5/reconnect/heartbeat`）恢复 `fc426c4` 生产模板，`streamid` 令牌 `HMAC-SHA256`，`resolve_addr` 域名支持，`has_auth` 强制 `0x02`。
+4. **Q15 双工风险应对**：单连接保持，验收加 **双向同时压测**（`16DL 10M + 16UL 10M`、`4DL 100M + 4UL 100M` 同时跑），互踩则再考虑“正反向各一条 SRT 连接隔离”（多一条 UDP 流，`B` 方案备份）。
+
+### 验证
+- `cargo check` / `cargo test` **30/30** 通过（`challenge/auth` 对时握手 7+`forward` 分片 6+`dispatch/multiplex` 8+`heartbeat` 等），`cargo build --release` 通过（`srt-vpn 0.5.0` 5.0M，`./target/release/srt-vpn -V/-h` 正常）。
+- **本地回环（127.0.0.1:9000，`rmem_max/wmem_max=32M` 已调，`ThreadingHTTPServer 18080` + `ThreadingTCPServer 18081 PUT`）**：
+  - 单线程 10M 下载 **0.13s** MD5 `289b10bd` 一致、上传 **1.20s** 一致、100M 下载 **1.04s** `5b912714` 一致；直连基线下载 **0.02s** 上传 **1.04s**。
+  - `16 并发下载 10M` **1.80s** 全 MD5 一致、`93.2 MB/s`；`16 并发上传 10M PUT` **3.02s** 全一致、`55.6 MB/s`（**多线上传卡死已根治，16 线全过**）。
+  - **双向同时 `16DL 10M + 16UL 10M`** **3.94s** `DL 16/16`(1.02–2.78s) `UL 16/16`(2.73–3.78s) 全一致、聚合 **85.3 MB/s** **无互踩**（`DL` 参考 `93.2` `UL` 参考 `55.6`，双向 tot `85.3` 无饥饿）。
+  - `4 并发 100M` 下载 **4.5s** `92.7 MB/s` 全过、上传 **6.0s** `70.3 MB/s` 全过；**双向同时 `4DL 100M + 4UL 100M`** **10.1s** 聚合 **83.2 MB/s** `4/4+4/4` 全过。
+  - 结论：SRT 回包路径经独立 `RcvQueue + per-socket FileCC` 未互踩，当前单连接 + 变长帧 + 轮询 `256K` 调度公平，双向 `85+ MB/s`，**Q15 风险未触发，无需双连接隔离**。
+- `cargo build --release` 零警告，`docs/refactor/REFACTOR_PLAN_v5.md` 已固化 15 题共识。
+
+### 涉及文件
+- 删除 `src/transport/**` `src/tuic/**` `configs/server.crt` `configs/server.key` `configs/client_noauth_internal.json`
+- 恢复/重建 `build.rs` `Cargo.toml`(`0.5.0`) `src/srt/**` `src/tunnel/**` `src/auth/**` `configs/server.conf` `configs/client.json` `Dockerfile/.dockerignore`
+- 新增 `docs/refactor/REFACTOR_PLAN_v5.md`（15 题，Q15 双工）
+
 ## [2026-08-22 21:10] - v0.4.8 RTCP SR 注入（满足软路由 DPI 的 RTP+RTCP 成对识别）
 
 ### 改动前总结
