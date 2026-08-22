@@ -306,6 +306,8 @@ pub enum SrtError {
     TooShort,
     /// 无效的控制包类型
     InvalidCtrlType(u16),
+    /// 不是合法 RTP 包（V != 2，用于驱动区分 RTP 外壳与旧 SRT 外壳）
+    InvalidRtpVersion,
 }
 
 impl std::fmt::Display for SrtError {
@@ -313,6 +315,7 @@ impl std::fmt::Display for SrtError {
         match self {
             SrtError::TooShort => write!(f, "SRT 包数据太短（不足 16 字节头）"),
             SrtError::InvalidCtrlType(t) => write!(f, "无效 SRT 控制包类型: {}", t),
+            SrtError::InvalidRtpVersion => write!(f, "非 RTP 包（V != 2）"),
         }
     }
 }

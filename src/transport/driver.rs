@@ -5,17 +5,25 @@
 //!
 //! 数据流：
 //! ```
-//! 收包: UdpSocket.recv_from -> 去SRT头 -> AES解密 -> endpoint.handle()
-//! 发包: conn.poll_transmit -> AES加密 -> 套SRT头 -> socket.try_send_to
+//! 收包: UdpSocket.recv_from -> 去RTP头 -> 取包号 -> AES解密 -> endpoint.handle()
+//! 发包: conn.poll_transmit -> AES加密 -> [8B包号|密文] -> 套RTP头 -> socket.try_send_to
 //! ```
+//!
+//! ## v0.4.7 RTP 外壳（2026-08-22，伪装目标从 SRT 升级为 RTP）
+//!
+//! 抓包研究结论：真实 RTP 视频流（H264 PT=96 / 90000Hz）首字节固定 0x80（V=2），
+//! SEQ 连续 +1，TS 每帧跳 3000，M 帧尾置 1，SSRC 会话内不变；而 SRT 数据包首字节
+//! bit31=0（0x00-0x7F）被判"未知 UDP"。故将外壳改为 RFC3550 RTP 头（12B）：
+//! [V=2|P|X|CC][M|PT=96][SEQ 16b][TS 32b][SSRC 32b][8B包号|AES密文]。
+//! 接收端双模式兼容：首字节 V=2 按 RTP 解析，否则回退旧 SRT 外壳（升级期互通）。
 //!
 //! ## v2 重写修复的 bug（2026-08-21 传输层完整审查）
 //!
 //! 1. **MTU 探测失控（"too many gaps" 断连根因）**：
-//!    allow_mtud=true 在回环（MTU 65536）上探测出巨型 QUIC 包，加 16B SRT 头
+//!    allow_mtud=true 在回环（MTU 65536）上探测出巨型 QUIC 包，加 RTP 头
 //!    后超过对端 65535 接收缓冲被截断丢弃 -> 接收流缓冲大量空洞 -> 连接自杀。
 //!    修复：禁用 MTU 探测（mtu_discovery_config(None)），固定 initial_mtu=1200。
-//!    注意：SRT 头 16B 意味着 wire 上 1216B，仍在以太网 MTU 1500 内。
+//!    注意：RTP 头 12B 意味着 wire 上 1212B，仍在以太网 MTU 1500 内。
 //!
 //! 2. **发送阻塞接收（74KB/s 低速根因）**：
 //!    旧版 flush_sends 用 send_to().await，wmem 满（内核 wmem_max 默认 208KB
@@ -68,7 +76,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::transport::crypto::PacketCipher;
-use crate::transport::srt_shell::{pack_fixed_payload, unpack_fixed_payload, SrtPacket};
+use crate::transport::rtp_shell::{RTP_PKTNUM_LEN, RtpPacket};
+use crate::transport::srt_shell::SrtPacket;
 
 /// UDP 接收缓冲区大小（单个 UDP 数据报最大 65507 + 16B SRT 头）
 const RECV_BUF_SIZE: usize = 65535;
@@ -219,12 +228,10 @@ pub struct TransportDriver {
     pending_writes: VecDeque<PendingWrite>,
     /// 缓存的本地 IP（避免每包系统调用）
     cached_local_ip: Option<std::net::IpAddr>,
-    /// SRT 外壳 SEQ 计数器（替代每包 3 次 rand）
+    /// RTP 外壳序号（16bit，每包 +1，回绕，替代每包 rand）
     srt_seq: u32,
-    /// SRT 外壳时间戳（每包 +1ms 递增，拟真 RTP 节奏，避免随机跳变被识别为未知 UDP）
-    srt_timestamp: u32,
-    /// SRT socket ID（每连接随机，拟真多路 SRT 会话）
-    srt_socket_id: u32,
+    /// RTP SSRC（同步源 ID，每连接随机固定，RTP 会话内不变）
+    rtp_ssrc: u32,
     /// 是否有 socket 可写事件待处理（发送 EAGAIN 后置位）
     send_blocked: bool,
     /// EAGAIN 时重排队的 QUIC 包（QUIC 包不能丢，丢了破坏状态机）
@@ -288,8 +295,7 @@ impl TransportDriver {
             pending_writes: VecDeque::new(),
             cached_local_ip: None,
             srt_seq: 0,
-            srt_timestamp: srt_timestamp(),
-            srt_socket_id: rand::random::<u32>() | 0x10000, // 非零拟真 ID
+            rtp_ssrc: rand::random::<u32>() | 0x8000_0000, // SSRC 高位通常非 0 拟真
             send_blocked: false,
             queued_packet: None,
         })
@@ -348,8 +354,7 @@ impl TransportDriver {
             pending_writes: VecDeque::new(),
             cached_local_ip: None,
             srt_seq: 0,
-            srt_timestamp: srt_timestamp(),
-            srt_socket_id: rand::random::<u32>() | 0x10000,
+            rtp_ssrc: rand::random::<u32>() | 0x8000_0000,
             send_blocked: false,
             queued_packet: None,
         })
@@ -495,30 +500,52 @@ impl TransportDriver {
 
     /// 处理接收到的 UDP 包
     ///
-    /// 数据流: UDP recv -> 去SRT头 -> AES解密 -> endpoint.handle()
+    /// 数据流: UDP recv -> 去RTP外壳 -> 取包号 -> AES解密 -> endpoint.handle()
+    ///
+    /// 兼容双模式：
+    /// - RTP 外壳（新，v0.4.7+）：首字节 V=2（0x80），负载 [8B 包号][密文]
+    /// - SRT 外壳（旧，历史）：首字节 bit31=0/1，packet_num 在 msg_no 字段，
+    ///   固定包按 2B 长度前缀还原（升级期间双端版本可能交错，必须兼容）
     fn handle_recv(&mut self, data: &[u8], src_addr: SocketAddr, send_buf: &mut Vec<u8>) {
         // 服务端学习对端地址（用于 accept 时路由；客户端固定）
         if self.is_server && self.peer_addr.is_none() {
             self.peer_addr = Some(src_addr);
         }
 
-        // 1. 去掉 SRT 外壳
-        let srt_packet = match SrtPacket::decode(data) {
-            Ok(pkt) => pkt,
-            Err(_) => return, // 非 SRT 包静默丢弃（可能是端口扫描）
-        };
-
-        // 2. AES 解密（packet_num 从 SRT 头 msg_no 字段读取；固定包需按 2B 前缀还原密文）
-        let packet_num = match &srt_packet {
-            SrtPacket::Data { msg_no, .. } => *msg_no as u64,
-            SrtPacket::Control { msg_no, .. } => *msg_no as u64,
-        };
-        let payload_bytes = srt_packet.payload().to_vec();
-        let ciphertext = if payload_bytes.len() == crate::transport::srt_shell::SRT_DATA_PAYLOAD_SIZE {
-            unpack_fixed_payload(&payload_bytes)
+        // 1. 优先按 RTP 外壳解析（V=2，首字节 0x80-0xBF）
+        let packet_num: u64;
+        let ciphertext: Vec<u8>;
+        if data.len() >= crate::transport::rtp_shell::RTP_HEADER_LEN
+            && (data[0] >> 6) & 0x3 == 2
+        {
+            let rtp = match RtpPacket::decode(data) {
+                Ok(p) => p,
+                Err(_) => return, // 非 RTP 包静默丢弃
+            };
+            packet_num = match rtp.packet_num() {
+                Some(n) => n,
+                None => return, // 载荷缺包号前缀
+            };
+            ciphertext = rtp.ciphertext().to_vec();
         } else {
-            payload_bytes
-        };
+            // 2. 回退旧 SRT 外壳（升级期间兼容旧对端）
+            let srt_packet = match SrtPacket::decode(data) {
+                Ok(pkt) => pkt,
+                Err(_) => return, // 非 SRT 包静默丢弃（可能是端口扫描）
+            };
+            packet_num = match &srt_packet {
+                SrtPacket::Data { msg_no, .. } => *msg_no as u64,
+                SrtPacket::Control { msg_no, .. } => *msg_no as u64,
+            };
+            let payload_bytes = srt_packet.payload().to_vec();
+            ciphertext = if payload_bytes.len() == crate::transport::srt_shell::SRT_DATA_PAYLOAD_SIZE {
+                crate::transport::srt_shell::unpack_fixed_payload(&payload_bytes)
+            } else {
+                payload_bytes
+            };
+        }
+
+        // 3. AES 解密（nonce = [连接前缀][包号]，见 crypto.rs）
         let plaintext = match self
             .cipher
             .decrypt_with_nonce(&ciphertext, self.cipher.conn_prefix(), packet_num)
@@ -527,7 +554,7 @@ impl TransportDriver {
             Err(_) => return, // 解密失败静默丢弃
         };
 
-        // 3. 喂给 quinn-proto Endpoint 处理
+        // 4. 喂给 quinn-proto Endpoint 处理
         let now = Instant::now();
         let data_mut = BytesMut::from(&plaintext[..]);
         if let Some(event) = self.endpoint.handle(
@@ -1174,45 +1201,28 @@ impl TransportDriver {
         sent_any
     }
 
-    /// 是否启用固定载荷模式（SRT_FIXED_PAYLOAD=1）
+    /// 加密 + 套 RTP 壳 + 非阻塞发送一个 wire 包
     ///
-    /// 默认关闭：变长直发贴近 quinn/TUIC 原生（ACK 不放大，带宽最优）。
-    /// 开启后所有数据包 pad 到 1312B 拟真 SRT live 1328 包长（牺牲带宽换伪装）。
-    fn fixed_payload_enabled() -> bool {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var("SRT_FIXED_PAYLOAD").map(|v| v == "1").unwrap_or(false))
-    }
-
-    /// 加密 + 套 SRT 壳 + 非阻塞发送一个 wire 包
-    ///
-    /// 载荷策略（SRT_FIXED_PAYLOAD=1 时固定 1312B 拟真 SRT live 1328 包长）：
-    /// - 默认变长直发（贴近 quinn/TUIC 原生流控，ACK 小包不放大 23 倍，带宽最优）
-    /// - 固定模式 ACK 55B→1344B 放大严重且 pad 浪费 7%，公网实测效率仅直连 80% 且大流量截断
+    /// 载荷格式：[8B 包号 BE][AES-128-CTR 密文]
+    /// - 包号前缀让接收方恢复 AES nonce（[连接前缀][包号]，见 crypto.rs）
+    /// - RTP 头 12B：V=2 首字节 0x80，PT=96，SEQ 连续 +1，TS 按 90000Hz 30fps
+    ///   节奏（每 2 包一帧），SSRC 连接级固定 → DPI 识别为 RTP 视频流
+    /// - 变长直发（贴近 quinn/TUIC 原生流控，ACK 小包不放大，带宽最优）
     fn send_wire_packet(&mut self, dst: &SocketAddr, quic_packet: &[u8]) -> bool {
-        // 1. AES 加密（packet_num 嵌入 SRT 头 msg_no 供接收方解密）
+        // 1. AES 加密（包号嵌入 RTP 载荷前缀供接收方解密）
         let (ciphertext, packet_num) = self.cipher.encrypt(quic_packet);
 
-        // 2. 载荷：默认变长；SRT_FIXED_PAYLOAD=1 才用固定 1312B（2B 长度前缀+密文+0填充）
-        let payload = if Self::fixed_payload_enabled() && ciphertext.len() + 2 <= crate::transport::srt_shell::SRT_DATA_PAYLOAD_SIZE {
-            pack_fixed_payload(&ciphertext)
-        } else {
-            ciphertext
-        };
+        // 2. 载荷：[8B 包号 BE][密文]
+        let mut payload = Vec::with_capacity(RTP_PKTNUM_LEN + ciphertext.len());
+        payload.extend_from_slice(&packet_num.to_be_bytes());
+        payload.extend_from_slice(&ciphertext);
 
-        // 3. 套 SRT 外壳（数据包形式，bit31=0，SEQ 递增、timestamp 每包 +1ms、固定 socket_id）
-        self.srt_seq = self.srt_seq.wrapping_add(1) & 0x7FFFFFFF;
-        // 时间戳按包递增 1000µs（1ms）模拟 90kHz RTP 节奏，避免随机跳变被判未知 UDP
-        self.srt_timestamp = self.srt_timestamp.wrapping_add(1000);
-        let srt_packet = SrtPacket::data(
-            self.srt_seq,
-            packet_num as u32, // packet_num 存入 msg_no
-            self.srt_timestamp,
-            self.srt_socket_id,
-            payload,
-        );
-        let wire_data = srt_packet.encode();
+        // 3. 套 RTP 外壳（SEQ 连续 +1、SSRC 固定，视频节奏）
+        self.srt_seq = self.srt_seq.wrapping_add(1);
+        let rtp_packet = RtpPacket::data(self.srt_seq as u16, self.rtp_ssrc, payload);
+        let wire_data = rtp_packet.encode();
 
-        // 3. 非阻塞发送（EAGAIN 返回 false，绝不阻塞 driver）
+        // 4. 非阻塞发送（EAGAIN 返回 false，绝不阻塞 driver）
         match self.socket.try_send_to(&wire_data, *dst) {
             Ok(_) => true,
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
@@ -1278,7 +1288,7 @@ impl TransportDriver {
 ///
 /// 关键修复：
 /// - mtu_discovery_config(None)：禁用 MTU 探测（"too many gaps" 根因）
-/// - initial_mtu=1200：QUIC 包最大 1200B + 16B SRT 头 = 1216B wire，
+/// - initial_mtu=1200：QUIC 包最大 1200B + 12B RTP 头 = 1212B wire，
 ///   以太网 MTU 1500 内不分片
 /// v0.4.3 优化：窗口从 10M->32M/8M，提升高 RTT 链路带宽（本地 52->50MB/s 保量，公网 40ms RTT 下 BDP 需大窗口）
 fn build_transport_config() -> TransportConfig {
@@ -1297,14 +1307,6 @@ fn build_transport_config() -> TransportConfig {
         .initial_mtu(1200)
         .min_mtu(1200);
     config
-}
-
-/// 生成当前微秒时间戳（相对程序启动）
-fn srt_timestamp() -> u32 {
-    use std::sync::OnceLock;
-    static START: OnceLock<Instant> = OnceLock::new();
-    let start = START.get_or_init(Instant::now);
-    (start.elapsed().as_micros() as u32)
 }
 
 /// 跳过 TLS 证书验证（QUIC 明文已被 AES 加密覆盖，认证由 TUIC 协议保证）

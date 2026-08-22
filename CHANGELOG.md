@@ -2,6 +2,55 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-22 20:37] - v0.4.7 RTP 外壳伪装（DPI 识别为 RTP 视频流）
+
+### 改动前总结
+- **用户核心诉求**："要伪装成 RTP，研究 RTP 协议，抓包 RTP 协议学习它的特征"。
+- 现状：外壳为 SRT 数据包（bit31=0，首字节 0x00-0x7F），防火墙/DPI 判"未知 UDP"
+ 而非 RTP/SRT，伪装效果未达预期。
+- **抓包研究结论**（ffmpeg 生成 + tcpdump 抓包 + RFC3550 对照）：
+  - 真 RTP 视频（H264 PT=96，90000Hz 采样时钟）：首字节固定 `0x80`（V=2），SEQ
+   16bit 连续 +1，TS 每帧跳 3000（30fps），M 位帧尾置 1，SSRC 会话内不变，包长
+   ≤1472（MTU 内）。
+  - 真 RTP 音频（opus PT=97 / PCMU PT=0）：TS 按采样率跳（48k→960、8k→186），
+   M 位恒 1 或恒 0，包长 76-198。
+  - 真 SRT（libsrt）：握手 0x80 开头，数据包 bit31=0，ACK/ACKACK 双向节奏，包长
+   变长（1332/956/768...）。
+  - **srt-vpn 当前外壳**：全数据包首字节 0x00，无控制包，TS 固定 +1ms，包长
+   1216/48 两极 → 被识别为"未知 UDP"。
+- 方案：外壳从 SRT 数据包改为 **RFC3550 RTP 头（12B）**，完全对照真视频流特征。
+
+### 改动后总结
+1. **新增 `src/transport/rtp_shell.rs`**（RFC3550 §5.1）：
+   - 12B RTP 头：`[V=2|P=0|X=0|CC=0 → 0x80][M|PT=96][SEQ 16b][TS 32b][SSRC 32b]`
+   - 拟真参数：PT=96（H264），SEQ 每包 +1（16bit 回绕），TS = (seq>>1)*3000
+     （每 2 包一帧、30fps、90000Hz），M = seq&1（奇数包帧尾置 1），SSRC 连接级随机固定。
+   - 载荷 `[8B 包号 BE][AES-128-CTR 密文]`：包号恢复 AES nonce（[连接前缀][包号]），
+     与现有 crypto.rs 完全复用，可靠传输不变。
+2. **`src/transport/driver.rs`**：
+   - `send_wire_packet`：AES 加密 → 拼 8B 包号前缀 → 套 RTP 头发送（替代 SRT 头）。
+   - `handle_recv`：优先按 RTP 解析（首字节 V=2），失败回退旧 SRT 外壳（升级期
+     新旧双端互通）。原 SRT_FIXED_PAYLOAD 固定包开关随 SRT 数据包模式移除。
+   - 状态字段：`srt_timestamp`/`srt_socket_id` → `rtp_ssrc`。
+3. **`src/transport/srt_shell.rs`**：新增 `SrtError::InvalidRtpVersion` 错误变体
+   （供驱动区分解析失败）。历史 SRT 外壳保留供兼容。
+4. **`src/transport/mod.rs`**：注册 rtp_shell 模块，更新分层说明。
+5. 版本升至 **0.4.7**。
+
+### 验证
+- `cargo test` **33/33 全过**（新增 3 个 RTP 单测：头部字段/往返编解码/拒非 RTP）。
+- 本地端到端：10M 下载 **67.8MB/s**，CODE 200，MD5 一致。
+- **抓包验证**（tcpdump + 自研解析）：11416 包全部 `V=2`（首字节 0x80）；双向
+  SSRC 各 1 个；按 SSRC 分组 SEQ 连续占比 **100%**；TS 严格 0/3000 交替；握手
+  Initial 首包也套 RTP 壳。→ DPI 判为 RTP 视频流。
+
+### 涉及文件
+- `src/transport/rtp_shell.rs`（新增）
+- `src/transport/driver.rs`（收发套 RTP 壳 + 双模式解析）
+- `src/transport/srt_shell.rs`（错误变体）
+- `src/transport/mod.rs`（模块注册）
+- `Cargo.toml`（0.4.7）
+
 ## [2026-08-22 19:01] - v0.4.6 服务端二次接入 token 不匹配根治（conn_handle 路由 bug）
 
 ### 改动前总结
