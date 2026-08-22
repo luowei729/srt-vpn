@@ -2,6 +2,39 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-22 19:01] - v0.4.6 服务端二次接入 token 不匹配根治（conn_handle 路由 bug）
+
+### 改动前总结
+- **v0.4.5 部署 hk2 后公网 10M 下载仅 36-108KB/s 且 MD5 不一致**，直连基线同期
+ 5.6MB/s 正常，排除链路波动。
+- **服务端日志再次出现"客户端认证失败（token 不匹配）"**：v0.4.5 双端同版本、配
+ 置一致，但 hk2 第二次连接必失败——而本地同版本测试却成功。
+- **本地复现锁定根因**：同一服务端进程，第二个客户端连接 auth 必失败（确定性
+ bug，与网络无关）。时间线证据：hk2 容器 10:44 第一个连接 auth 成功、10:47 第二个
+ 连接失败；本地"杀客户端重开连同一服务端"完全复现。
+- **代码级根因**：`driver.rs handle_datagram_event` 的 NewConnection 分支中，
+ `conn_handle` 只在 `is_none()` 时设置。服务端接受第二个连接后，`conn_handle` 仍
+ 指向第一个连接。认证的 `ExportKeyingMaterial` 请求无 stream_id，按 `conn_handle`
+ 路由 → 被路由到**第一个连接的 TLS session** → exporter 输出基于错误握手材料 →
+ 与客户端 token 必然不匹配。旧连接 Drained 清理（v0.4.5 新增）把 conn_handle 置
+ None 的时机与新连接到达交错，导致问题间歇出现。
+
+### 改动后总结
+1. **conn_handle 总是指向最新连接**（src/transport/driver.rs）：服务端单客户端场
+ 景下，新连接 accept 成功即更新 `self.conn_handle = Some(conn_handle)`，不再依赖
+ is_none() 判断。配合 v0.4.5 的 Drained 清理，断连→重连→认证全链路闭环。
+2. 版本升至 **0.4.6**。
+
+### 验证
+- 本地复现场景修复确认：同一服务端进程两次客户端接入，**两次均"认证成功"**
+ （修复前第二次必失败）；第二轮下载 76.5MB/s CODE 200 MD5 一致。
+- `cargo test` 30/30 全过，release 零错误。
+- hk2 升级 v0.4.6 后公网复测进行中。
+
+### 涉及文件
+- `src/transport/driver.rs`（NewConnection 分支 conn_handle 更新逻辑）
+- `Cargo.toml`（0.4.6）
+
 ## [2026-08-22 18:24] - v0.4.5 变长包 A/B 实验落地 + 断连重连链路三处修复
 
 ### 改动前总结

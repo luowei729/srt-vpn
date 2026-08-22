@@ -557,10 +557,13 @@ impl TransportDriver {
                         Ok((conn_handle, conn)) => {
                             tracing::info!(?remote, ?conn_handle, "新连接接入");
                             self.connections.insert(conn_handle, conn);
-                            // 更新主连接句柄（单客户端服务端场景）
-                            if self.conn_handle.is_none() {
-                                self.conn_handle = Some(conn_handle);
-                            }
+                            // 服务端单客户端场景：总是把主连接句柄指向最新连接。
+                            // 修复：旧逻辑只在 is_none() 时设置，导致客户端重连后
+                            // ExportKeyingMaterial/Close 等无 stream_id 的请求仍路由到
+                            // 第一个（已死）连接的 TLS session，token 派生不一致 →
+                            // "认证失败（token 不匹配）"。旧连接 Drained 时会被清为
+                            // None，但新旧连接事件可能交错，必须以最新为准。
+                            self.conn_handle = Some(conn_handle);
                         }
                         Err(e) => {
                             tracing::warn!(error = ?e, "接受连接失败");

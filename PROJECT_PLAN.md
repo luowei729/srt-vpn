@@ -280,6 +280,7 @@ srt-vpn/
 - [x] **v0.4.0 推翻重做（2026-08-21 启动，传输层 v2 定版）**：自研 quic/srt_shell 全删，改用 `quinn-proto` 成熟 QUIC 状态机 + 自研 TUIC 协议层（~500 行）+ 包级 AES-128-CTR+SRT 0x80 外壳（双阶段密钥派生，线路上无 QUIC/TLS 明文）。**7 项血泪教训根治**（详见 CHANGELOG 2026-08-21 09:17）：
   单次 10M/100M 下载 53/52 MB/s、上传 40/47 MB/s，8 并发下载 1 唯一 MD5、4 并发上传 4/4 OK，30 单测+双端零告警。
 - [x] **v0.4.5 变长包定论 + 断连重连修复（2026-08-22 18:24）**：hk2 A/B 实验证明固定 1328 包是公网带宽杀手（ACK 放大 23.6 倍，54.6s 超时 vs 直连 1.15s），默认改回变长直发（贴近 quinn/TUIC 原生），`SRT_FIXED_PAYLOAD=1` 可选拟真。同时修复断连感知链三处：驱动 Drained 清理 / socks5 ConnectionLost 退出 / connect_and_serve 返回 Err（auth 失败自动重连闭环验证 attempt 1→4）。本地回环回归 76MB/s MD5 一致。详见 CHANGELOG 2026-08-22 18:24。
+- [x] **v0.4.6 conn_handle 路由 bug 根治（2026-08-22 19:01）**：服务端二次接入 token 不匹配根因为 NewConnection 分支只在 is_none() 时更新 conn_handle → ExportKeyingMaterial 路由到旧连接 TLS session。修复为总是指向最新连接。本地 100% 复现→修复→验证闭环（两次接入均成功，76.5MB/s MD5 一致）。详见 CHANGELOG。
 - [ ] **P2 部署与 passwall**：passwall 适配新核心 + Docker/CI + 公网多线程 + SRT 特征抓包验证
 
 ### 重构共识决策表（grilling 收束，2026-08-20）
