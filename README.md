@@ -1,14 +1,14 @@
 # SRT-VPN
 
-基于 **SRT 直播流协议** 的 VPN 隧道：**quinn-proto QUIC 内核 + TUIC 协议语义 + SRT 深度仿真外壳 + 包级 AES 加密**
-（2026-08-21 重构定版，v0.4.0，详见 `docs/refactor/REFACTOR_PLAN_v4.md` 与 `CHANGELOG.md` 2026-08-21 条目）。
+基于 **SRT 直播流协议** 的 VPN 隧道：**libsrt 1.5.6 单连接多路复用（专注稳定高多线带宽，不叠 RTP）**
+（2026-08-22 回归定版，v0.5.0，见 `docs/refactor/REFACTOR_PLAN_v5.md` 与 `CHANGELOG.md` 2026-08-22 22:40 条目；v0.4.x 自研 quinn-proto+TUIC+RTP 已归档）。
 
-> 架构：`quinn-proto`（成熟 QUIC 状态机，无 I/O）+ 自管 `UdpSocket`（tokio `select!` 桥接）+ TUIC 协议层（~500 行，不引入 wind）+ I/O 薄层 AES-128-CTR 加密后套 SRT 0x80 外壳。线路上只看到 SRT 壳+密文，DPI 看不到 QUIC/TLS 明文。单 QUIC 连接 stream 多路复用，无连接池。
+> 架构：`libsrt 1.5.6` 源码内嵌静态编译（`build.rs` CMake + `srt-1.5.6/`）+ 单 SRT 连接 `src/srt`（SRT FFI + 单发单收串行化 `mpsc→srt_sendmsg MJ_AGAIN 100μs 重试`）+ 多路复用 `src/tunnel`（变长帧 `ver|type|sid|len` + 轮询256K窗口+讣告）+ 三件套认证 `src/auth`（`passphrase+streamid+HMAC 90s` 对时握手）。单 UDP 流伪装最好，`S1/S5/S6` 三件套保稳定。已验：`16DL 93.2/16UL 55.6 双向同时 85.3 MB/s 32/32 无互踩`。
 
-- **服务端**：监听 UDP 端口，TUIC 认证（UUID+password→TLS exporter token）后为多个客户端提供直连转发
+- **服务端**：监听 UDP 端口，`streamid` 令牌 + `HMAC` 挑战-应答对时握手（90s 窗，防重放）后为多客户端提供直连转发
 - **客户端**：SOCKS5 + HTTP + HTTPS 三合一代理入口（首字节嗅探，同端口），经加密隧道到服务器
-- **协议**：TUIC 5 命令（Auth/Connect/Packet/Dissociate/Heartbeat）+ Address（Domain/IPv4/IPv6）+ UDP 分片重组
-- **传输**：quinn-proto 驱动循环（批量收包/非阻塞发包/超时重传/Writable 重试/固定 MTU 1200）
+- **协议**：复用层 15B 帧头（`SRTV` Magic + `ver|type|sid|len|seq|flags`）+ UDP 分片重组（`0xFF` 标记）+ 三件套认证（`passphrase/streamid/HMAC`）
+- **传输**：`SRTT_FILE` FileCC + 单发单收串行化（`crossbeam mpsc` → `srt_sendmsg inorder=1`，`MJ_AGAIN` 自旋重试）+ `epoll IN|ERR` 批量 `srt_recvmsg` → `tokio mpsc`，`SND32M/RCV11M≤FC65536/UDP4M/8M`，`rmem_max≥32M`
 - **性能**：本机回环 `93.2 MB/s（16DL）/55.6 MB/s（16UL）/双向同时 85.3 MB/s 32/32 无互踩`（10M/100M MD5 一致，`4×100M DL 92.7/UL 70.3 双向 83.2` 全过，30 单测零告警，`release 5.0M`）
 
 ---
@@ -191,11 +191,12 @@ src/
   srt/           libsrt FFI 封装（bindings.rs / connection.rs 单发单收 + FileCC 16M）
   tunnel/        多路复用层（multiplex.rs 15B 帧头 + dispatch.rs 会话事件型 + 讣告）
   auth/          三件套认证（challenge.rs 对时握手 90s 窗 + mod.rs argon2）
-  client/        SOCKS5 + HTTP/HTTPS 三合一代理入口（socks5.rs + proxy.rs + mod.rs）
-  server/        监听 + 认证 + 转发（mod.rs + auth.rs + forward.rs）
+  client/        SOCKS5 + HTTP/HTTPS 三合一代理入口（socks5.rs + proxy.rs + http_proxy.rs + mod.rs）
+  server/        监听 + 认证 + 转发（mod.rs + listener.rs 常驻 + forward.rs TCP/UDP 双栈）
   cli.rs / config.rs / logging.rs / main.rs / metrics.rs
-configs/        示例配置（server.conf / client.json）
+configs/        示例配置（server.conf / client.json，`fc426c4` 生产模板）
 deploy/          systemd 单元
+docs/refactor/   重构设计（REFACTOR_PLAN_v5.md 15题共识，Q15 双工）
 ```
 
 ---
