@@ -2,6 +2,53 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-22 18:24] - v0.4.5 变长包 A/B 实验落地 + 断连重连链路三处修复
+
+### 改动前总结
+- **A/B 对照实验结论（hk2 公网 103.244.89.78，10M 下载）**：
+  - **A 组变长包（默认新行为）**：1.43s 即传完但 exit 18 截断——根因是 hk2 服务端
+  仍跑 v0.4.4 旧镜像，认证失败后 `request_close` 只关连接不通知客户端，客户端不知
+  情继续在死连接上灌数据导致截断；
+  - **B 组固定包（SRT_FIXED_PAYLOAD=1）**：54.6s 超时（exit 28），速度远低于直连
+  基线 9.1MB/s/1.15s——**确认固定 1328 包是公网带宽杀手**（ACK 55B 被放大至
+  1344B ≈23.6 倍 + pad 浪费 7%），与用户"hy1 能跑 60-80M 而我们慢"的观察吻合。
+- **认证失败僵尸连接 bug**：服务端日志反复出现"客户端认证失败（token 不匹配）"
+ 但连接继续工作。排查发现三层问题：① 服务端 auth 失败后 `conn.close()` 了，但驱
+ 动从不处理 quinn-proto 的 `Drained` 端点事件，`connections` 死条目永久泄漏；② 客
+ 户端 `socks5::serve` 收到 ConnectionLost 只打日志不退出，代理还活着；③ 客户端
+ `connect_and_serve` 的 select! 无论谁退出都返回 `Ok(())`，`run()` 视为"正常关闭"
+ 不重连。
+
+### 改动后总结
+1. **SRT_FIXED_PAYLOAD 开关（src/transport/driver.rs send_wire_packet）**：默认
+ 变长直发（贴近 quinn/TUIC 原生流控，ACK 不放大、无 pad 浪费）；设
+ `SRT_FIXED_PAYLOAD=1` 才启用固定 1312B 拟真模式。解密端按载荷长度自适应（等于
+ SRT_DATA_PAYLOAD_SIZE 才走 unpack_fixed_payload），新旧版本互通兼容。
+2. **Drained 清理（driver.rs poll_endpoint_events）**：endpoint 返回 Drained 时
+ 同步 remove connections 条目 + 清 stream_route + 清 conn_handle，杜绝死连接泄漏。
+3. **auth 失败语义（src/server/mod.rs）**：保持 request_close（配合 #2 现在真正生
+ 效），服务端日志不变。
+4. **断连感知（src/client/socks5.rs）**：ConnectionLost 时 serve 返回 Err 退出，
+ 让 select! 结束。
+5. **重连语义（src/client/mod.rs connect_and_serve）**：select! 任一子任务退出返
+ 回 `Err(原因)` 触发 run() 重连循环；不再误报"连接正常关闭"。
+6. 版本升至 **0.4.5**。
+
+### 验证
+- `cargo test` **30/30 全过**，release 零错误（存量 warning 为 tuic/ 模块遗留，
+ 本次未新增）。
+- **场景1 auth 失败自动重连**：本地错误密码服务端 → 客户端 attempt 1→4 持续重连
+（此前卡死在 attempt 1）。
+- **场景2 本地回环回归**：10M 下载 **76.4 MB/s**、CODE 200、MD5 一致。
+- hk2 公网复测待新版 Docker 镜像部署后进行（预期变长包恢复直连级带宽）。
+
+### 涉及文件
+- `src/transport/driver.rs`（SRT_FIXED_PAYLOAD 开关 + Drained 清理）
+- `src/server/mod.rs`（auth 失败注释澄清）
+- `src/client/socks5.rs`（ConnectionLost 退出）
+- `src/client/mod.rs`（connect_and_serve 返回 Err）
+- `Cargo.toml`（0.4.5）
+
 ## [2026-08-21 18:20] - v0.4.4 转发批量 64K 优化（上传 8.5→46MB/s 达标）
 
 ### 改动前总结

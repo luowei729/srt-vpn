@@ -1031,7 +1031,18 @@ impl TransportDriver {
                 };
 
                 if let Some(event) = endpoint_event {
+                    // Drained：endpoint 已移除该连接的 CID 索引，驱动同步清理 connections
+                    // 条目（否则死连接条目永久泄漏，handle_request 路由到已关闭连接）
+                    let drained = event.is_drained();
                     if let Some(conn_event) = self.endpoint.handle_event(ch, event) {
+                        if drained {
+                            self.connections.remove(&ch);
+                            self.stream_route.retain(|_, h| *h != ch);
+                            if self.conn_handle == Some(ch) {
+                                self.conn_handle = None;
+                            }
+                            tracing::debug!(?ch, "连接已排空，清理驱动条目");
+                        }
                         if let Some(conn) = self.connections.get_mut(&ch) {
                             conn.handle_event(conn_event);
                         }
@@ -1160,16 +1171,30 @@ impl TransportDriver {
         sent_any
     }
 
+    /// 是否启用固定载荷模式（SRT_FIXED_PAYLOAD=1）
+    ///
+    /// 默认关闭：变长直发贴近 quinn/TUIC 原生（ACK 不放大，带宽最优）。
+    /// 开启后所有数据包 pad 到 1312B 拟真 SRT live 1328 包长（牺牲带宽换伪装）。
+    fn fixed_payload_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("SRT_FIXED_PAYLOAD").map(|v| v == "1").unwrap_or(false))
+    }
+
     /// 加密 + 套 SRT 壳 + 非阻塞发送一个 wire 包
     ///
-    /// 固定 wire 长度 1328B（SRT live 常见 1312+16），拟真 RTP/SRT 让防火墙识别为媒体流。
-    /// 返回 false 表示 EAGAIN（发送缓冲满，需等 writable）。
+    /// 载荷策略（SRT_FIXED_PAYLOAD=1 时固定 1312B 拟真 SRT live 1328 包长）：
+    /// - 默认变长直发（贴近 quinn/TUIC 原生流控，ACK 小包不放大 23 倍，带宽最优）
+    /// - 固定模式 ACK 55B→1344B 放大严重且 pad 浪费 7%，公网实测效率仅直连 80% 且大流量截断
     fn send_wire_packet(&mut self, dst: &SocketAddr, quic_packet: &[u8]) -> bool {
         // 1. AES 加密（packet_num 嵌入 SRT 头 msg_no 供接收方解密）
         let (ciphertext, packet_num) = self.cipher.encrypt(quic_packet);
 
-        // 2. 固定长度载荷（2B 长度前缀 + 密文 + 0 填充到 1312B）
-        let fixed_payload = pack_fixed_payload(&ciphertext);
+        // 2. 载荷：默认变长；SRT_FIXED_PAYLOAD=1 才用固定 1312B（2B 长度前缀+密文+0填充）
+        let payload = if Self::fixed_payload_enabled() && ciphertext.len() + 2 <= crate::transport::srt_shell::SRT_DATA_PAYLOAD_SIZE {
+            pack_fixed_payload(&ciphertext)
+        } else {
+            ciphertext
+        };
 
         // 3. 套 SRT 外壳（数据包形式，bit31=0，SEQ 递增、timestamp 每包 +1ms、固定 socket_id）
         self.srt_seq = self.srt_seq.wrapping_add(1) & 0x7FFFFFFF;
@@ -1180,7 +1205,7 @@ impl TransportDriver {
             packet_num as u32, // packet_num 存入 msg_no
             self.srt_timestamp,
             self.srt_socket_id,
-            fixed_payload,
+            payload,
         );
         let wire_data = srt_packet.encode();
 

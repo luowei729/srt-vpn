@@ -73,7 +73,11 @@ pub async fn serve(
                                 tracing::debug!("传输层连接已建立");
                             }
                             DriverEvent::ConnectionLost { reason } => {
-                                tracing::warn!(%reason, "传输层连接丢失");
+                                // 断连必须退出 serve：select! 收到本任务结束 →
+                                // connect_and_serve 返回 Err → run() 重连循环接管。
+                                // （只打日志不退出会导致隧道死了代理还活着，永不重连）
+                                tracing::warn!(%reason, "传输层连接丢失，代理服务退出以触发重连");
+                                return Err(format!("传输层连接丢失: {}", reason));
                             }
                         }
                     }

@@ -215,18 +215,22 @@ async fn connect_and_serve(
     });
 
     // 8. 等待任意子任务结束
-    tokio::select! {
+    // 任一子任务退出都意味着本条连接生命周期结束（驱动器死 / 代理退出）。
+    let reason: String = tokio::select! {
         _ = driver_handle => {
             tracing::warn!("传输驱动器退出");
+            "传输驱动器退出".to_string()
         }
         _ = socks5_handle => {
             tracing::warn!("SOCKS5 代理服务退出");
+            "SOCKS5 代理服务退出".to_string()
         }
-    }
+    };
 
     heartbeat_handle.abort();
 
-    Ok(())
+    // 返回 Err 让 run() 重连循环接管；Ok(()) 仅用于进程正常退出路径
+    Err(reason)
 }
 
 /// 等待特定事件（带 15 秒超时）
