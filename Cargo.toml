@@ -1,6 +1,6 @@
 [package]
 name = "srt-vpn"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 description = "回归 libsrt 1.5.6 单连接多路复用 VPN（专注稳定高多线带宽，不叠 RTP）"
 license = "MIT"

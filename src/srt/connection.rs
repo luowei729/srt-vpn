@@ -425,9 +425,8 @@ impl SrtConnection {
             // 发送线程（双队列调度，见 run_send_loop 注释）
             // S6：保存 JoinHandle 供 close() join（防退出段错误）
             let send_sock = sock;
-            let rtt_send = rtt.clone();
             let send_thread = std::thread::spawn(move || {
-                Self::run_send_loop(send_rel_rx, send_prio_rx, send_sock, rtt_send);
+                Self::run_send_loop(send_rel_rx, send_prio_rx, send_sock);
                 // 发送线程退出仅置位 closed（socket 由 close()/Drop 统一关闭，S1 单一释放方）
                 closed_send.store(true, AtomicOrdering::Release);
             });
@@ -556,9 +555,8 @@ impl SrtConnection {
             let closed_send = closed.clone();
             // S6：保存 JoinHandle 供 close() join（防退出段错误）
             let send_sock = accepted;
-            let rtt_send = rtt.clone();
             let send_thread = std::thread::spawn(move || {
-                Self::run_send_loop(send_rel_rx, send_prio_rx, send_sock, rtt_send);
+                Self::run_send_loop(send_rel_rx, send_prio_rx, send_sock);
                 closed_send.store(true, AtomicOrdering::Release);
             });
 
@@ -940,24 +938,22 @@ impl SrtConnection {
         let _ = recv_tx.send(SrtMessage { data: Vec::new() });
     }
 
-    /// 发送循环（发送线程主逻辑，v0.5.3 双队列调度版）
+    /// 发送循环（发送线程主逻辑，v0.5.4 双队列调度版）
     ///
-    /// 调度策略（参考 hysteria2 对 UDP 的公平性思想 + SRT 单 SNDBUF 现实约束）：
+    /// 调度策略：
     /// - **优先队列无条件插队**：每轮循环先非阻塞清空 prio 队列（UDP 小包），
     ///   使其不被可靠队列里排队的 TCP 大块数据拖延（消除应用层队头阻塞）
-    /// - **TCP 背压**：SNDBUF 未确认跨度(msSndBuf) > 300ms 时暂停消费可靠队列
-    ///   数毫秒，让已入队数据排空、给 UDP 让出管道（hy2"减速上游"思想的镜像：
-    ///   hy2 阻塞 UDP 上游，我们阻塞 TCP 大流——因为 TCP 可靠可等，实时 UDP 不能等）
-    /// - **永不因背压退出线程**：MJ_AGAIN 背压与断开判定逻辑保持 v0.5.1 语义不变
+    /// - 可靠队列为空时 recv_timeout(5ms) 回轮询头，防 UDP 在阻塞等待中饿死
     ///
-    /// QUIC 语义映射（SendItem）：
-    /// - STREAM（reliable=true）：msgttl=-1 + inorder=1 —— TCP 行为与旧版完全一致
-    /// - DATAGRAM（reliable=false）：msgttl=自适应值 + inorder=0 —— 仅 udp_datagram=true 时使用
+    /// v0.5.4 教训：v0.5.3 曾加"SNDBUF 积压>300ms 暂停消费可靠队列"的 TCP 背压，
+    /// 但公网大 BDP 管道（85Mbps×70ms RTT）下 msSndBuf 稳态就远超 300ms，
+    /// speedtest 多线并发时判定恒真 → 可靠队列被饿死 → 测速全部卡死（用户实测）。
+    /// **绝对时间跨度不能作为积压异常判据**，已移除；如需背压应基于
+    /// byteAvailSndBuf 剩余空间比例另行实验。
     fn run_send_loop(
         rel_rx: crossbeam_channel::Receiver<SendItem>,
         prio_rx: crossbeam_channel::Receiver<SendItem>,
         send_sock: SRTSOCKET,
-        rtt: Arc<RttTracker>,
     ) {
         // 可靠队列为空时等待新数据的超时：5ms 内回到循环头检查优先队列，
         // 保证 UDP 最坏只多等一个轮询间隔（对比旧版无限阻塞 recv 的改进）
@@ -969,13 +965,7 @@ impl SrtConnection {
                     return; // socket 断开，退出发送线程
                 }
             }
-            // ② TCP 背压判定：SNDBUF 积压超阈值 → 本轮跳过可靠队列，
-            //    短暂让出时间片持续服务 UDP，等积压消退后再恢复 TCP 入队
-            if rtt.tcp_backpressured() {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
-            }
-            // ③ 消费可靠队列：最多等 REL_WAIT_MS 即回轮询头（防 UDP 在此饿死）
+            // ② 消费可靠队列：最多等 REL_WAIT_MS 即回轮询头（防 UDP 在此饿死）
             match rel_rx.recv_timeout(std::time::Duration::from_millis(REL_WAIT_MS)) {
                 Ok(item) => {
                     if !Self::send_one(&item, send_sock) {
@@ -1052,6 +1042,15 @@ impl SrtConnection {
     /// 该开关关闭时上层（TunnelSession）会直接走可靠 Data 帧，不会调用到这里。
     pub fn send_unreliable(&self, data: Vec<u8>, ttl_ms: i32) -> Result<(), SrtError> {
         self.send_item_to(true, SendItem::unreliable(data, ttl_ms))
+    }
+
+    /// 发送可靠数据到【优先队列】（v0.5.4 新增，默认 UDP 路径）
+    ///
+    /// 与 send() 同为可靠语义（msgttl=-1/inorder=1），但走优先队列：
+    /// 发送线程每轮先清空优先队列，UDP 小包不被 TCP 大流量积压拖延
+    /// （消除应用层队头阻塞），同时保持必达——WebRTC/DTLS 场景的正确组合。
+    pub fn send_priority(&self, data: Vec<u8>) -> Result<(), SrtError> {
+        self.send_item_to(true, SendItem::reliable(data))
     }
 
     /// 统一入队入口：closed 原子读 + 锁内投递（S1 修复语义不变）
