@@ -35,20 +35,6 @@ const ATYP_IPV6: u8 = 0x04;
 /// 应答码：成功（proxy.rs 复用）
 pub const REP_SUCCESS: u8 = 0x00;
 
-/// 判断是否为 STUN 包（WebRTC ICE 洪水来源，speedtest 上传0根因）
-/// STUN 固定 Magic Cookie 0x2112A442 位于头 4-7 字节，Type 高2位为00（RFC8489）
-#[inline]
-fn is_stun_payload(payload: &[u8]) -> bool {
-    // STUN 最小头 20B，但宽松到 8B 即可判定 Magic，误伤概率极低
-    if payload.len() < 8 {
-        return false;
-    }
-    // Magic Cookie 0x2112A442 是 STUN 最可靠特征，普通 UDP 误撞概率极低
-    payload[4] == 0x21 && payload[5] == 0x12 && payload[6] == 0xA4 && payload[7] == 0x42
-        // 且 Type 高2位为00（STUN 要求），进一步降低误伤
-        && (payload[0] & 0xC0) == 0x00
-}
-
 /// 已认证的 SOCKS5 用户（用户名密码，来自配置或 CLI）
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -531,13 +517,6 @@ async fn start_udp_associate(
     let mut idle_watchdog = std::pin::pin!(tokio::time::sleep(idle_duration));
     // H1：TCP 控制连接读缓冲（读到任何数据都异常，SOCKS5 规定 ASSOCIATE 后 TCP 不再有数据）
     let mut tcp_buf = [0u8; 512];
-    // P0 2026-08-23：令牌桶（WebRTC洪水防护，speedtest上传0根因）
-    // 每隧道UDP会话 200pps / 625KBps(5Mbps)，超限丢包不进隧道，避免共享FileCC窗口被UDP占满阻塞TCP
-    let mut udp_packet_tokens: f64 = 200.0;
-    let mut udp_byte_tokens: f64 = 625_000.0;
-    let mut udp_last_refill = std::time::Instant::now();
-    let mut udp_stun_dropped: u64 = 0;
-    let mut udp_throttled: u64 = 0;
     loop {
         tokio::select! {
             // H1：看门狗分支
@@ -573,30 +552,6 @@ async fn start_udp_associate(
                         }
                         idle_watchdog.as_mut().reset(tokio::time::Instant::now() + idle_duration);
                         if let Some((host, port, payload)) = parse_udp_datagram(&buf[..len]) {
-                            // P0 2026-08-23：STUN快路径丢弃（WebRTC ICE洪水直接不进隧道，speedtest上传0根因）
-                            if is_stun_payload(payload) {
-                                udp_stun_dropped += 1;
-                                if udp_stun_dropped % 100 == 0 {
-                                    tracing::info!(session = sid, dropped = udp_stun_dropped, "STUN UDP洪水丢弃中");
-                                }
-                                continue;
-                            }
-                            // P0 2026-08-23：令牌桶限流（200pps/625KBps=5Mbps，共享SRT单窗口保护TCP）
-                            let now = std::time::Instant::now();
-                            let elapsed = now.duration_since(udp_last_refill).as_secs_f64();
-                            udp_last_refill = now;
-                            udp_packet_tokens = (udp_packet_tokens + elapsed * 200.0).min(200.0);
-                            udp_byte_tokens = (udp_byte_tokens + elapsed * 625_000.0).min(625_000.0);
-                            let need_bytes = payload.len() as f64;
-                            if udp_packet_tokens < 1.0 || udp_byte_tokens < need_bytes {
-                                udp_throttled += 1;
-                                if udp_throttled % 50 == 0 {
-                                    tracing::warn!(session = sid, throttled = udp_throttled, stun_dropped = udp_stun_dropped, "UDP限流丢弃中");
-                                }
-                                continue;
-                            }
-                            udp_packet_tokens -= 1.0;
-                            udp_byte_tokens -= need_bytes;
                             // H2 修复：目标 host 直接按字符串进地址头（IPv4/域名/IPv6
                             // 全类型支持）。旧实现 parse::<Ipv4Addr> 失败就替换成
                             // 0.0.0.0 占位 -> 域名/IPv6 目标被静默发往 0.0.0.0 失效。
