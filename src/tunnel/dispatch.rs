@@ -229,23 +229,26 @@ impl TunnelSession {
         Ok(())
     }
 
-    /// 发送不可靠数据帧到隧道（QUIC DATAGRAM 语义，v0.5.2 新增）
+    /// 发送 UDP 隧道数据（v0.5.3 按 udp_datagram 开关分流）
     ///
-    /// UDP 隧道方向专用：帧类型用 Datagram（0x04），底层 SRT 消息带自适应 TTL
-    /// （过期即弃、不重传、允许后发先至）。丢包链路下 UDP 端到端延时被钳在
-    /// ≈TTL（max(2×RTT,150ms)）内，不再被 TCP 重传排队拖高。
-    /// 大数据自动分片；同一批分片取同一次 adaptive_ttl_ms()，保证全到或全弃。
+    /// 默认（开关关，= v0.5.0 行为）：编码 Data 帧走【可靠传输 + 可靠队列】——
+    /// 教训：v0.5.2 的"拥塞时 TTL 丢弃"会杀死 WebRTC 的 STUN/DTLS 握手导致上传归零；
+    /// hy2 官方实现拥塞时也是背压而非主动丢包。
+    /// 开关开（实验）：编码 Datagram 帧 + 自适应 TTL 走优先队列——低延时但会丢包，
+    /// 仅适合游戏/实时等可容忍丢包场景。
     pub async fn send_unreliable(&self, data: &[u8]) -> Result<(), String> {
-        // 同一数据报的所有分片共用一个 TTL：避免"部分分片 TTL 不同导致半弃"
+        if !self.conn.udp_datagram_enabled() {
+            // 默认路径：Data 帧可靠有序（复用 send_data 的编码与指标口径）
+            return self.send_data(data).await;
+        }
+        // 实验路径：同一数据报的所有分片共用一个 TTL，避免部分分片先弃导致重组失败
         let ttl = self.conn.adaptive_ttl_ms();
         for chunk in data.chunks(FRAME_DATA_MAX) {
-            // 帧类型 Datagram：接收侧 dispatch_frame 按 Data 事件投递，会话层无感
             let frame = self.mux_enc.encode_frame(FrameType::Datagram, self.session_id, 0, chunk);
             self.conn
                 .send_unreliable(frame, ttl)
                 .map_err(|e| format!("发送不可靠数据帧失败: {e}"))?;
         }
-        // 与 send_data 一致计入发送字节指标（F2 口径统一）
         let m = crate::metrics::metrics();
         m.tx_bytes.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())

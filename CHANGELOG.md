@@ -2,6 +2,27 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-23 17:20] - v0.5.3 双队列调度（hy2 思想落地）+ UDP 回退可靠为默认
+
+### 改动前总结
+- **用户实测反馈**：v0.5.2 部署后 speedtest 多线下载 2Mbps、**多线 WebRTC 上传归零**，比 v0.5.0 更差；用户质疑"不是说处理了 UDP 吗"，并指示"研究在 0.5.0 基础上优化，参考 hy2 对 UDP 的处理"。
+- **根因（设计误判承认）**：speedtest WebRTC 上传全程走 UDP（STUN 打洞 + DTLS 握手 + DataChannel）；v0.5.2 把所有 UDP 变成"150ms TTL 过期即弃"——隧道空闲时无恙（回环验证全绿是盲区），但多线大流量把 SRT SNDBUF 挤满后，排在后面的 STUN/DTLS 握手包被主动丢弃 → WebRTC 建连失败 → 上传归 0。v0.5.0 可靠 UDP 慢但必达所以不为 0。
+- **hy2 官方最新源码调研**（联网克隆 apernet/hysteria@619a6f8，2026-08-22）：UDP 走 QUIC DATAGRAM 但 **拥塞时背压阻塞而非丢弃**——`SendDatagram` 在发送队列(32帧)满时阻塞等待、发送链路全程同步无内部大缓冲、压力传导给上游应用减速；仅"打包瞬间装不下/超 buffer"等边缘场景才丢。**结论：hy2 从不因拥塞主动丢 UDP**。
+
+### 改动后总结
+1. **双队列调度器**（connection.rs `run_send_loop` 重写）：
+   - 双 crossbeam 通道：`send_rel_tx`（可靠队列：TCP Data/控制帧/默认 UDP）+ `send_prio_tx`（优先队列：实验 Datagram）
+   - 每轮循环无条件先非阻塞清空优先队列 → UDP 小包不再排在 TCP 大流量积压之后（消除应用层队头阻塞）
+   - **TCP 背压**：SNDBUF 未确认跨度(msSndBuf) >300ms 时暂停消费可靠队列数毫秒让 UDP 先行——hy2"减速上游"思想的镜像（TCP 可靠可等，实时 UDP 不能等）
+   - 可靠队列为空时 `recv_timeout(5ms)` 回轮询头，防 UDP 在阻塞等待中饿死
+   - MJ_AGAIN 背压重试/S5 断开判定语义不变；`RttTracker` 扩展 `sndbuf_ms`（接收线程 bistats 顺带采样 msSndBuf）
+2. **UDP 默认回退可靠**（dispatch.rs）：`udp_datagram=false`（默认）时 `send_unreliable` 编码 Data 帧走可靠队列 = v0.5.0 行为，WebRTC 必达；Datagram+自适应 TTL 降级为 `udp_datagram: true` / 环境变量 `SRT_UDP_DATAGRAM=true` 实验开关（config.rs 新增字段+env 支持，client/server 透传 SrtConfig，SrtListener→accept 继承）
+3. **验证**：cargo test 32/32；回环热身下行 93.6MB/s 与基线持平；UDP DNS 2/2 PASS；下载与 DNS 并发互不干扰；公网本机→SG 单流 100m 21.6MB/s(173Mbps)、8 并发聚合 33.7MB/s(270Mbps) 均超 v0.5.0 基线
+4. **另证**：用户 v0.5.2 实测"多线下载 2Mbps"主因之一是 speedtest 选到坏节点 `72.249.203.145`（SG 日志 30 分钟 1625 个会话反复连其 :443 全部超时），换节点即可规避
+
+### 待办
+- 部署 SG + OpenWrt 后重测 speedtest（务必手动切换测速服务器节点避开 72.249.203.145）
+
 ## [2026-08-23 16:10] - v0.5.2 QUIC STREAM/DATAGRAM 双通道语义 + SRT per-message 自适应 TTL
 
 ### 改动前总结

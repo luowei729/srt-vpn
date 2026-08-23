@@ -47,6 +47,12 @@ pub struct Config {
     /// UDP 模式：reliable（默认）/ best-effort（-m 可覆盖）
     #[serde(default = "default_udp_mode")]
     pub udp_mode: UdpMode,
+    /// v0.5.3：UDP DATAGRAM 实验模式（默认 false）
+    /// false = UDP 隧道帧走可靠传输（v0.5.0 行为，WebRTC 必达，推荐保持）
+    /// true  = UDP 帧走 Datagram + 自适应 TTL（低延时实验特性，拥塞时会丢包）
+    /// 环境变量 SRT_UDP_DATAGRAM=true/1 可开启
+    #[serde(default)]
+    pub udp_datagram: bool,
     /// 最大并发客户端数（默认 32）
     #[serde(default = "default_max_clients")]
     pub max_clients: usize,
@@ -319,6 +325,10 @@ impl Config {
                 .map(|s| UdpMode::parse_str(&s).map_err(|e| e.to_string()))
                 .transpose()?
                 .unwrap_or_else(default_udp_mode),
+            // v0.5.3：SRT_UDP_DATAGRAM=true/1 开启 UDP DATAGRAM 实验模式（默认关）
+            udp_datagram: std::env::var("SRT_UDP_DATAGRAM")
+                .map(|s| s == "true" || s == "1")
+                .unwrap_or(false),
             max_clients: std::env::var("SRT_MAX_CLIENTS")
                 .ok()
                 .map(|s| s.parse::<usize>().map_err(|_| "SRT_MAX_CLIENTS 不是有效数字".to_string()))
@@ -363,6 +373,10 @@ impl Config {
             if let Ok(udp) = UdpMode::parse_str(&u) {
                 self.udp_mode = udp;
             }
+        }
+        // v0.5.3：环境变量可覆盖配置文件的 UDP DATAGRAM 开关
+        if let Ok(u) = std::env::var("SRT_UDP_DATAGRAM") {
+            self.udp_datagram = u == "true" || u == "1";
         }
         if let Ok(mc) = std::env::var("SRT_MAX_CLIENTS") {
             if let Ok(v) = mc.parse::<usize>() {

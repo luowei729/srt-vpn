@@ -58,6 +58,8 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
         reliable: true, // 客户端跟随服务端协商，默认可靠
         message_api: true,
         payload_size: 1316, // SRT 官方默认 payload（SRT_LIVE_DEF_PLSIZE=1316）
+        // v0.5.3：UDP DATAGRAM 实验开关透传（默认 false，UDP 走可靠 = v0.5.0 行为）
+        udp_datagram: cfg.udp_datagram,
         is_server: false,
     };
 

@@ -31,6 +31,8 @@ pub async fn run(cfg: &Config) -> Result<(), String> {
         },
         message_api: true,
         payload_size: 1316, // SRT 官方默认 payload
+        // v0.5.3：UDP DATAGRAM 实验开关透传（默认 false，accept 的连接继承）
+        udp_datagram: cfg.udp_datagram,
         is_server: true,
     };
 

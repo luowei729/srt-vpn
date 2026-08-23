@@ -105,6 +105,11 @@ pub struct SrtConfig {
     pub message_api: bool,
     /// payload 大小（SRT 消息模式单包上限，1316 官方默认）
     pub payload_size: i32,
+    /// v0.5.3：UDP DATAGRAM 实验模式开关（默认 false）
+    /// false = UDP 帧走可靠传输（Data 帧 + 可靠队列，= v0.5.0 行为，WebRTC 必达）
+    /// true  = UDP 帧走 Datagram 帧 + 自适应 TTL（低延时实验特性，拥塞时会丢包，
+    ///         仅适合游戏/实时等可容忍丢包场景；参考 hy2 后结论：默认必须关）
+    pub udp_datagram: bool,
     /// 是否服务端（listen 模式）
     /// （P1 后半段用于区分收发策略，当前仅日志参考）
     #[allow(dead_code)]
@@ -122,6 +127,8 @@ impl Default for SrtConfig {
             reliable: true,
             message_api: true,
             payload_size: 1316, // SRT 官方默认 payload
+            // v0.5.3：UDP DATAGRAM 实验模式默认关闭（拥塞时丢包伤 WebRTC，见字段注释）
+            udp_datagram: false,
             is_server: false,
         }
     }
@@ -163,7 +170,7 @@ impl SendItem {
     }
 }
 
-/// RTT 跟踪器：EWMA 平滑瞬时 RTT 并推导自适应消息 TTL
+/// RTT/链路状态跟踪器：EWMA 平滑瞬时 RTT 并推导自适应消息 TTL
 ///
 /// 为什么不用固定 TTL：不同服务器链路延时差异大（70ms~400ms+），且可能突变；
 /// 固定小值会导致高延时链路上 UDP 包大量被误丢，固定大值则失去"过期即弃"的低延时意义。
@@ -175,6 +182,10 @@ impl SendItem {
 pub struct RttTracker {
     /// EWMA 平滑后的 RTT（毫秒）。原子存储：读多写少且精度要求为毫秒级整数
     ewma_ms: std::sync::atomic::AtomicI32,
+    /// v0.5.3：SND BUF 未确认数据的时间跨度（毫秒，来自 bistats.msSndBuf）。
+    /// 由接收线程随 RTT 一并采样写入，供发送线程做 TCP 背压判定：
+    /// 积压超过阈值时暂停消费可靠队列，让 UDP 小包优先追上进度（仿 hy2 公平性）。
+    sndbuf_ms: std::sync::atomic::AtomicI32,
 }
 
 impl RttTracker {
@@ -188,9 +199,32 @@ impl RttTracker {
     const MAX_MS: i32 = 800;
     /// 自适应 TTL 下限：即使低 RTT 也至少给 150ms 发送窗口（约 2 个 RTT + 调度余量）
     const TTL_MIN_MS: i32 = 150;
+    /// v0.5.3：TCP 背压阈值——SNDBUF 未确认时间跨度超过此值时暂停消费可靠队列。
+    /// 取值考量：rcv_latency=120ms 重传窗口的 2.5 倍；超过说明 TCP 大流量已把
+    /// 发送管道塞满，此时继续入队 TCP 只会把 UDP 小包越推越远，应让 UDP 先行。
+    const SND_BACKPRESSURE_MS: i32 = 300;
 
     pub fn new() -> Self {
-        Self { ewma_ms: std::sync::atomic::AtomicI32::new(Self::INIT_MS) }
+        Self {
+            ewma_ms: std::sync::atomic::AtomicI32::new(Self::INIT_MS),
+            sndbuf_ms: std::sync::atomic::AtomicI32::new(0),
+        }
+    }
+
+    /// 当前 SND BUF 积压时间跨度（毫秒，接收线程采样写入）
+    pub fn sndbuf_ms(&self) -> i32 {
+        self.sndbuf_ms.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// 写入 SND BUF 积压跨度（接收线程采样调用；负值钳为 0 防御异常读数）
+    pub fn set_sndbuf_ms(&self, ms: i32) {
+        self.sndbuf_ms.store(ms.max(0), std::sync::atomic::Ordering::Release);
+    }
+
+    /// 是否处于 TCP 背压状态（发送线程调度判定用）
+    #[allow(dead_code)]
+    pub fn tcp_backpressured(&self) -> bool {
+        self.sndbuf_ms() > Self::SND_BACKPRESSURE_MS
     }
 
     /// 采样新的瞬时 RTT 并更新 EWMA
@@ -243,7 +277,18 @@ pub struct SrtConnection {
     /// close() 时锁内 take+drop 关闭通道，发送线程 recv() 返回 Err 自然退出。
     /// （旧实现发"空消息"但发送线程不检查，发送线程永不退出=socket 永不关闭）
     /// v0.5.2：条目类型 Vec<u8> → SendItem（携带可靠/TTL 语义，支撑 QUIC 双通道）
-    send_tx: std::sync::Mutex<Option<Sender<SendItem>>>,
+    ///
+    /// v0.5.3 双队列调度（参考 hysteria2 公平性思想）：
+    /// - send_rel_tx：可靠队列——TCP Data 帧、控制帧、以及默认模式下的 UDP 帧
+    /// - send_prio_tx：优先队列——仅 udp_datagram=true 时 Datagram 帧走此队列，
+    ///   发送线程每轮无条件先清空它，UDP 小包不再排在 TCP 大流量积压之后
+    ///   （v0.5.2 的 TTL 丢弃方案已废弃：拥塞时丢包会杀死 WebRTC 的 STUN/DTLS 握手）
+    send_rel_tx: std::sync::Mutex<Option<Sender<SendItem>>>,
+    #[allow(dead_code)]
+    send_prio_tx: std::sync::Mutex<Option<Sender<SendItem>>>,
+    /// v0.5.3：是否启用 UDP DATAGRAM 实验模式（来自 SrtConfig.udp_datagram，默认 false）
+    /// false = UDP 走可靠 Data 帧（= v0.5.0 行为，WebRTC 必达）；true = Datagram 帧 + 自适应 TTL
+    udp_datagram: bool,
     /// v0.5.2：RTT 跟踪器（接收线程采样写入，上层 adaptive_ttl_ms 读取）
     rtt: Arc<RttTracker>,
     /// epoll 句柄：已移除结构体字段（2026-08-19 S1 修复）
@@ -353,9 +398,12 @@ impl SrtConnection {
             //   tokio 侧直接 UnboundedReceiver.recv().await 异步消费。
             //   消除原先 crossbeam + spawn_blocking 双重桥接的全双工吞吐瓶颈。
             let (recv_tx, recv_rx) = tokio::sync::mpsc::unbounded_channel::<SrtMessage>();
-            // v0.5.2：发送条目携带可靠/TTL 语义；RTT 跟踪器随连接创建（收发线程共享 Arc）
-            let (send_tx, send_rx) = crossbeam_channel::unbounded::<SendItem>();
+            // v0.5.3 双队列：可靠队列(TCP/控制/默认UDP) + 优先队列(实验 Datagram)；
+            // RTT/SNDBUF 跟踪器随连接创建（收发线程共享 Arc）
+            let (send_rel_tx, send_rel_rx) = crossbeam_channel::unbounded::<SendItem>();
+            let (send_prio_tx, send_prio_rx) = crossbeam_channel::unbounded::<SendItem>();
             let rtt = Arc::new(RttTracker::new());
+            let udp_datagram = cfg.udp_datagram;
             let eid = srt_epoll_create();
             if eid == -1 {
                 let err = last_error_str();
@@ -374,17 +422,14 @@ impl SrtConnection {
             // 2026-08-19 S1 修复：关闭标志改原子 CAS（幂等），发送线程退出后由 close() 统一 srt_close
             let closed = Arc::new(AtomicBool::new(false));
             let closed_send = closed.clone();
-            // 发送线程（从 send_rx 取数据写 SRT socket）
-            // 2026-08-19 S1 修复：不再由发送线程 srt_close（旧实现与 close()/Drop 多处
-            // 关闭来源混杂）；发送线程只负责发数据，通道关闭(Sender drop)即退出
+            // 发送线程（双队列调度，见 run_send_loop 注释）
             // S6：保存 JoinHandle 供 close() join（防退出段错误）
             let send_sock = sock;
             let rtt_send = rtt.clone();
             let send_thread = std::thread::spawn(move || {
-                Self::run_send_loop(send_rx, send_sock);
+                Self::run_send_loop(send_rel_rx, send_prio_rx, send_sock, rtt_send);
                 // 发送线程退出仅置位 closed（socket 由 close()/Drop 统一关闭，S1 单一释放方）
                 closed_send.store(true, AtomicOrdering::Release);
-                drop(rtt_send); // 显式消费：发送线程不持有 RTT（采样归接收线程），防未使用告警
             });
 
             // 接收事件循环线程（批量消费，优化吞吐，见 run_recv_loop 注释）
@@ -405,7 +450,9 @@ impl SrtConnection {
             Ok(Self {
                 socket: sock,
                 recv_rx: Arc::new(tokio::sync::Mutex::new(recv_rx)),
-                send_tx: Mutex::new(Some(send_tx)),
+                send_rel_tx: Mutex::new(Some(send_rel_tx)),
+                send_prio_tx: Mutex::new(Some(send_prio_tx)),
+                udp_datagram,
                 rtt,
                 closed,
                 threads: Mutex::new(vec![send_thread, recv_thread]),
@@ -451,7 +498,10 @@ impl SrtConnection {
                 return Err(SrtError::Connect(err));
             }
             tracing::info!(listen = %addr, "SRT 监听 socket 已建立（常驻）");
-            Ok(SrtListener { sock })
+            Ok(SrtListener {
+                sock,
+                udp_datagram: cfg.udp_datagram,
+            })
         }
     }
 
@@ -459,7 +509,7 @@ impl SrtConnection {
     ///
     /// 由 SrtListener 调用；每客户端一次（可在多任务并发调用，
     /// 监听 socket 常驻不重复 bind）。
-    fn accept_from_listener(listen_sock: SRTSOCKET) -> Result<Self, SrtError> {
+    fn accept_from_listener(listen_sock: SRTSOCKET, udp_datagram: bool) -> Result<Self, SrtError> {
         unsafe {
             // 接受连接（阻塞；srt_accept 线程安全，多任务并发调用由 libsrt 内部排队）
             let mut peer: libc::sockaddr_in = std::mem::zeroed();
@@ -482,10 +532,10 @@ impl SrtConnection {
             Self::set_nonblocking(accepted)?;
 
             // 启动事件循环（同 connect 后半部分）
-            // 发送 unbounded / 接收 tokio mpsc Unbounded（2026-08-19 重构，消除 spawn_blocking 桥接）
+            // v0.5.3 双队列：与 connect 一致
             let (recv_tx, recv_rx) = tokio::sync::mpsc::unbounded_channel::<SrtMessage>();
-            // v0.5.2：与 connect 一致，发送条目带可靠/TTL 语义 + RTT 跟踪器
-            let (send_tx, send_rx) = crossbeam_channel::unbounded::<SendItem>();
+            let (send_rel_tx, send_rel_rx) = crossbeam_channel::unbounded::<SendItem>();
+            let (send_prio_tx, send_prio_rx) = crossbeam_channel::unbounded::<SendItem>();
             let rtt = Arc::new(RttTracker::new());
             let eid = srt_epoll_create();
             if eid == -1 {
@@ -508,9 +558,8 @@ impl SrtConnection {
             let send_sock = accepted;
             let rtt_send = rtt.clone();
             let send_thread = std::thread::spawn(move || {
-                Self::run_send_loop(send_rx, send_sock);
+                Self::run_send_loop(send_rel_rx, send_prio_rx, send_sock, rtt_send);
                 closed_send.store(true, AtomicOrdering::Release);
-                drop(rtt_send); // 显式消费：采样归接收线程
             });
 
             // S6：保存 JoinHandle 供 close() join（防退出段错误）
@@ -528,7 +577,9 @@ impl SrtConnection {
             Ok(Self {
                 socket: accepted,
                 recv_rx: Arc::new(tokio::sync::Mutex::new(recv_rx)),
-                send_tx: Mutex::new(Some(send_tx)),
+                send_rel_tx: Mutex::new(Some(send_rel_tx)),
+                send_prio_tx: Mutex::new(Some(send_prio_tx)),
+                udp_datagram,
                 rtt,
                 closed,
                 threads: Mutex::new(vec![send_thread, recv_thread]),
@@ -824,6 +875,8 @@ impl SrtConnection {
                     if ret == 0 && perf.msRTT > 0.0 {
                         // EWMA 平滑并钳位后写回 tracker
                         let ewma = rtt.update(perf.msRTT);
+                        // v0.5.3：顺带记录 SND BUF 积压跨度，供发送线程 TCP 背压判定
+                        rtt.set_sndbuf_ms(perf.msSndBuf);
                         crate::metrics::metrics()
                             .last_rtt_ms
                             .store(ewma.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
@@ -887,65 +940,102 @@ impl SrtConnection {
         let _ = recv_tx.send(SrtMessage { data: Vec::new() });
     }
 
-    /// 发送循环（发送线程主逻辑）
+    /// 发送循环（发送线程主逻辑，v0.5.3 双队列调度版）
     ///
-    /// 关键：非阻塞 srt_sendmsg 在发送缓冲满时返回 -1（MJ_AGAIN，暂不可写），
-    /// 这是"预期内"的背压信号，必须重试而非退出线程！
-    /// 若一遇到 -1 就 break，发送通道会永久关闭，后续所有数据发送失败
-    /// （这是大文件传输丢数据的根因）。
-    /// 仅连接真正断开（重复失败）时才退出。
+    /// 调度策略（参考 hysteria2 对 UDP 的公平性思想 + SRT 单 SNDBUF 现实约束）：
+    /// - **优先队列无条件插队**：每轮循环先非阻塞清空 prio 队列（UDP 小包），
+    ///   使其不被可靠队列里排队的 TCP 大块数据拖延（消除应用层队头阻塞）
+    /// - **TCP 背压**：SNDBUF 未确认跨度(msSndBuf) > 300ms 时暂停消费可靠队列
+    ///   数毫秒，让已入队数据排空、给 UDP 让出管道（hy2"减速上游"思想的镜像：
+    ///   hy2 阻塞 UDP 上游，我们阻塞 TCP 大流——因为 TCP 可靠可等，实时 UDP 不能等）
+    /// - **永不因背压退出线程**：MJ_AGAIN 背压与断开判定逻辑保持 v0.5.1 语义不变
     ///
-    /// v0.5.2：srt_sendmsg(ttl,inorder) → srt_sendmsg2 + SRT_MSGCTRL，
-    /// 按 SendItem.reliable 分流 QUIC 双通道语义：
-    /// - STREAM（reliable=true）：msgttl=-1 + inorder=1 —— 与旧版行为完全等价（TCP 零变化）
-    /// - DATAGRAM（reliable=false）：msgttl=自适应值 + inorder=0 —— 过期即弃、允许后发先至，
-    ///   UDP 包不再被 TCP 重传排队拖出高延时（丢包链路下 UDP 延时上限≈TTL）
-    fn run_send_loop(send_rx: crossbeam_channel::Receiver<SendItem>, send_sock: SRTSOCKET) {
-        while let Ok(item) = send_rx.recv() {
-            // 2026-08-19 S1 修复：空消息不再是哨兵（旧 close 依赖它但从未生效），
-            // 空消息直接跳过（防御异常调用），正常关闭路径是通道断开/socket 断开
-            if item.data.is_empty() {
+    /// QUIC 语义映射（SendItem）：
+    /// - STREAM（reliable=true）：msgttl=-1 + inorder=1 —— TCP 行为与旧版完全一致
+    /// - DATAGRAM（reliable=false）：msgttl=自适应值 + inorder=0 —— 仅 udp_datagram=true 时使用
+    fn run_send_loop(
+        rel_rx: crossbeam_channel::Receiver<SendItem>,
+        prio_rx: crossbeam_channel::Receiver<SendItem>,
+        send_sock: SRTSOCKET,
+        rtt: Arc<RttTracker>,
+    ) {
+        // 可靠队列为空时等待新数据的超时：5ms 内回到循环头检查优先队列，
+        // 保证 UDP 最坏只多等一个轮询间隔（对比旧版无限阻塞 recv 的改进）
+        const REL_WAIT_MS: u64 = 5;
+        loop {
+            // ① 无条件优先清空优先队列（非阻塞 try_recv，UDP 插队核心）
+            while let Ok(item) = prio_rx.try_recv() {
+                if !Self::send_one(&item, send_sock) {
+                    return; // socket 断开，退出发送线程
+                }
+            }
+            // ② TCP 背压判定：SNDBUF 积压超阈值 → 本轮跳过可靠队列，
+            //    短暂让出时间片持续服务 UDP，等积压消退后再恢复 TCP 入队
+            if rtt.tcp_backpressured() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
             }
-            // 非阻塞 srt_sendmsg2：遇背压（缓冲满）持续重试，永不因背压退出！
-            loop {
-                // 每次重试都重建 MSGCTRL：libsrt 在阻塞等待场景可能修改 mctrl 字段，
-                // 重建保证语义恒定。srctime=0 安全性已核实：TTL 基准取消息入队时刻
-                // m_tsOriginTime（buffer_snd.cpp:347），与 srctime 无关。
-                let mut mctrl = super::bindings::SRT_MSGCTRL {
-                    // QUIC 语义映射核心：
-                    msgttl: if item.reliable { -1 } else { item.ttl_ms },
-                    inorder: if item.reliable { 1 } else { 0 },
-                    ..super::bindings::SRT_MSGCTRL::default()
-                };
-                let ret = unsafe {
-                    srt_sendmsg2(
-                        send_sock,
-                        item.data.as_ptr() as *const c_char,
-                        item.data.len() as c_int,
-                        &mut mctrl,
-                    )
-                };
-                if ret == -1 {
-                    // 检查 socket 是否已断开
-                    // 2026-08-19 S5 修复：正确状态值 BROKEN=6/CLOSED=8（旧判 2/3 永假，
-                    // 断线后发送线程 100µs 忙等重试不止、占满 CPU）
-                    let state = unsafe { srt_getsockstate(send_sock) };
-                    if super::bindings::srt_state_unavailable(state) {
-                        tracing::warn!(state, "发送 socket 已断开，退出发送线程");
+            // ③ 消费可靠队列：最多等 REL_WAIT_MS 即回轮询头（防 UDP 在此饿死）
+            match rel_rx.recv_timeout(std::time::Duration::from_millis(REL_WAIT_MS)) {
+                Ok(item) => {
+                    if !Self::send_one(&item, send_sock) {
                         return;
                     }
-                    // 背压：发送缓冲满或 UDP 背压，短暂等待后重试（不退出线程）。
-                    // 注意不可靠消息同样重试——TTL 过期由 libsrt 内部丢弃兜底
-                    // （buffer_snd.cpp:350 m_iTTL 检查），应用层无需感知。
-                    std::thread::sleep(std::time::Duration::from_micros(100));
-                    continue;
                 }
-                break;
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    // 可靠队列关闭（连接关闭）：清空剩余优先队列后退出
+                    while let Ok(item) = prio_rx.try_recv() {
+                        if !Self::send_one(&item, send_sock) {
+                            break;
+                        }
+                    }
+                    tracing::debug!("发送通道关闭，退出发送线程");
+                    return;
+                }
             }
         }
-        // send_rx 通道关闭（连接关闭）
-        tracing::debug!("发送通道关闭，退出线程");
+    }
+
+    /// 发送单条消息（含背压重试/断开退出语义；返回 false 表示 socket 已断开）
+    fn send_one(item: &SendItem, send_sock: SRTSOCKET) -> bool {
+        // 空消息直接跳过（防御异常调用），正常关闭路径是通道断开/socket 断开
+        if item.data.is_empty() {
+            return true;
+        }
+        loop {
+            // 每次重试都重建 MSGCTRL：libsrt 在阻塞等待场景可能修改 mctrl 字段，
+            // 重建保证语义恒定。srctime=0 安全性已核实：TTL 基准取消息入队时刻
+            // m_tsOriginTime（buffer_snd.cpp:347），与 srctime 无关。
+            let mut mctrl = super::bindings::SRT_MSGCTRL {
+                // QUIC 语义映射核心：
+                msgttl: if item.reliable { -1 } else { item.ttl_ms },
+                inorder: if item.reliable { 1 } else { 0 },
+                ..super::bindings::SRT_MSGCTRL::default()
+            };
+            let ret = unsafe {
+                srt_sendmsg2(
+                    send_sock,
+                    item.data.as_ptr() as *const c_char,
+                    item.data.len() as c_int,
+                    &mut mctrl,
+                )
+            };
+            if ret == -1 {
+                // 检查 socket 是否已断开（S5：状态 >=6 才算不可用，禁止硬编码魔法数字）
+                let state = unsafe { srt_getsockstate(send_sock) };
+                if super::bindings::srt_state_unavailable(state) {
+                    tracing::warn!(state, "发送 socket 已断开，退出发送线程");
+                    return false;
+                }
+                // 背压：发送缓冲满或 UDP 背压，短暂等待后重试（不退出线程）。
+                // 注意不可靠消息同样重试——TTL 过期由 libsrt 内部丢弃兜底
+                // （buffer_snd.cpp:350 m_iTTL 检查），应用层无需感知。
+                std::thread::sleep(std::time::Duration::from_micros(100));
+                continue;
+            }
+            return true;
+        }
     }
 
     /// 发送数据（应用层 → 发送队列 → SRT）
@@ -956,26 +1046,39 @@ impl SrtConnection {
         self.send_item(SendItem::reliable(data))
     }
 
-    /// 发送不可靠数据（QUIC DATAGRAM 语义，v0.5.2 新增）
+    /// 发送不可靠数据（QUIC DATAGRAM 语义，v0.5.2 引入；v0.5.3 路由到优先队列）
     ///
-    /// UDP 隧道帧专用：msgttl=ttl_ms 内未发出即被 libsrt 丢弃、inorder=0 允许后发先至。
-    /// ttl_ms 通常取 adaptive_ttl_ms() 的返回值（由调用方统一一次，保证同一数据报
-    /// 分片使用相同 TTL）。
+    /// 仅当 udp_datagram=true（实验开关）时才真正以不可靠消息发送；
+    /// 该开关关闭时上层（TunnelSession）会直接走可靠 Data 帧，不会调用到这里。
     pub fn send_unreliable(&self, data: Vec<u8>, ttl_ms: i32) -> Result<(), SrtError> {
-        self.send_item(SendItem::unreliable(data, ttl_ms))
+        self.send_item_to(true, SendItem::unreliable(data, ttl_ms))
     }
 
     /// 统一入队入口：closed 原子读 + 锁内投递（S1 修复语义不变）
     fn send_item(&self, item: SendItem) -> Result<(), SrtError> {
+        self.send_item_to(false, item)
+    }
+
+    /// 指定队列入队：priority=true 投优先队列（UDP 小包插队），false 投可靠队列
+    fn send_item_to(&self, priority: bool, item: SendItem) -> Result<(), SrtError> {
         // 2026-08-19 S1 修复：closed 原子读；通道被 close() take 后返回 Closed
         if self.closed.load(AtomicOrdering::Acquire) {
             return Err(SrtError::Closed);
         }
-        let guard = self.send_tx.lock().unwrap();
+        let guard = if priority {
+            self.send_prio_tx.lock().unwrap()
+        } else {
+            self.send_rel_tx.lock().unwrap()
+        };
         match guard.as_ref() {
             Some(tx) => tx.send(item).map_err(|_| SrtError::Closed),
             None => Err(SrtError::Closed),
         }
+    }
+
+    /// 是否启用 UDP DATAGRAM 实验模式（TunnelSession 编码帧类型时判定用）
+    pub fn udp_datagram_enabled(&self) -> bool {
+        self.udp_datagram
     }
 
     /// 获取当前自适应消息 TTL（毫秒），供上层发送不可靠消息时使用（v0.5.2）
@@ -1119,7 +1222,10 @@ impl SrtConnection {
         }
         // 1. 关闭发送通道（锁内 take+drop Sender）-> 发送线程 recv() 返回 Err
         //    自然退出（覆盖空闲连接上发送线程永久挂在 recv 的泄漏窗口）
-        drop(self.send_tx.lock().unwrap().take());
+        //    v0.5.3：双队列都要关闭（可靠队列断开使 run_send_loop 走 Disconnected 分支，
+        //    优先队列 drop 保证 try_recv 永远为空）
+        drop(self.send_rel_tx.lock().unwrap().take());
+        drop(self.send_prio_tx.lock().unwrap().take());
         // 2. 关闭 socket（幂等：libsrt 对已关 socket 返回错误，无副作用）
         //    -> 接收线程 epoll/recv 感知断开退出，并由接收线程释放 eid
         //    （唯一释放方，消除跨线程释放 UB 与双重释放）
@@ -1190,6 +1296,8 @@ fn sockaddr_from(addr: SocketAddr) -> Result<libc::sockaddr_in, SrtError> {
 pub struct SrtListener {
     /// 常驻监听 socket（由 bind_listener 建立，Drop 时关闭）
     sock: SRTSOCKET,
+    /// v0.5.3：UDP DATAGRAM 实验模式开关（accept 出的连接继承此配置）
+    udp_datagram: bool,
 }
 
 // 跨线程移动（accept_loop 经 spawn_blocking 调用 accept_one）
@@ -1199,7 +1307,7 @@ unsafe impl Sync for SrtListener {}
 impl SrtListener {
     /// 在常驻监听 socket 上接受一个连接（阻塞，可并发调用）
     pub fn accept_one(&self) -> Result<SrtConnection, SrtError> {
-        SrtConnection::accept_from_listener(self.sock)
+        SrtConnection::accept_from_listener(self.sock, self.udp_datagram)
     }
 }
 
