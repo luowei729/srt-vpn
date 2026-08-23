@@ -561,7 +561,9 @@ async fn start_udp_associate(
                             // 大包自动分片，小包单帧原样
                             let frames = crate::server::forward::split_udp_frames(&addr_header, payload);
                             for frame in frames {
-                                if let Err(e) = session.send_data(&frame).await {
+                                // v0.5.2：UDP 方向改走不可靠通道（QUIC DATAGRAM 语义）--
+                                // SRT per-message TTL 过期即弃，丢包链路下不再被重传拖高延时
+                                if let Err(e) = session.send_unreliable(&frame).await {
                                     tracing::debug!(error = %e, "UDP 隧道发送失败");
                                     break;
                                 }

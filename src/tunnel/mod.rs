@@ -28,12 +28,18 @@ pub const TUNNEL_MAGIC: [u8; 4] = *b"SRTV";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FrameType {
-    /// 数据帧（承载应用数据）
+    /// 数据帧（承载应用数据，可靠有序 = QUIC STREAM 语义）
     Data = 0x01,
     /// ACK（窗口推进/流控信号）
     Ack = 0x02,
     /// NACK（丢包报告，best-effort 模式用）
     Nack = 0x03,
+    /// 不可靠数据报帧（v0.5.2 新增 = QUIC DATAGRAM 语义）
+    /// 承载 UDP 隧道数据：底层走 SRT per-message TTL 过期即弃 + inorder=0，
+    /// 与 Data 帧共用会话通道（接收侧等同 Data 处理），仅发送路径可靠性不同。
+    /// 选独立类型而非 Data+flags 位：语义显式、老版本收到未知类型静默丢弃
+    /// （decode_frame from_byte 返回 None），不会误当可靠数据处理。
+    Datagram = 0x04,
     /// 挑战（服务器下发 nonce）
     Challenge = 0x10,
     /// 应答（客户端响应）
@@ -57,6 +63,7 @@ impl FrameType {
             0x01 => Some(Self::Data),
             0x02 => Some(Self::Ack),
             0x03 => Some(Self::Nack),
+            0x04 => Some(Self::Datagram),
             0x10 => Some(Self::Challenge),
             0x11 => Some(Self::Response),
             0x12 => Some(Self::Heartbeat),

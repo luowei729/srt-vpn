@@ -229,6 +229,28 @@ impl TunnelSession {
         Ok(())
     }
 
+    /// 发送不可靠数据帧到隧道（QUIC DATAGRAM 语义，v0.5.2 新增）
+    ///
+    /// UDP 隧道方向专用：帧类型用 Datagram（0x04），底层 SRT 消息带自适应 TTL
+    /// （过期即弃、不重传、允许后发先至）。丢包链路下 UDP 端到端延时被钳在
+    /// ≈TTL（max(2×RTT,150ms)）内，不再被 TCP 重传排队拖高。
+    /// 大数据自动分片；同一批分片取同一次 adaptive_ttl_ms()，保证全到或全弃。
+    pub async fn send_unreliable(&self, data: &[u8]) -> Result<(), String> {
+        // 同一数据报的所有分片共用一个 TTL：避免"部分分片 TTL 不同导致半弃"
+        let ttl = self.conn.adaptive_ttl_ms();
+        for chunk in data.chunks(FRAME_DATA_MAX) {
+            // 帧类型 Datagram：接收侧 dispatch_frame 按 Data 事件投递，会话层无感
+            let frame = self.mux_enc.encode_frame(FrameType::Datagram, self.session_id, 0, chunk);
+            self.conn
+                .send_unreliable(frame, ttl)
+                .map_err(|e| format!("发送不可靠数据帧失败: {e}"))?;
+        }
+        // 与 send_data 一致计入发送字节指标（F2 口径统一）
+        let m = crate::metrics::metrics();
+        m.tx_bytes.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     /// 批量发送数据帧到隧道（带宽优化，2026-08-19）
     ///
     /// 优化点（移除 TS 伪装层后）：
@@ -348,6 +370,16 @@ pub fn dispatch_frame(
                 DispatchAction::UnknownSession(frame.session_id)
             }
         }
+        // v0.5.2：Datagram 帧（QUIC DATAGRAM 语义）接收侧与 Data 等同处理--
+        // 可靠性差异只体现在发送路径（SRT per-message TTL），会话层收到的都是
+        // 完整隧道帧，无需感知底层通道类型。
+        FrameType::Datagram => {
+            if registry.route(frame.session_id, SessionEvent::Data(frame.payload.clone())) {
+                DispatchAction::Routed
+            } else {
+                DispatchAction::UnknownSession(frame.session_id)
+            }
+        }
         FrameType::Fin => {
             // 半关闭信号：投递 Fin 事件（会话任务收到后停止接收、仍可发送）
             registry.route(frame.session_id, SessionEvent::Fin);
@@ -421,6 +453,36 @@ mod tests {
         // 会话通道应收到 Data 事件
         let ev = try_recv_event(&mut rx).expect("应有事件");
         assert!(matches!(ev, SessionEvent::Data(d) if d == b"hello"));
+    }
+
+    #[test]
+    /// v0.5.2：Datagram 帧（QUIC DATAGRAM）接收侧等同 Data 投递--
+    /// 验证不可靠通道的接收语义与可靠通道一致，会话层无感
+    fn test_dispatch_datagram_routes_as_data() {
+        let reg = SessionRegistry::new();
+        let (sid, mut rx) = reg.allocate().expect("分配成功");
+        let frame = mk_frame(FrameType::Datagram, sid, b"udp");
+        let act = dispatch_frame(&frame, &reg);
+        assert!(matches!(act, DispatchAction::Routed), "Datagram 应路由到已注册会话 {sid}");
+        // 接收侧收到的是 Data 事件（与 Data 帧完全一致的投递路径）
+        let ev = try_recv_event(&mut rx).expect("应有事件");
+        assert!(matches!(ev, SessionEvent::Data(d) if d == b"udp"));
+    }
+
+    #[test]
+    /// v0.5.2：Datagram 帧类型值 = 0x04 且编解码往返正确
+    /// （老版本对端 from_byte(0x04) 返回 None → decode_frame 静默丢弃，不断连）
+    fn test_datagram_frame_type_roundtrip() {
+        assert_eq!(FrameType::Datagram as u8, 0x04);
+        assert_eq!(FrameType::from_byte(0x04), Some(FrameType::Datagram));
+        // 编码器产出 Datagram 帧 → 解码器还原同类型（reliable 标志仅写入 flags 位，不影响类型）
+        let enc = crate::tunnel::multiplex::MuxEncoder::new(true);
+        let raw = enc.encode_frame(FrameType::Datagram, 9, 0, b"dg");
+        let mut dec = crate::tunnel::multiplex::MuxDecoder::new();
+        let f = dec.decode_frame(&raw).expect("应可解码");
+        assert_eq!(f.ftype, FrameType::Datagram);
+        assert_eq!(f.session_id, 9);
+        assert_eq!(f.payload, b"dg");
     }
 
     #[test]

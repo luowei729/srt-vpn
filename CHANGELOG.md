@@ -2,6 +2,29 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-23 16:10] - v0.5.2 QUIC STREAM/DATAGRAM 双通道语义 + SRT per-message 自适应 TTL
+
+### 改动前总结
+- **用户指令**：`继续参照 quic 实现处理 tcp 和 udp 的方法，然后测试` + `srt 可靠传输应该设置成延时自适应，因为不同的服务器延时不同，有时候延时会突然增大`。
+- **现状**：v0.5.1 发送通道仅传 `Vec<u8>`，`run_send_loop` 统一 `srt_sendmsg(ttl=-1, inorder=1)`——TCP/UDP 全部可靠有序重传；UDP 延时敏感数据（DNS/QUIC/WireGuard）在丢包链路上被重传排队拖出高延时；RTT 无采样、TTL 无自适应。
+- **源码核实**（内嵌 srt-1.5.6）：per-message TTL 走 `CSndBuffer::m_iTTL` 独立路径（buffer_snd.cpp:350/469），与 `SNDDROPDELAY=-1`(TLPKTDROP) 互不影响；TTL 基准为消息入队时刻 `m_tsOriginTime`（buffer_snd.cpp:347），`srctime=0` 安全；TSBPD 关闭时 libsrt 强制清零 srctime（core.cpp:7125）。
+
+### 改动后总结
+1. **`src/srt/bindings.rs`**：新增 `CBytePerfMon` 全 82 字段 FFI 定义（严格对照 srt.h:304-410 含 1.5.0 尾部字段，gcc 探针实测 sizeof=496B 与 Rust repr(C) 一致）+ `srt_bistats(u,perf,clear,instantaneous)` 声明 + `PB_FIRST/PB_LAST/PB_SOLO` 常量 + `SRT_MSGCTRL::default()`。
+2. **`src/srt/connection.rs`**（核心）：
+   - 新增 `SendItem{data,reliable,ttl_ms}` 双通道条目：reliable=true ≙ QUIC STREAM（msgttl=-1+inorder=1，TCP 零变化）；reliable=false ≙ DATAGRAM（msgttl=自适应+inorder=0，过期即弃允许后发先至）。
+   - `run_send_loop` 改 `srt_sendmsg2+SRT_MSGCTRL`（每次重试重建 mctrl 防字段被改写），背压重试/断开退出语义不变。
+   - 新增 `RttTracker`：EWMA α=1/8 初值 70ms 钳位 [60,800]ms，原子 i32 免锁；`adaptive_ttl()` = max(2×EWMA_RTT, 150ms)。接收线程每 500ms 节流调 `srt_bistats(instantaneous=1)` 采样 msRTT 并同步 `metrics.last_rtt_ms`。新增公开 API `send_unreliable(data,ttl)/adaptive_ttl_ms()/ewma_rtt_ms()`，旧 `send()` 签名不变内部包装 reliable。
+3. **`src/tunnel/mod.rs` + `dispatch.rs`**：新增 `FrameType::Datagram = 0x04`（选独立类型而非 flags 位：老版本 from_byte(0x04)=None 静默丢弃不断连）；`TunnelSession::send_unreliable()` 同一数据报分片共用一次 TTL（全到或全弃）；`dispatch_frame` Datagram 分支接收侧等同 Data 投递（会话层无感）。
+4. **`src/client/socks5.rs` + `src/server/forward.rs`**：UDP 双方向（客户端→隧道、服务端 v4/v6 回包）改走 `send_unreliable`；TCP 路径 proxy.rs 不动。
+5. **坑位修复**：`SRT_MSGCTRL.msgno=0` 触发 `INVALID forced msgno`（core.cpp:6889 要求 -1=自动分配或 [1,MSGNO_SEQ_MAX]），且发送循环把 MN_INVAL 当背压无限重试刷屏——Default 改 `msgno:-1` 并注释。
+6. **验证**：`cargo test 32/32`（新增 Datagram 路由/编解码往返 2 用例）；回环端到端：TCP 冒烟 200 OK、UDP ASSOCIATE→DNS 解析 3/3 PASS（往返 1-12ms）、下行 100MB 单流 91.8MB/s、4 并发聚合 ≈96MB/s，与 v0.5.1 基线持平，双端日志零错误。
+7. **"回环上行慢"破案（重要更正）**：初测 curl POST 上行仅 ~699KB/s 引发排查，经五组实验（v0.5.0 二进制对照 / 禁 RTT 采样 / 退回 srt_sendmsg / Python 裸 socket / curl 直连）定位为**测试工具假象而非隧道问题**——自写 sink 服务端等连接关闭才回响应，而 curl 发完 body 保持连接等响应，双方互等到 `--max-time` 超时，`speed_upload` 被错误除以超时秒数（349506×60s=20971520B 完美吻合）。修正 sink 按 Content-Length 判定后：**curl 经隧道上行 12.4MB/s(20MB/1.69s) 数据完整；Python 裸 socket 经隧道上行 513MB/s**——隧道上行吞吐从未有问题，v0.5.0→v0.5.2 无回归。教训见 DEVTIPS。
+
+### 待办（下一会话）
+- SG 公网三档验证（bench_sg.py 单流/8 并发 + Chrome speedtest WeRTC 场景观察 TTFB 与多线上传、UDP 延时改善）
+- 打 tag v0.5.2 触发 release.yml 发布（需确认）
+
 ## [2026-08-23 11:05] - passwall 回归 v0.5.0 libsrt 单密码 + OpenWrt 10.0.100.1 全链验证（SOCKS5 三合一）
 
 ### 改动前总结

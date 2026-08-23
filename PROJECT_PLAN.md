@@ -344,6 +344,17 @@ srt-vpn/
 > - `rust:1.97-alpine` `static-pie 10.9M` 交付 `OpenWrt musl` 零依赖，`BSQuo71x Srtvpn` 节点 `passphrase change-me…` 经 `ln_run srt-vpn -c` 启动双实例 `127.0.0.1:1070/3001 LISTEN`。
 > - `curl --socks5/-x http://example.com 200 cloudflare` 三合一验证通过，`srt-vpn` 日志 `SRT 连接建立成功` 无告警，与 `SG 0.5.0 FileCC` 对时握手一致。详见 `CHANGELOG 2026-08-23 11:05`。
 
+### v0.5.2 QUIC STREAM/DATAGRAM 双通道 + SRT 自适应 TTL（2026-08-23 16:10，已落地待公网验证）
+
+- [x] **QUIC 语义映射**（用户指令"参照 quic 处理 tcp/udp + srt 延时自适应"）：
+  - TCP Data 帧 ≙ QUIC STREAM：`srt_sendmsg2(msgttl=-1, inorder=1)`，行为与旧版完全等价
+  - UDP 新增 `FrameType::Datagram=0x04` ≙ QUIC DATAGRAM：`msgttl=自适应, inorder=0` 过期即弃允许后发先至
+- [x] **SRT 自适应 TTL**：接收线程每 500ms 节流采样 `srt_bistats(instantaneous=1).msRTT` → EWMA(α=1/8, 初值70ms, 钳位[60,800]ms) → TTL=max(2×RTT,150ms)；同步 metrics.last_rtt_ms 观测
+- [x] **FFI 扩展**：CBytePerfMon 全 82 字段（gcc 探针核 sizeof=496B 与 Rust repr(C) 一致）+ srt_bistats + SRT_MSGCTRL::default(msgno=-1)
+- [x] **验证**：cargo test 32/32；回环 TCP 冒烟 + UDP DNS DATAGRAM 3/3 PASS + 下行 100MB 91.8MB/s 与基线持平、4 并发聚合 ≈96MB/s、双端日志零错误
+- [x] **上行吞吐澄清（2026-08-23 16:40 破案）**：初测"回环上行 699KB/s"经五组对照实验定性为**测试工具假象**（自写 sink 等连接关闭才回响应，curl 发完 body 互等至 max-time 超时，speed_upload=数据量/超时秒数）；修正后 **curl 经隧道上行 12.4MB/s、Python 裸 socket 经隧道 513MB/s**——v0.5.0→v0.5.2 上行无任何回归
+- [ ] **待办**：SG 公网三档验证（bench_sg.py + Chrome speedtest 观察 TTFB/多线上传/UDP 延时改善）；tag v0.5.2 发布需确认
+
 ### P2（规划：重构后更新）：TUN 模式 + iptables NAT + 动态 PID + 黑名单
 
 > P2 原规划基于 libsrt 时代，待 PX 重构落地后按新内核重新评估 TUN/NAT/动态 PID 可行性。

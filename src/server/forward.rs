@@ -258,7 +258,9 @@ async fn start_udp_forward(
                         // 按大小自动分片（小包单帧原样，大包拆多帧）
                         let frames = split_udp_frames(&header, &udp_buf[..len]);
                         for frame in frames {
-                            if let Err(e) = session.send_data(&frame).await {
+                            // v0.5.2：回传方向改走不可靠通道（QUIC DATAGRAM 语义），
+                            // 与客户端→隧道方向对称，丢包链路下 UDP 延时不被重传拖高
+                            if let Err(e) = session.send_unreliable(&frame).await {
                                 tracing::debug!(session = session_id, error = %e, "UDP 回传失败");
                                 break;
                             }
@@ -286,7 +288,8 @@ async fn start_udp_forward(
                         encode_udp_addr_header(&src, &mut header);
                         let frames = split_udp_frames(&header, &udp_buf_v6[..len]);
                         for frame in frames {
-                            if let Err(e) = session.send_data(&frame).await {
+                            // v0.5.2：v6 回包同样走不可靠通道（与 v4 对称）
+                            if let Err(e) = session.send_unreliable(&frame).await {
                                 tracing::debug!(session = session_id, error = %e, "UDP 回传失败（v6）");
                                 break;
                             }

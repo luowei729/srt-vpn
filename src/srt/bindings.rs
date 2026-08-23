@@ -118,6 +118,14 @@ pub fn srt_state_unavailable(state: c_int) -> bool {
     state >= SRTS_BROKEN
 }
 
+/// 消息边界常量（对应 srtcore/packet.h PacketBoundaryBits）
+/// 发送侧 libsrt 内部按消息分片自动设置 PB_FIRST/PB_LAST/PB_SOLO，
+/// SRT_MSGCTRL.boundary 传入值仅作占位；本项目单帧 ≤1301B < payload 1316，
+/// 天然单包单消息，恒为 PB_SOLO。
+pub const PB_LAST: c_int = 1; // 消息最后一包
+pub const PB_FIRST: c_int = 2; // 消息第一包
+pub const PB_SOLO: c_int = 3; // 独立单包消息（PB_FIRST|PB_LAST）
+
 /// SRT 消息控制结构（对应 srt.h SRT_MSGCTRL）
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -131,6 +139,132 @@ pub struct SRT_MSGCTRL {
     pub msgno: i32,
     pub grpdata: *mut c_void,
     pub grpdata_size: usize,
+}
+
+impl Default for SRT_MSGCTRL {
+    /// 默认值：与 libsrt 官方示例一致（srt_sendmsg2 调用前必须初始化全字段）
+    fn default() -> Self {
+        Self {
+            flags: 0,
+            msgttl: -1, // 默认无限 TTL（可靠语义）
+            inorder: 1, // 默认保序投递
+            boundary: PB_SOLO,
+            srctime: 0, // TSBPD 关闭时 libsrt 会强制清零，无需应用侧填时间戳
+            pktseq: 0,
+            // msgno 必须 -1（=由 libsrt 自动分配）；0 会被 CUDT::sendmsg2 判为
+            // "强制指定消息号"且越界（合法域 [1,MSGNO_SEQ_MAX]），抛 MN_INVAL。
+            // 实测教训：msgno=0 导致发送失败并被当背压无限重试刷屏（core.cpp:6889）。
+            msgno: -1,
+            grpdata: std::ptr::null_mut(),
+            grpdata_size: 0,
+        }
+    }
+}
+
+// ===== 字节级性能统计（2026-08-23 v0.5.2 新增）=====
+//
+// 对应 srt.h CBytePerfMon（srt.h:304-410，含 1.5.0 新增尾部字段），
+// 用于 srt_bistats(instantaneous=1) 读取瞬时 RTT，驱动 per-message TTL 自适应。
+//
+// 布局安全关键：
+// - 字段顺序/类型必须与 srt.h 逐项一致（repr(C) 自然对齐规则与 MSVC/GCC 一致）
+// - srt.h 明确要求"新字段只许加在末尾"，故本定义以 1.5.6 全字段为准；
+//   若未来升级 libsrt 且在中间插字段，此处必须同步重抄
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CBytePerfMon {
+    // ---- global measurements（累计值）----
+    pub msTimeStamp: i64,           // socket 存活时长（毫秒）
+    pub pktSentTotal: i64,          // 已发数据包总数（含重传）
+    pub pktRecvTotal: i64,          // 已收数据包总数
+    pub pktSndLossTotal: c_int,     // 发送侧累计丢包数
+    pub pktRcvLossTotal: c_int,     // 接收侧累计丢包数
+    pub pktRetransTotal: c_int,     // 累计重传包数
+    pub pktSentACKTotal: c_int,     // 已发 ACK 总数
+    pub pktRecvACKTotal: c_int,     // 已收 ACK 总数
+    pub pktSentNAKTotal: c_int,     // 已发 NAK 总数
+    pub pktRecvNAKTotal: c_int,     // 已收 NAK 总数
+    pub usSndDurationTotal: i64,    // 累计发送忙碌时长（微秒）
+    pub pktSndDropTotal: c_int,     // 发送侧因过期丢弃的包总数
+    pub pktRcvDropTotal: c_int,     // 接收侧因迟到丢弃的包总数
+    pub pktRcvUndecryptTotal: c_int,// 无法解密的包总数
+    pub byteSentTotal: u64,         // 已发字节总数（含重传）
+    pub byteRecvTotal: u64,         // 已收字节总数
+    pub byteRcvLossTotal: u64,      // 接收侧丢失字节总数
+    pub byteRetransTotal: u64,      // 重传字节总数
+    pub byteSndDropTotal: u64,      // 发送侧丢弃字节总数
+    pub byteRcvDropTotal: u64,      // 接收侧丢弃字节总数（按平均包长估算）
+    pub byteRcvUndecryptTotal: u64, // 无法解密字节总数
+
+    // ---- local measurements（自上次查询以来的局部值）----
+    pub pktSent: i64,
+    pub pktRecv: i64,
+    pub pktSndLoss: c_int,
+    pub pktRcvLoss: c_int,
+    pub pktRetrans: c_int,
+    pub pktRcvRetrans: c_int,
+    pub pktSentACK: c_int,
+    pub pktRecvACK: c_int,
+    pub pktSentNAK: c_int,
+    pub pktRecvNAK: c_int,
+    pub mbpsSendRate: f64,          // 发送速率 Mb/s
+    pub mbpsRecvRate: f64,          // 接收速率 Mb/s
+    pub usSndDuration: i64,
+    pub pktReorderDistance: c_int,  // 收到乱序的距离
+    pub pktRcvAvgBelatedTime: f64,  // 迟到包平均延迟
+    pub pktRcvBelated: i64,         // 因迟到被忽略的包数
+    pub pktSndDrop: c_int,
+    pub pktRcvDrop: c_int,
+    pub pktRcvUndecrypt: c_int,
+    pub byteSent: u64,
+    pub byteRecv: u64,
+    pub byteRcvLoss: u64,
+    pub byteRetrans: u64,
+    pub byteSndDrop: u64,
+    pub byteRcvDrop: u64,
+    pub byteRcvUndecrypt: u64,
+
+    // ---- instant measurements（瞬时值，自适应 TTL 的数据源）----
+    pub usPktSndPeriod: f64,        // 包发送间隔（微秒）
+    pub pktFlowWindow: c_int,       // 流控窗口（包数）
+    pub pktCongestionWindow: c_int, // 拥塞窗口（包数）
+    pub pktFlightSize: c_int,       // 在途包数
+    pub msRTT: f64,                 // ★ RTT（毫秒）：instantaneous=1 时为瞬时值，驱动自适应 TTL
+    pub mbpsBandwidth: f64,         // 估算带宽 Mb/s
+    pub byteAvailSndBuf: c_int,     // 发送缓冲可用字节
+    pub byteAvailRcvBuf: c_int,     // 接收缓冲可用字节
+
+    pub mbpsMaxBW: f64,             // 带宽上限设置值 Mbps
+    pub byteMSS: c_int,             // MTU
+    pub pktSndBuf: c_int,           // 发送缓冲未 ACK 包数
+    pub byteSndBuf: c_int,          // 发送缓冲未 ACK 字节
+    pub msSndBuf: c_int,            // 发送缓冲未 ACK 时间跨度（毫秒）
+    pub msSndTsbPdDelay: c_int,     // 发送侧 TSBPD 延迟
+    pub pktRcvBuf: c_int,           // 接收缓冲未投递包数
+    pub byteRcvBuf: c_int,          // 接收缓冲未投递字节
+    pub msRcvBuf: c_int,            // 接收缓冲未投递时间跨度（毫秒）
+    pub msRcvTsbPdDelay: c_int,     // 接收侧 TSBPD 延迟
+
+    pub pktSndFilterExtraTotal: c_int, // 包过滤器额外产生的控制包总数
+    pub pktRcvFilterExtraTotal: c_int, // 过滤器收到但未回供的控制包总数
+    pub pktRcvFilterSupplyTotal: c_int,// FEC 重建等额外供给包总数
+    pub pktRcvFilterLossTotal: c_int,  // 过滤器无法覆盖的丢包总数
+
+    pub pktSndFilterExtra: c_int,
+    pub pktRcvFilterExtra: c_int,
+    pub pktRcvFilterSupply: c_int,
+    pub pktRcvFilterLoss: c_int,
+    pub pktReorderTolerance: c_int, // 当前乱序容限值
+
+    // ---- New stats in 1.5.0（srt.h 要求追加在末尾的字段）----
+    pub pktSentUniqueTotal: i64,    // 应用实际发送的数据包总数（不含重传）
+    pub pktRecvUniqueTotal: i64,    // 应用应接收的数据包总数
+    pub byteSentUniqueTotal: u64,   // 应用实际发送字节总数
+    pub byteRecvUniqueTotal: u64,   // 应用应接收字节总数
+    pub pktSentUnique: i64,
+    pub pktRecvUnique: i64,
+    pub byteSentUnique: u64,
+    pub byteRecvUnique: u64,
 }
 
 /// epoll 事件结构（对应 srt.h SRT_EPOLL_EVENT）
@@ -203,6 +337,12 @@ extern "C" {
 
     /// 接收消息（带控制结构）
     pub fn srt_recvmsg2(u: SRTSOCKET, buf: *mut c_char, len: c_int, mctrl: *mut SRT_MSGCTRL) -> c_int;
+
+    /// 字节级性能统计查询（对应 srt.h srt_bistats，v0.5.2 新增）
+    /// - clear=1：同时清零局部统计；本项目传 0（只读不干扰）
+    /// - instantaneous=1：msRTT 等返回瞬时值（非平滑均值），
+    ///   这是自适应 TTL 选它而非 srt_bstats 的原因（链路突变能立刻感知）
+    pub fn srt_bistats(u: SRTSOCKET, perf: *mut CBytePerfMon, clear: c_int, instantaneous: c_int) -> c_int;
 
     /// 获取最后错误码
     pub fn srt_getlasterror(errno_loc: *mut c_int) -> c_int;
