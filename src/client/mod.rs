@@ -54,7 +54,7 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
         passphrase: cfg.passphrase.clone(),
         pbkeylen: crate::config::crypto_to_pbkeylen(&cfg.crypto),
         streamid: Some(streamid),
-        rcv_latency: 1000,
+        rcv_latency: 120, // P1 2026-08-23：1000→120ms 与服务端一致
         reliable: true, // 客户端跟随服务端协商，默认可靠
         message_api: true,
         payload_size: 1316, // SRT 官方默认 payload（SRT_LIVE_DEF_PLSIZE=1316）

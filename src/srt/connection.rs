@@ -118,7 +118,7 @@ impl Default for SrtConfig {
             passphrase: String::new(),
             pbkeylen: 16, // aes-128
             streamid: None,
-            rcv_latency: 1000,
+            rcv_latency: 120, // P1 2026-08-23：1000→120ms 降低 TTFB（TSBPD 关闭后仅重传窗口，120ms 已够 70ms RTT 重传）
             reliable: true,
             message_api: true,
             payload_size: 1316, // SRT 官方默认 payload
@@ -245,8 +245,8 @@ impl SrtConnection {
             }
 
             // 关键：连接确认后短暂等待，让 SRT 内部接收/发送队列完全就绪
-            // （连接事件触发后立即收发可能丢数据，实测需要小延迟）
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            // P0+P1 2026-08-23：200ms→50ms 降低首包 TTFB（实测 50ms 已足够，配合 epoll CONNECT 事件，移除后偶发丢首包）
+            std::thread::sleep(std::time::Duration::from_millis(50));
 
             // 连接建立后设为非阻塞（配合 epoll 事件循环收发）
             Self::set_nonblocking(sock)?;
@@ -376,8 +376,8 @@ impl SrtConnection {
             // 关键：accept 返回后等待握手完全完成！
             // 实测：responder 立即发数据时，initiator 的握手（URQ_CONCLUSION/AGREEMENT）
             // 还没完成，会触发 "Connection was broken"，数据丢失。
-            // 等待 300ms 让握手完成后再进入认证/收发。
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            // P0+P1 2026-08-23：300ms→50ms 降低首包 TTFB（配合 epoll CONNECT 事件，50ms 已足够）
+            std::thread::sleep(std::time::Duration::from_millis(50));
 
             // 已接受的连接设为非阻塞（配合 epoll 事件循环收发）
             Self::set_nonblocking(accepted)?;
@@ -627,7 +627,8 @@ impl SrtConnection {
         }
 
         // 保活（SRT 层 keepalive 由 libsrt 内部管理，这里设置对端空闲超时）
-        set(SRT_SOCKOPT::SRTO_PEERIDLETIMEO, &10_000)?;
+        // P1 2026-08-23：10000→5000ms 更快感知对端失联，且不影响 5s 心跳保活
+        set(SRT_SOCKOPT::SRTO_PEERIDLETIMEO, &5_000)?;
 
         Ok(())
     }

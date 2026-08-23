@@ -186,40 +186,43 @@ async fn start_udp_forward(
                         if let Some(full) = reassembler.push(&data) {
                             // 解析地址头 → (host, port, payload)
                             if let Some((host, port, payload)) = parse_udp_addr_header(&full) {
-                                // 解析目标地址（lookup_host 接受 (host, port) 所有权，避免借用生命周期问题）
-                                match tokio::net::lookup_host((host.as_str(), port)).await {
-                                    Ok(mut addrs) => {
-                                        if let Some(addr) = addrs.next() {
-                                            // H2 配套修复（2026-08-19）：按目标地址族选 socket
-                                            // （v4-only socket 无法向 v6 目标 send_to，实测 ::1 超时根因）
-                                            let sock = if addr.is_ipv4() {
-                                                socket_v4.clone()
-                                            } else {
-                                                match &socket_v6 {
-                                                    Some(s) => s.clone(),
-                                                    None => {
-                                                        // 懒创建 v6 socket（首次遇到 v6 目标时补建）
-                                                        match tokio::net::UdpSocket::bind("[::]:0").await {
-                                                            Ok(s) => {
-                                                                let s = std::sync::Arc::new(s);
-                                                                socket_v6 = Some(s.clone());
-                                                                s
-                                                            }
-                                                            Err(e) => {
-                                                                tracing::warn!(session = session_id, error = %e, "IPv6 UDP socket 创建失败（v6 目标不可达）");
-                                                                continue;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            };
-                                            if let Err(e) = sock.send_to(payload, addr).await {
-                                                tracing::debug!(session = session_id, error = %e, "UDP send_to 失败");
-                                            }
+                                // P0 2026-08-23：IP字面量快路径（避免每包DNS，speedtest上传0时STUN风暴放大）
+                                let resolved: Option<std::net::SocketAddr> = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                                    Some(std::net::SocketAddr::new(ip, port))
+                                } else {
+                                    match tokio::net::lookup_host((host.as_str(), port)).await {
+                                        Ok(mut addrs) => addrs.next(),
+                                        Err(e) => {
+                                            tracing::debug!(session = session_id, host = %host, port = port, error = %e, "UDP 目标解析失败");
+                                            None
                                         }
                                     }
-                                    Err(e) => {
-                                        tracing::debug!(session = session_id, host = %host, port = port, error = %e, "UDP 目标解析失败");
+                                };
+                                if let Some(addr) = resolved {
+                                    // H2 配套修复（2026-08-19）：按目标地址族选 socket
+                                    // （v4-only socket 无法向 v6 目标 send_to，实测 ::1 超时根因）
+                                    let sock = if addr.is_ipv4() {
+                                        socket_v4.clone()
+                                    } else {
+                                        match &socket_v6 {
+                                            Some(s) => s.clone(),
+                                            None => {
+                                                match tokio::net::UdpSocket::bind("[::]:0").await {
+                                                    Ok(s) => {
+                                                        let s = std::sync::Arc::new(s);
+                                                        socket_v6 = Some(s.clone());
+                                                        s
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(session = session_id, error = %e, "IPv6 UDP socket 创建失败（v6 目标不可达）");
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    };
+                                    if let Err(e) = sock.send_to(payload, addr).await {
+                                        tracing::debug!(session = session_id, error = %e, "UDP send_to 失败");
                                     }
                                 }
                             } else {
@@ -565,9 +568,10 @@ pub async fn start_tcp_forward(
     // 1. 连接目标（支持 IPv4/DNS）
     //    稳定性加固（2026-08-19）：connect 加 10s 超时，避免目标不可达时
     //    转发任务永久挂起（此前"连接目标超时"会话死循环导致服务端卡死的根因之一）
+    //    P0 2026-08-23：10s→3s 快失败（speedtest上传0时多并发Open 10s占会话，隧道被垃圾会话占满）
     let target = format!("{}:{}", open.host, open.port);
     let mut stream = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(3),
         TcpStream::connect(&target),
     )
     .await

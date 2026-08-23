@@ -18,12 +18,13 @@ pub async fn run(cfg: &Config) -> Result<(), String> {
     let peer_addr = parse_listen_addr(&listen)?;
 
     // 构建监听配置（服务端：listen 模式 + 不设 streamid）
+    // P1 2026-08-23：1000→120ms 降低 TTFB（与客户端一致）
     let srt_cfg = SrtConfig {
         peer_addr,
         passphrase: cfg.passphrase.clone(),
         pbkeylen: crate::config::crypto_to_pbkeylen(&cfg.crypto),
         streamid: None,
-        rcv_latency: 1000,
+        rcv_latency: 120,
         reliable: match cfg.udp_mode {
             crate::cli::UdpMode::Reliable => true,
             crate::cli::UdpMode::BestEffort => false,
