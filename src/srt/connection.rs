@@ -272,6 +272,11 @@ pub struct SrtConnection {
     /// 接收通道（事件循环线程产出；tokio UnboundedReceiver 供异步消费）
     /// 用 tokio Mutex 包装以支持 &self 方法 + 跨 await 安全
     recv_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<SrtMessage>>>,
+    /// v0.5.5：接收通道当前积压条数（recv 线程入队 +1，上层消费 -1）
+    /// 用途：高水位背压判定——浏览器停止读下载时让 SRT 流控刹车，
+    /// 防止"僵尸下载"残留流量挤占上行带宽（详见 run_recv_loop 注释）。
+    /// tokio UnboundedSender 无 len()，故用原子计数器自行跟踪。
+    recv_len: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// 发送通道（应用层投入）
     /// 2026-08-19 S1 修复：Mutex<Option<Sender>> 包装--
     /// close() 时锁内 take+drop 关闭通道，发送线程 recv() 返回 Err 自然退出。
@@ -398,6 +403,9 @@ impl SrtConnection {
             //   tokio 侧直接 UnboundedReceiver.recv().await 异步消费。
             //   消除原先 crossbeam + spawn_blocking 双重桥接的全双工吞吐瓶颈。
             let (recv_tx, recv_rx) = tokio::sync::mpsc::unbounded_channel::<SrtMessage>();
+            // v0.5.5：接收积压计数器（recv 线程 +1 / 上层消费 -1），高水位背压判定用
+            let recv_len_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let recv_len_recv = recv_len_counter.clone();
             // v0.5.3 双队列：可靠队列(TCP/控制/默认UDP) + 优先队列(实验 Datagram)；
             // RTT/SNDBUF 跟踪器随连接创建（收发线程共享 Arc）
             let (send_rel_tx, send_rel_rx) = crossbeam_channel::unbounded::<SendItem>();
@@ -439,7 +447,7 @@ impl SrtConnection {
             let closed_recv = closed.clone();
             let rtt_recv = rtt.clone();
             let recv_thread = std::thread::spawn(move || {
-                Self::run_recv_loop(recv_sock, eid, recv_tx, rtt_recv);
+                Self::run_recv_loop(recv_sock, eid, recv_tx, rtt_recv, recv_len_recv);
                 // 接收线程退出 = 连接终结：置位 closed + 释放 epoll（唯一释放方）
                 closed_recv.store(true, AtomicOrdering::Release);
                 // 注：此处处于外层 unsafe 块内，无需再套 unsafe（修复嵌套警告）
@@ -449,6 +457,7 @@ impl SrtConnection {
             Ok(Self {
                 socket: sock,
                 recv_rx: Arc::new(tokio::sync::Mutex::new(recv_rx)),
+                recv_len: recv_len_counter,
                 send_rel_tx: Mutex::new(Some(send_rel_tx)),
                 send_prio_tx: Mutex::new(Some(send_prio_tx)),
                 udp_datagram,
@@ -531,8 +540,10 @@ impl SrtConnection {
             Self::set_nonblocking(accepted)?;
 
             // 启动事件循环（同 connect 后半部分）
-            // v0.5.3 双队列：与 connect 一致
+            // v0.5.3 双队列：与 connect 一致；v0.5.5 接收积压计数器
             let (recv_tx, recv_rx) = tokio::sync::mpsc::unbounded_channel::<SrtMessage>();
+            let recv_len_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let recv_len_recv = recv_len_counter.clone();
             let (send_rel_tx, send_rel_rx) = crossbeam_channel::unbounded::<SendItem>();
             let (send_prio_tx, send_prio_rx) = crossbeam_channel::unbounded::<SendItem>();
             let rtt = Arc::new(RttTracker::new());
@@ -565,7 +576,7 @@ impl SrtConnection {
             let closed_recv = closed.clone();
             let rtt_recv = rtt.clone();
             let recv_thread = std::thread::spawn(move || {
-                Self::run_recv_loop(recv_sock, eid, recv_tx, rtt_recv);
+                Self::run_recv_loop(recv_sock, eid, recv_tx, rtt_recv, recv_len_recv);
                 // 接收线程退出 = 连接终结：置位 closed + 释放 epoll（唯一释放方，S1）
                 closed_recv.store(true, AtomicOrdering::Release);
                 // 注：此处处于外层 unsafe 块内，无需再套 unsafe（修复嵌套警告）
@@ -575,6 +586,7 @@ impl SrtConnection {
             Ok(Self {
                 socket: accepted,
                 recv_rx: Arc::new(tokio::sync::Mutex::new(recv_rx)),
+                recv_len: recv_len_counter,
                 send_rel_tx: Mutex::new(Some(send_rel_tx)),
                 send_prio_tx: Mutex::new(Some(send_prio_tx)),
                 udp_datagram,
@@ -701,7 +713,10 @@ impl SrtConnection {
         // 设 11MB 更稳妥：11MB/188 ≈ 61,276 包 < 65536 包，确保不违反 FC 约束
         let rcvbuf = 11 * 1024 * 1024;      // 11MB 接收缓冲（受 FC 约束，包数<65536）
         // SNDBUF 不受该约束，可大些容纳 in-flight 待确认数据
-        let sndbuf = 32 * 1024 * 1024;      // 32MB 发送缓冲（高吞吐下防止发送被限）
+        // v0.5.5：32MB→8MB——用户实测发现测速切换阶段"僵尸下载"残留流量持续
+        // 150M 挤占上行；SNDBUF 越大残留越多排空越慢。8MB 仍远超公网 BDP
+        // （200Mbps×70ms≈1.75MB），对正常吞吐无影响，但把最坏残留时长降为 1/4。
+        let sndbuf = 8 * 1024 * 1024;      // 8MB 发送缓冲（高吞吐下防止发送被限）
         set(SRT_SOCKOPT::SRTO_SNDBUF, &sndbuf)?;
         set(SRT_SOCKOPT::SRTO_RCVBUF, &rcvbuf)?;
         // UDP 层缓冲（内核 socket 缓冲），进一步吸收突发
@@ -838,6 +853,7 @@ impl SrtConnection {
         eid: i32,
         recv_tx: tokio::sync::mpsc::UnboundedSender<SrtMessage>,
         rtt: Arc<RttTracker>,
+        recv_len: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
         // v0.5.2：RTT 采样节流间隔 500ms（约 2Hz）。过密浪费 FFI 调用，过疏
         // 则链路突变（如延时骤增）响应太慢；500ms 在两者间取平衡。
@@ -854,13 +870,36 @@ impl SrtConnection {
                 if recv_tx.send(SrtMessage { data }).is_err() {
                     return;
                 }
+                // v0.5.5：入队计数 +1（高水位背压判定依据）
+                recv_len.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             } else {
                 break; // 无更多缓冲数据
             }
         }
 
         let mut events_buf = [SRT_EPOLL_EVENT { fd: -1, events: 0 }; 16];
+        // v0.5.5：接收通道高水位背压（修复"僵尸下载"）
+        //
+        // 问题：recv 通道为 unbounded，浏览器停止读取下载（测速切换阶段/页面关闭）时，
+        // 上层消费者停止取数据，但本线程仍全速收包入队 → SRT 流控永不刹车 →
+        // 服务端持续以百兆级速率发送无人消费的残留流量（用户实测 SG 网卡 tx 持续
+        // 150M），其 ACK/NACK 洪水与上传测试流量抢占上行带宽 → 上传被挤压掉 42%+
+        // （对照实验：单独上行 66Mbps vs 并发下载时 38Mbps）。
+        // 方案：通道积压超过高水位时暂停 epoll 收包数毫秒 → SRT 内核接收缓冲涨满 →
+        // libsrt 流控自动让发送方减速 → 残留下载快速消散。低水位恢复避免抖动。
+        const RECV_HIGH_WATERMARK: usize = 4096;
+        const RECV_LOW_WATERMARK: usize = 1024;
         loop {
+            if recv_len.load(std::sync::atomic::Ordering::Acquire) > RECV_HIGH_WATERMARK {
+                // 积压过高：暂停收包让流控刹车，等上层消费到低水位再继续
+                while recv_len.load(std::sync::atomic::Ordering::Acquire) > RECV_LOW_WATERMARK {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    // 期间若连接已关闭则退出（防 close 后空转）
+                    if recv_tx.is_closed() {
+                        return;
+                    }
+                }
+            }
             // v0.5.2：节流采样瞬时 RTT（每 500ms 一次，开销可忽略）。
             // msRTT>0 才更新 EWMA；同时同步到全局 metrics.last_rtt_ms 供观测端点读取。
             // （二分实验结论：采样与 sendmsg2 均与回环上行慢无关，该现象为 v0.5.1 既有）
@@ -918,6 +957,8 @@ impl SrtConnection {
                                 // 接收方已关闭
                                 return;
                             }
+                            // v0.5.5：入队计数 +1（高水位背压判定依据）
+                            recv_len.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                         } else if ret == -1 {
                             // MJ_AGAIN：当前无更多数据，结束本次批量消费
                             // 调用 unsafe 的错误字符串获取函数
@@ -1116,6 +1157,8 @@ impl SrtConnection {
         };
         match guard.try_recv() {
             Ok(msg) => {
+                // v0.5.5：消费一条，积压计数 -1（与 recv 线程入队 +1 对应）
+                self.recv_len.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 if msg.data.is_empty() {
                     Err(SrtError::Closed) // 空消息 = 连接关闭信号
                 } else {
@@ -1138,6 +1181,8 @@ impl SrtConnection {
         let mut rx = self.recv_rx.lock().await;
         match rx.recv().await {
             Some(msg) => {
+                // v0.5.5：消费一条，积压计数 -1
+                self.recv_len.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 if msg.data.is_empty() {
                     Err(SrtError::Closed) // 空消息 = 连接关闭信号
                 } else {
@@ -1162,6 +1207,8 @@ impl SrtConnection {
             Some(m) => m,
             None => return Err(SrtError::Closed),
         };
+        // v0.5.5：消费一条，积压计数 -1（与 recv 线程入队 +1 对应）
+        self.recv_len.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         if first.data.is_empty() {
             return Err(SrtError::Closed); // 空消息 = 连接关闭信号
         }
@@ -1171,6 +1218,8 @@ impl SrtConnection {
         while batch.len() < max {
             match rx.try_recv() {
                 Ok(m) => {
+                    // v0.5.5：消费计数 -1
+                    self.recv_len.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                     if m.data.is_empty() {
                         return Ok(batch); // 遇到关闭信号，先交付这批
                     }
