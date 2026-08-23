@@ -314,6 +314,13 @@ srt-vpn/
 
 > 结论：SRT 双向经独立 `RcvQueue + per-socket FileCC` 未互踩，单连接公平，`Q15` 无需双连接隔离。
 
+### SG 生产固化与带宽回归（2026-08-23 09:15，v0.5.0，单连接已达国际链路天花板，见 CHANGELOG）
+
+- **部署**：`sg_systemd.sh` 将 `nohup` 固化为 `systemd`（`enabled/active`），`binary 4.7M /etc/srt-vpn/server.json /etc/sysctl.d/99-srt-vpn.conf 33M / iptables 置顶`，`ss/journalctl` 验证 `0.0.0.0:9000` 常驻；压测服务 `run_http_sg.py 18080` 落盘 `10m/100m/1m`
+- **隔离**：`srt_probe_pub.rs` 裸 SRT 两地对比 `hk2 0.33 vs SG 8.34 MB/s(66.7M)` + `iperf UDP100/TCP116 RTT69` → SG 健康、hk2 限速，本地 500 MB/s 无回归
+- **回归**：`单 10m 20.21(161M) 100m 17.69(141M) / 8并 18.07(144M) ≈150M / 4并上传10.07(80M) >50M / 双工8/8 0.54s` MD5 全对，已超 `iperf` 单流即天花板（国际出口 100-150M/流）
+- **结论**：`CPU/多池` 优化暂缓（单连接 FileCC 已最优），剩余开发转向 `P2 TUN/NAT` 与 `passwall` 适配，见 `DEPLOY_CREDENTIALS` SG 小节
+
 | # | 决策 | 结论（v0.5.0 15 题） |
 |---|------|---------------------|
 | Q1 | 重构方向 | 推翻自研，回归 libsrt |
@@ -330,6 +337,12 @@ srt-vpn/
 | Q13 | 验收 | `16×100M 全 MD5 + 50MB/s+` |
 | Q14 | 节奏 | 本地→hk2→passwall 分层 |
 | Q15 | 双工 | 加双向同时压测（已验无互踩） |
+
+
+> 集成验证 2026-08-23 11:05（passwall 回归 v0.5.0 libsrt 单密码，OpenWrt 10.0.100.1 全链通过）：
+> - `util_srt-vpn.lua` 删 `uuid/password` 恢复 `crypto/streamid` 可选（`nil` 省略），`arg` 守卫修复 `dofile` 崩溃；`7_srt-vpn.lua` 删 `uuid/password/pool_size` 恢复 `crypto/streamid` 活跃；`po` 去重 66 行。
+> - `rust:1.97-alpine` `static-pie 10.9M` 交付 `OpenWrt musl` 零依赖，`BSQuo71x Srtvpn` 节点 `passphrase change-me…` 经 `ln_run srt-vpn -c` 启动双实例 `127.0.0.1:1070/3001 LISTEN`。
+> - `curl --socks5/-x http://example.com 200 cloudflare` 三合一验证通过，`srt-vpn` 日志 `SRT 连接建立成功` 无告警，与 `SG 0.5.0 FileCC` 对时握手一致。详见 `CHANGELOG 2026-08-23 11:05`。
 
 ### P2（规划：重构后更新）：TUN 模式 + iptables NAT + 动态 PID + 黑名单
 

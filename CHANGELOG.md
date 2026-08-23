@@ -2,6 +2,75 @@
 
 所有变更记录使用北京时间（UTC+8）。
 
+## [2026-08-23 11:05] - passwall 回归 v0.5.0 libsrt 单密码 + OpenWrt 10.0.100.1 全链验证（SOCKS5 三合一）
+
+### 改动前总结
+- **问题起源**：`openwrt-passwall-srt-vpn` 的 `util_srt-vpn.lua / 7_srt-vpn.lua` 仍为 `v0.4 TUIC` 契约（必填 `uuid/password`、`crypto/streamid` 标 `Deprecated`、`pool_size` 残留），与 `srt-vpn v0.5.0` 回归 `libsrt` 后的 `src/config.rs` 契约错位（`passphrase/crypto/streamid/socks5/reconnect/heartbeat`，无 `uuid/password`，`crypto/streamid` 恢复可选），导致 `passwall` 生成的 `client.json` 含无效字段、缺有效字段，`srt-vpn` 校验虽过但语义不一致；`po/zh-cn/passwall.po` 含重复 `SRT Server` 块 66 行（`2233` 行应唯一，`zh_Hans` 为 `zh-cn` 符号链接）；`OpenWrt 10.0.100.1` 仍跑 `srt-vpn 0.4.4`。
+- **用户指令**："`op是 10.0.100.1 root 782094.Abc passwall 继续适配开发，不用兼容旧配置 actions 编译 我自己安装`"，不保留 `uuid/password`，最小侵入回退。
+
+### 改动后总结
+1. **`openwrt-passwall-srt-vpn` 回归**（`2026-08-23 11:05`，3 文件，`20+/119-`）：
+   - `util_srt-vpn.lua`：删 `uuid/password` 回退逻辑，恢复 `crypto = (srtvpn_crypto..) ? .. : nil` 与 `streamid` 同，`arg` 加 `arg and arg[1]` 守卫（`dofile` 时 `arg` 为 `nil` 崩溃），注释更新为 `v0.5.0 libsrt 单连接多路复用，对应 src/config.rs`，`socks5.listen` 复用 `local_socks_address/port`（三合一嗅探，`http_port` 无需独立）。
+   - `7_srt-vpn.lua`：删 `uuid/password/pool_size` 三字段，将 `crypto Deprecated` 改回 `Crypto (Encryption Strength)`（`Keep default/aes-128/192/256`），`streamid Deprecated` 改回 `Camouflage Token`（`r=live/srtvpn,m=video`），`passphrase` 说明改 `10-79 字符两端一致`，保留 `srtvpn_` 前缀与 `type_name Srtvpn`（`app.sh srtvpn)` 分支小写化对应）。
+   - `po/zh-cn/passwall.po`：删重复 `SRT Server/Port/Passphrase/Crypto/Streamid/SOCKS5/Reconnect/Heartbeat/SRT-VPN` 块 66 行（`2299→2233`），`2247` `SRT Server` 去重后唯一。
+   - 辅改：`luac5.4 -p` 两文件通过；本地 `lua5.4 gen_config` 自测 3 例（全字段/空可选/IPv6 `[]`）均 `crypto aes-256/streamid r=live` 正确且无 `uuid` 泄漏；`config.rs` 真实 `from_env` 校验 `client.json` 解析通过。
+2. **x86_64 全静态编译**（`rust:1.97-alpine`，`1m24s`）：
+   - `docker run rust:1.97-alpine`（`apk add build-base cmake openssl-dev openssl-libs-static linux-headers pkgconfig`）`cargo build --release` → `dist/srt-vpn-linux-amd64 10.9M static-pie ELF 64-bit LSB pie executable BuildID 9b50ea… not stripped`（`/lib/ld-musl-x86_64.so.1`，OpenWrt `musl` 零依赖，`ldd` 仅 `musl`），与 `release.yml build-binaries` 逻辑一致。
+3. **OpenWrt 10.0.100.1 部署与验证**（`2026-08-23 11:00-11:04`）：
+   - 覆盖 `/usr/bin/srt-vpn 0.5.0`（备份 `0.4.4 9.0M→/tmp/srt-vpn.bak-0.4.4`），`scp util/7` 到 `/usr/lib/lua/luci/passwall/` 与 `/usr/lib/lua/luci/model/cbi/passwall/client/type/`，`uci set global_app.srt_vpn_file=/usr/bin/srt-vpn`。
+   - 节点 `BSQuo71x Srtvpn 129.150.44.117:9000 passphrase change-me-strong-passphrase-2026`（与 `SG /etc/srt-vpn/server.json 0.0.0.0:9000 aes-128` 一致），`uci set global.tcp_node=BSQuo71x && /etc/init.d/passwall restart`。
+   - 生成 `TCP_SOCKS_BSQuo71x.json → 127.0.0.1:3001` 与 `SOCKS_TCP.json → 127.0.0.1:1070`（`passphrase/server 129.150.44.117:9000`，`reconnect 5/10 heartbeat 5`），`ps` 双 `srt-vpn -c` 常驻，`netstat` `127.0.0.1:1070/3001 LISTEN`。
+   - `lua util gen_config` 单测在 `OpenWrt lua5.1` 上 `arg guard OK`，`dofile` 生成 `passphrase change-me…/server 129.150.44.117:9000` 正确；`timeout 2 srt-vpn -c /tmp/passwall/TCP_SOCKS_BSQuo71x.json` 日志 `SRT 连接建立成功 + 挑战-应答 RESPONSE 已发送 server 时钟`（与 `SG` 对时握手 `HMAC 90s` 一致），无 `PBKEYLEN/BADSECRET`。
+   - **端到端**：`curl --socks5 127.0.0.1:1070 http://example.com` `200 cloudflare`，`curl -x http://127.0.0.1:1070` 同 `200`（三合一嗅探验证），`127.0.0.1:3001` 同 `200`，`wget/http_proxy` 亦 `200`；`ping SG 70ms` 链路健康。
+4. **附带**：`zh_Hans` 确认 `symlink → zh-cn`（仅 `zh-cn` 入库）；`srt-vpn` 侧 `cargo test 30/30` 保持。
+
+### 验证
+- `luac5.4 -p util_srt-vpn.lua && 7_srt-vpn.lua` → `OK`；`lua5.4 gen_config` 3 例断言 `passphrase/crypto/IPv6 []` 全过且 `not uuid`。
+- `file dist/srt-vpn-linux-amd64` → `static-pie linked`；`ls -lh 10.9M`；`scp` 后 `OpenWrt /usr/bin/srt-vpn -V 0.5.0 -h` 正常。
+- `OpenWrt`：`uci show passwall.BSQuo71x` 无 `uuid/password` 仅 `passphrase`；`cat /tmp/etc/passwall/TCP_SOCKS_BSQuo71x.json` 符合 `src/config.rs`；`ps/netstat` 双实例双端口；`curl --socks5/-x` 四次 `200`；`srt-vpn` 日志无 `WARN/ERROR` 告警。
+- `cargo test 30/30`（`srt-vpn`），`cargo build --release 5.0M`（本机 `glibc`）与 `static-pie 10.9M`（`musl`）并存。
+
+### 涉及文件
+- `openwrt-passwall-srt-vpn/luci-app-passwall/luasrc/passwall/util_srt-vpn.lua`（回退 `crypto/streamid`，`arg` 守卫）
+- `openwrt-passwall-srt-vpn/luci-app-passwall/luasrc/model/cbi/passwall/client/type/7_srt-vpn.lua`（删 `uuid/password/pool_size`，恢复 `crypto/streamid` 活跃）
+- `openwrt-passwall-srt-vpn/luci-app-passwall/po/zh-cn/passwall.po`（去重 66 行，`2233` 唯一定位）
+- `srt-vpn/dist/srt-vpn-linux-amd64`（`static-pie 10.9M`，`rust:1.97-alpine`）
+- `OpenWrt 10.0.100.1` `/usr/bin/srt-vpn` `/usr/lib/lua/luci/passwall/util_srt-vpn.lua` `/tmp/etc/passwall/TCP_SOCKS_BSQuo71x.json`
+
+
+## [2026-08-23 09:15] - SG systemd 固化 + 新加坡带宽回归达标（已达 v1 150M/50M 水平，国际链路天花板）
+
+### 改动前总结
+- **问题起源**：用户反馈 hk2(103.244.89.78) 公网隧道带宽极低（裸 SRT 0.33 MB/s vs 本地 500 MB/s），怀疑 v0.5.0 回归 libsrt 后性能回退；要求以 SG(129.150.44.117) 为基准重测（v1 在 SG 能跑 100M+）。
+- **探针隔离结论**：本地编译 `examples/srt_probe_pub.rs`（无 libc 依赖，`SockaddrIn` 手写，`SND32M/RCV11M≤FC65536/FileCC` 与主程序一致）在两地对比：hk2 裸 SRT 上行 0.33 MB/s + iperf TCP 2.3 Mbit 高重传 = 链路限速；SG 裸 SRT 8.34 MB/s (66 Mbps) + iperf UDP 100M/TCP 116M RTT 69ms = 健康。
+- **部署现状**：SG 上 `nohup /opt/srt-vpn/target/release/srt-vpn -c /opt/srt-vpn/server_sg.json` 手动运行，未 systemd 托管，`iptables` 未持久化，`rmem_max` 未落盘。
+
+### 改动后总结
+1. **SG systemd 固化**（`target/tmp/sg_systemd.sh` 一次性脚本，aarch64 Debian 11）：
+   - 二进制快照：`/opt/srt-vpn/target/release/srt-vpn (4.7M)` → `/usr/local/bin/srt-vpn -V 0.5.0`
+   - 配置：`/etc/srt-vpn/server.json`（`0.0.0.0:9000` `aes-128` `reliable` `max_clients 32` `9090`，`passphrase change-me-...`）
+   - 内核：`/etc/sysctl.d/99-srt-vpn.conf` `rmem/wmem_max/default=33M` 并 `sysctl -p` 生效（ss 幂等）
+   - 防火墙：`iptables -I INPUT 1 ACCEPT udp 9000/tcp 9090/tcp 18080/29000` 置顶于 `DROP` 黑名单之前
+   - 服务：`/etc/systemd/system/srt-vpn.service` `Restart=always` `enabled` `active (PID 1085480)`，`ss -ulpn 0.0.0.0:9000` + `journalctl` 验证
+2. **压测服务**：`python3 /tmp/run_http_sg.py` → `ThreadingTCPServer 127.0.0.1:18080`，生成 `10m.bin 10M (dd1c30...) /100m.bin 100M (979a8f...) /1m.bin 1M (004ab4...)` 全量落盘
+3. **隧道回归验证**（`本机 127.0.0.1:1080 socks5h://user1:***` → `SG 127.0.0.1:18080`，单 SRT 连接 FileCC）：
+   - 单线程下载 1m 4.06 MB/s (32 Mbps)/10m 20.21 MB/s (161 Mbps)/100m 17.69 MB/s (141 Mbps) MD5 全对
+   - 并发 4x1m 8.87 MB/s/8x1m 18.07 MB/s (144 Mbps)/16x1m 10.51 MB/s 长尾 1.3s（单核争抢，全部 OK）
+   - 上传 10m 4.99 MB/s (40 Mbps)/4x1m 10.07 MB/s (80 Mbps)/双工 4DL+4UL 8/8 OK 0.54s 无互踩，`iperf TCP 116 Mbps` 对比已超链路单流
+   - 结论：单流 161 Mbps 已超 `iperf` 单流，8 并发 144 Mbps ≈ `v1 150M(18.75 MB/s)`，上传 80 Mbps > `50M(6.25 MB/s)`，**已达国际互联天花板，CPU/多池优化暂缓**（见 AGENTS 决策表）
+
+### 验证
+- `systemctl is-active srt-vpn` → `active` / `is-enabled` → `enabled` / `ss -ulpn 9000` / `journalctl 20 行` 无 ERROR
+- `curl -x socks5h://user1:***@127.0.0.1:1080 http://127.0.0.1:18080/1m.bin -o /tmp/test` MD5 `004ab4...` 一致
+- 自动化压测 `target/tmp/bench_sg.py` → `16/16 100% OK`，`metrics 9090` 保留回环（ss 不显示属预期）
+- 交叉验证：本地回环 500 MB/s 证明代码无回归，`hk2 0.33` 为链路限速非代码问题
+
+### 涉及文件
+- 新增/更新部署脚本 `target/tmp/sg_systemd.sh` `target/tmp/sg_http.sh` `target/tmp/bench_sg.py`
+- 服务端 ` /etc/srt-vpn/server.json` `/usr/local/bin/srt-vpn` `/etc/systemd/system/srt-vpn.service` `/etc/sysctl.d/99-srt-vpn.conf`
+- 文档 `CHANGELOG.md` `DEPLOY_CREDENTIALS.md` `PROJECT_PLAN.md` `AGENTS.md`（本条）
+
+
 ## [2026-08-22 22:40] - v0.5.0 回归 libsrt 1.5.6 单连接多路复用（推翻自研，根治多线上传卡死）
 
 ### 改动前总结
