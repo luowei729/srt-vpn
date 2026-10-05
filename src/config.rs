@@ -47,12 +47,26 @@ pub struct Config {
     /// UDP 模式：reliable（默认）/ best-effort（-m 可覆盖）
     #[serde(default = "default_udp_mode")]
     pub udp_mode: UdpMode,
-    /// v0.5.3：UDP DATAGRAM 实验模式（默认 false）
-    /// false = UDP 隧道帧走可靠传输（v0.5.0 行为，WebRTC 必达，推荐保持）
-    /// true  = UDP 帧走 Datagram + 自适应 TTL（低延时实验特性，拥塞时会丢包）
-    /// 环境变量 SRT_UDP_DATAGRAM=true/1 可开启
-    #[serde(default)]
+    /// v0.6.0（2026-10-05，参照 hysteria2）：UDP 隧道帧默认走【不可靠数据报】
+    /// true （默认）= UDP 帧走 Datagram + RTT 自适应 TTL（inorder=0，过期即弃、
+    ///         绝不无限补发）——对齐 hy2 "UDP 走 QUIC 不可靠 datagram、丢即整包丢弃"，
+    ///         根治 WebRTC 多 UDP 无限补发打满单核导致的卡死/断网。
+    /// false= 回退 v0.5.4 可靠行为（Data 帧无限重传，低 RTT 链路可用）。
+    /// 环境变量 SRT_UDP_DATAGRAM=false/0 可关闭。
+    #[serde(default = "default_udp_datagram")]
     pub udp_datagram: bool,
+    /// v0.6.0：SRT 收发缓冲延迟毫秒（SRTO_RCVLATENCY/PEERLATENCY）。
+    /// 必须 ≥ 链路 RTT 才能在丢包时等到重传返回，否则 FileCC 疯狂补发/塌陷。
+    /// 历史 120ms 仅适配 ~70ms 开发链路；真实 OpenWrt→SG 链路 RTT≈222ms，
+    /// 默认 500ms（≈2×RTT，覆盖抖动）；TSBPD 关闭不引入投递延时，仅扩大重传容忍窗。
+    /// 环境变量 SRT_LATENCY 覆盖（毫秒）。
+    #[serde(default = "default_latency")]
+    pub latency_ms: i32,
+    /// v0.6.0：不可靠 UDP 消息 TTL 下限毫秒（自适应 TTL=max(3×RTT, 本值)）。
+    /// 下限须 ≥ RTT，保证连接初期尚未测得 RTT 时握手小包不被误丢。默认 400ms。
+    /// 环境变量 SRT_UDP_TTL_MIN 覆盖。
+    #[serde(default = "default_udp_ttl_min")]
+    pub udp_ttl_min: i32,
     /// 最大并发客户端数（默认 32）
     #[serde(default = "default_max_clients")]
     pub max_clients: usize,
@@ -158,6 +172,21 @@ fn default_crypto() -> String {
 
 fn default_udp_mode() -> UdpMode {
     UdpMode::Reliable
+}
+
+/// v0.6.0：UDP 不可靠数据报默认开启（参照 hy2，根治补发风暴）
+fn default_udp_datagram() -> bool {
+    true
+}
+
+/// v0.6.0：SRT 延迟默认 500ms（覆盖真实高 RTT 链路，≈2×RTT）
+fn default_latency() -> i32 {
+    500
+}
+
+/// v0.6.0：不可靠 UDP TTL 下限默认 400ms（须 ≥ RTT，保护握手小包）
+fn default_udp_ttl_min() -> i32 {
+    400
 }
 
 fn default_max_clients() -> usize {
@@ -325,10 +354,22 @@ impl Config {
                 .map(|s| UdpMode::parse_str(&s).map_err(|e| e.to_string()))
                 .transpose()?
                 .unwrap_or_else(default_udp_mode),
-            // v0.5.3：SRT_UDP_DATAGRAM=true/1 开启 UDP DATAGRAM 实验模式（默认关）
+            // v0.6.0：SRT_UDP_DATAGRAM 显式设为 false/0 才关闭不可靠 UDP；默认开启
             udp_datagram: std::env::var("SRT_UDP_DATAGRAM")
-                .map(|s| s == "true" || s == "1")
-                .unwrap_or(false),
+                .map(|s| s != "false" && s != "0")
+                .unwrap_or(true),
+            // v0.6.0：SRT_LATENCY 毫秒（SRT 重传容忍窗），默认 500
+            latency_ms: std::env::var("SRT_LATENCY")
+                .ok()
+                .map(|s| s.parse::<i32>().map_err(|_| "SRT_LATENCY 不是有效数字".to_string()))
+                .transpose()?
+                .unwrap_or_else(default_latency),
+            // v0.6.0：SRT_UDP_TTL_MIN 毫秒（不可靠 UDP TTL 下限），默认 400
+            udp_ttl_min: std::env::var("SRT_UDP_TTL_MIN")
+                .ok()
+                .map(|s| s.parse::<i32>().map_err(|_| "SRT_UDP_TTL_MIN 不是有效数字".to_string()))
+                .transpose()?
+                .unwrap_or_else(default_udp_ttl_min),
             max_clients: std::env::var("SRT_MAX_CLIENTS")
                 .ok()
                 .map(|s| s.parse::<usize>().map_err(|_| "SRT_MAX_CLIENTS 不是有效数字".to_string()))
@@ -374,9 +415,21 @@ impl Config {
                 self.udp_mode = udp;
             }
         }
-        // v0.5.3：环境变量可覆盖配置文件的 UDP DATAGRAM 开关
+        // v0.6.0：环境变量覆盖 UDP 不可靠开关（仅显式 false/0 才关，缺省沿用结构默认 true）
         if let Ok(u) = std::env::var("SRT_UDP_DATAGRAM") {
-            self.udp_datagram = u == "true" || u == "1";
+            self.udp_datagram = u != "false" && u != "0";
+        }
+        // v0.6.0：环境变量覆盖 SRT 延迟（毫秒）
+        if let Ok(v) = std::env::var("SRT_LATENCY") {
+            if let Ok(n) = v.parse::<i32>() {
+                self.latency_ms = n;
+            }
+        }
+        // v0.6.0：环境变量覆盖不可靠 UDP TTL 下限（毫秒）
+        if let Ok(v) = std::env::var("SRT_UDP_TTL_MIN") {
+            if let Ok(n) = v.parse::<i32>() {
+                self.udp_ttl_min = n;
+            }
         }
         if let Ok(mc) = std::env::var("SRT_MAX_CLIENTS") {
             if let Ok(v) = mc.parse::<usize>() {

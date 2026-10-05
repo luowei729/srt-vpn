@@ -18,21 +18,23 @@ pub async fn run(cfg: &Config) -> Result<(), String> {
     let peer_addr = parse_listen_addr(&listen)?;
 
     // 构建监听配置（服务端：listen 模式 + 不设 streamid）
-    // P1 2026-08-23：1000→120ms 降低 TTFB（与客户端一致）
+    // v0.6.0：延迟改为配置驱动（默认 500ms，≥ 链路 RTT），与客户端对称。
     let srt_cfg = SrtConfig {
         peer_addr,
         passphrase: cfg.passphrase.clone(),
         pbkeylen: crate::config::crypto_to_pbkeylen(&cfg.crypto),
         streamid: None,
-        rcv_latency: 120,
+        rcv_latency: cfg.latency_ms,
         reliable: match cfg.udp_mode {
             crate::cli::UdpMode::Reliable => true,
             crate::cli::UdpMode::BestEffort => false,
         },
         message_api: true,
         payload_size: 1316, // SRT 官方默认 payload
-        // v0.5.3：UDP DATAGRAM 实验开关透传（默认 false，accept 的连接继承）
+        // v0.6.0：UDP 不可靠数据报开关 + TTL 下限透传（accept 连接继承）
         udp_datagram: cfg.udp_datagram,
+        udp_ttl_min: cfg.udp_ttl_min,
+        retrans_efficient: true,
         is_server: true,
     };
 

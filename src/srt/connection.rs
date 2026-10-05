@@ -110,6 +110,14 @@ pub struct SrtConfig {
     /// true  = UDP 帧走 Datagram 帧 + 自适应 TTL（低延时实验特性，拥塞时会丢包，
     ///         仅适合游戏/实时等可容忍丢包场景；参考 hy2 后结论：默认必须关）
     pub udp_datagram: bool,
+    /// v0.6.0（2026-10-05）：不可靠 UDP 消息 TTL 下限毫秒。
+    /// 自适应 TTL = max(3×EWMA_RTT, 本值)，下限须 ≥ 链路 RTT，保证连接初期尚未
+    /// 测得真实 RTT 时 WebRTC/ICE 握手小包不被误丢（参照 hy2 不可靠 datagram 语义）。
+    pub udp_ttl_min: i32,
+    /// v0.6.0：是否使用高效重传算法（SRTO_RETRANSMITALGO=1）。
+    /// true  = 高效算法，只在必要时重传，222ms 高 RTT 丢包链路下大幅减少
+    ///         补发量与单核 CPU 开销（根治补发风暴）；false=旧版激进算法(0)。
+    pub retrans_efficient: bool,
     /// 是否服务端（listen 模式）
     /// （P1 后半段用于区分收发策略，当前仅日志参考）
     #[allow(dead_code)]
@@ -123,12 +131,18 @@ impl Default for SrtConfig {
             passphrase: String::new(),
             pbkeylen: 16, // aes-128
             streamid: None,
-            rcv_latency: 120, // P1 2026-08-23：1000→120ms 降低 TTFB（TSBPD 关闭后仅重传窗口，120ms 已够 70ms RTT 重传）
+            // v0.6.0（2026-10-05）：120→500ms。历史 120ms 仅适配开发机→SG 的 ~70ms
+            // 链路；真实 OpenWrt→SG 链路 RTT≈222ms，延迟必须 ≥ RTT 才能在丢包时等到
+            // 重传返回，否则 FileCC 无法恢复丢包→疯狂补发→并发塔陷+单核 CPU 打满。
+            // TSBPD 已关闭，延迟不引入投递延时，仅扩大重传容忍窗（对低 RTT 链路无副作用）。
+            rcv_latency: 500,
             reliable: true,
             message_api: true,
             payload_size: 1316, // SRT 官方默认 payload
-            // v0.5.3：UDP DATAGRAM 实验模式默认关闭（拥塞时丢包伤 WebRTC，见字段注释）
-            udp_datagram: false,
+            // v0.6.0：UDP 不可靠数据报默认开启（参照 hy2，根治 WebRTC 无限补发风暴）
+            udp_datagram: true,
+            udp_ttl_min: 400,
+            retrans_efficient: true,
             is_server: false,
         }
     }
@@ -186,6 +200,9 @@ pub struct RttTracker {
     /// 由接收线程随 RTT 一并采样写入，供发送线程做 TCP 背压判定：
     /// 积压超过阈值时暂停消费可靠队列，让 UDP 小包优先追上进度（仿 hy2 公平性）。
     sndbuf_ms: std::sync::atomic::AtomicI32,
+    /// v0.6.0：自适应 TTL 下限（毫秒，来自 SrtConfig.udp_ttl_min，创建后不变）。
+    /// 保证尚未测得真实 RTT 时 TTL 仍 ≥ 链路 RTT，握手小包不被误丢。
+    ttl_min_ms: i32,
 }
 
 impl RttTracker {
@@ -197,17 +214,20 @@ impl RttTracker {
     const MIN_MS: i32 = 60;
     /// EWMA 上限钳制：超过 800ms 的链路已不适合 UDP 低延时场景，封顶防 TTL 失控
     const MAX_MS: i32 = 800;
-    /// 自适应 TTL 下限：即使低 RTT 也至少给 150ms 发送窗口（约 2 个 RTT + 调度余量）
-    const TTL_MIN_MS: i32 = 150;
     /// v0.5.3：TCP 背压阈值——SNDBUF 未确认时间跨度超过此值时暂停消费可靠队列。
     /// 取值考量：rcv_latency=120ms 重传窗口的 2.5 倍；超过说明 TCP 大流量已把
     /// 发送管道塞满，此时继续入队 TCP 只会把 UDP 小包越推越远，应让 UDP 先行。
     const SND_BACKPRESSURE_MS: i32 = 300;
 
-    pub fn new() -> Self {
+    /// 自适应 TTL 上限：即使高 RTT 链路也不给超过 1.5s 的存活窗，
+    /// 防止不可靠 UDP Bulk 媒体包在拥塞时长期滞留发送缓冲（v0.6.0）
+    const TTL_MAX_MS: i32 = 1500;
+
+    pub fn new(ttl_min_ms: i32) -> Self {
         Self {
             ewma_ms: std::sync::atomic::AtomicI32::new(Self::INIT_MS),
             sndbuf_ms: std::sync::atomic::AtomicI32::new(0),
+            ttl_min_ms,
         }
     }
 
@@ -251,10 +271,14 @@ impl RttTracker {
     }
 
     /// 由当前 RTT 推导不可靠消息的自适应 TTL：
-    /// max(2×EWMA_RTT, 150ms)。2×RTT 保证正常情况下消息有足够时间完成一次
-    /// 发送往返；150ms 下限防止低 RTT 链路上 TTL 过小造成无谓丢弃。
+    /// v0.6.0 改为 max(3×EWMA_RTT, ttl_min_ms) 并限顶 1500ms。为何 3×RTT：
+    /// 不可靠数据报需活过足够个 RTT 才能完成“发送→丢包→NAK→重传→到达”一个周期，
+    /// 旧值 2×RTT+150ms 下限在 222ms 链路上小于一个 RTT → 握手小包必丢（WebRTC 上传 0）。
+    /// 3×RTT + ≥RTT 下限（默认 400ms）保证握手包存活，而 Bulk 媒体过期即弃不无限补发。
     pub fn adaptive_ttl(&self) -> i32 {
-        (self.ewma_ms() * 2).max(Self::TTL_MIN_MS)
+        (self.ewma_ms() * 3)
+            .max(self.ttl_min_ms)
+            .min(Self::TTL_MAX_MS)
     }
 }
 
@@ -410,7 +434,7 @@ impl SrtConnection {
             // RTT/SNDBUF 跟踪器随连接创建（收发线程共享 Arc）
             let (send_rel_tx, send_rel_rx) = crossbeam_channel::unbounded::<SendItem>();
             let (send_prio_tx, send_prio_rx) = crossbeam_channel::unbounded::<SendItem>();
-            let rtt = Arc::new(RttTracker::new());
+            let rtt = Arc::new(RttTracker::new(cfg.udp_ttl_min));
             let udp_datagram = cfg.udp_datagram;
             let eid = srt_epoll_create();
             if eid == -1 {
@@ -509,6 +533,7 @@ impl SrtConnection {
             Ok(SrtListener {
                 sock,
                 udp_datagram: cfg.udp_datagram,
+                udp_ttl_min: cfg.udp_ttl_min,
             })
         }
     }
@@ -517,7 +542,7 @@ impl SrtConnection {
     ///
     /// 由 SrtListener 调用；每客户端一次（可在多任务并发调用，
     /// 监听 socket 常驻不重复 bind）。
-    fn accept_from_listener(listen_sock: SRTSOCKET, udp_datagram: bool) -> Result<Self, SrtError> {
+    fn accept_from_listener(listen_sock: SRTSOCKET, udp_datagram: bool, udp_ttl_min: i32) -> Result<Self, SrtError> {
         unsafe {
             // 接受连接（阻塞；srt_accept 线程安全，多任务并发调用由 libsrt 内部排队）
             let mut peer: libc::sockaddr_in = std::mem::zeroed();
@@ -546,7 +571,7 @@ impl SrtConnection {
             let recv_len_recv = recv_len_counter.clone();
             let (send_rel_tx, send_rel_rx) = crossbeam_channel::unbounded::<SendItem>();
             let (send_prio_tx, send_prio_rx) = crossbeam_channel::unbounded::<SendItem>();
-            let rtt = Arc::new(RttTracker::new());
+            let rtt = Arc::new(RttTracker::new(udp_ttl_min));
             let eid = srt_epoll_create();
             if eid == -1 {
                 let err = last_error_str();
@@ -709,14 +734,12 @@ impl SrtConnection {
         // 取 65536（支撑 ~125Mbps @ 60ms），TS 包 188B → RCVBUF ≤ 65536×188 ≈ 12.3MB
         let fc_window = 65536;
         set(SRT_SOCKOPT::SRTO_FC, &fc_window)?;
-        // RCVBUF(字节) 受 FC 约束：12MB / 188 ≈ 66,910 包 ≤ 65536（略超，SRT 按 MSS 对齐会修正到≤FC）
-        // 设 11MB 更稳妥：11MB/188 ≈ 61,276 包 < 65536 包，确保不违反 FC 约束
-        let rcvbuf = 11 * 1024 * 1024;      // 11MB 接收缓冲（受 FC 约束，包数<65536）
-        // SNDBUF 不受该约束，可大些容纳 in-flight 待确认数据
-        // v0.5.5：32MB→8MB——用户实测发现测速切换阶段"僵尸下载"残留流量持续
-        // 150M 挤占上行；SNDBUF 越大残留越多排空越慢。8MB 仍远超公网 BDP
-        // （200Mbps×70ms≈1.75MB），对正常吞吐无影响，但把最坏残留时长降为 1/4。
-        let sndbuf = 8 * 1024 * 1024;      // 8MB 发送缓冲（高吞吐下防止发送被限）
+        // v0.6.0：缓冲与延迟联动。延迟提到 500ms 后，缓冲需覆盖 BDP=带宽×延迟：
+        // 500ms×~32MB/s≈16MB，故 RCVBUF/SNDBUF 各取 16MB（仍受 FC 约束：
+        // 16MB/1316≈12,766 包 < FC 65536，安全）。旧 8/11MB 是为 120ms/70ms 链路调的，
+        // 在 500ms 延迟下不足以容纳在途数据，会成为吞吐硬上限。
+        let rcvbuf = 16 * 1024 * 1024;      // 16MB 接收缓冲（受 FC 约束，包数<65536）
+        let sndbuf = 16 * 1024 * 1024;      // 16MB 发送缓冲（支撑 500ms 延迟的高吞吐）
         set(SRT_SOCKOPT::SRTO_SNDBUF, &sndbuf)?;
         set(SRT_SOCKOPT::SRTO_RCVBUF, &rcvbuf)?;
         // UDP 层缓冲（内核 socket 缓冲），进一步吸收突发
@@ -748,9 +771,11 @@ impl SrtConnection {
         let snd_drop_delay: i32 = -1;
         set(SRT_SOCKOPT::SRTO_SNDDROPDELAY, &snd_drop_delay)?;
 
-        // 重传算法：0 = 激进（每次 NAK 立即重传，延迟最低）vs 1 = 高效（省带宽）。
-        // VPN 链路质量好，选 0 激进算法吞吐最高、恢复最快。
-        let retransmit_algo = 0;
+        // 重传算法：0=激进（每次 NAK 立即全量重传，延迟低但补发量大）vs 1=高效
+        // （只在必要时重传，省带宽+省 CPU）。v0.6.0 默认改 1：222ms 高 RTT 丢包链路上
+        // 激进算法制造补发风暴打满单核 CPU（并发塔陷/卡死真凶），高效算法显著缓解。
+        // 低 RTT 链路可用 SRT 配置回退 0。cfg.retrans_efficient 默认 true。
+        let retransmit_algo = if cfg.retrans_efficient { 1 } else { 0 };
         set(SRT_SOCKOPT::SRTO_RETRANSMITALGO, &retransmit_algo)?;
 
         // passphrase 加密（SRT 原生，aes 强度由 pbkeylen 控制）
@@ -1346,6 +1371,8 @@ pub struct SrtListener {
     sock: SRTSOCKET,
     /// v0.5.3：UDP DATAGRAM 实验模式开关（accept 出的连接继承此配置）
     udp_datagram: bool,
+    /// v0.6.0：不可靠 UDP TTL 下限（accept 出的连接继承，用于初始化 RttTracker）
+    udp_ttl_min: i32,
 }
 
 // 跨线程移动（accept_loop 经 spawn_blocking 调用 accept_one）
@@ -1355,7 +1382,7 @@ unsafe impl Sync for SrtListener {}
 impl SrtListener {
     /// 在常驻监听 socket 上接受一个连接（阻塞，可并发调用）
     pub fn accept_one(&self) -> Result<SrtConnection, SrtError> {
-        SrtConnection::accept_from_listener(self.sock, self.udp_datagram)
+        SrtConnection::accept_from_listener(self.sock, self.udp_datagram, self.udp_ttl_min)
     }
 }
 

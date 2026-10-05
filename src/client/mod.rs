@@ -54,12 +54,15 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
         passphrase: cfg.passphrase.clone(),
         pbkeylen: crate::config::crypto_to_pbkeylen(&cfg.crypto),
         streamid: Some(streamid),
-        rcv_latency: 120, // P1 2026-08-23：1000→120ms 与服务端一致
+        // v0.6.0：延迟改为配置驱动（默认 500ms），必须 ≥ 链路 RTT 才能恢复丢包。
+        rcv_latency: cfg.latency_ms,
         reliable: true, // 客户端跟随服务端协商，默认可靠
         message_api: true,
         payload_size: 1316, // SRT 官方默认 payload（SRT_LIVE_DEF_PLSIZE=1316）
-        // v0.5.3：UDP DATAGRAM 实验开关透传（默认 false，UDP 走可靠 = v0.5.0 行为）
+        // v0.6.0：UDP 不可靠数据报（参照 hy2，默认开）+ TTL 下限 + 高效重传，均由配置透传
         udp_datagram: cfg.udp_datagram,
+        udp_ttl_min: cfg.udp_ttl_min,
+        retrans_efficient: true,
         is_server: false,
     };
 
