@@ -1,6 +1,165 @@
 # SRT-VPN 项目 变更日志
-
 所有变更记录使用北京时间（UTC+8）。
+
+## [2026-10-05 21:05] - v0.6.5：新增 SRTO_MAXBW 固定码率（hy1/hy2 Brutal 等价物）+ 修复 metrics 被静默清空
+
+### 改动前总结
+- 用户反馈：0.6.4 **多线程上传仍为 0**、多线程下载降到不到 10M。同时排查发现**此刻链路本身已崩**：
+  裸链路 iperf3（不经隧道）只有 **349 Kbit/s**，而上午同一条测得 **258 Mbps**；SG 主机 load 仅 0.25、
+  ping 仍 222ms 通 → 属国际出口被整形/极高丢包，**本轮所有吞吐数字均不可用于判优**（含用户看到的"不到10M"）。
+- 从 hy1/hy2 学到的另一半（比 per-stream 更关键）：`docs/reference/hysteria/core/internal/congestion/brutal`
+  ——**固定目标码率发送，不因丢包降窗**。对照 libsrt 源码确认我们的 FileCC 恰好相反：
+  `srtcore/congctl.cpp` L469-470 注释 "Slowdown to avoid further losses"、L302 `TEV_LOSSREPORT→onLossReport`、
+  L552-553 拥塞期内连乘 `m_dPktSndPeriod*1.03`、L406-407 恢复天花板钉死在"上次丢包点"。
+  而我们代码里 `SRTO_MAXBW` 被**硬编码为 -1（无限）**：多线程时无限发送把窄上行灌满→ACK/TLS 响应出不去
+  →拥塞崩溃（浏览器多线程上传显示 0 的另一半解释）。
+
+### 改动后总结
+1. `src/config.rs`：新增 `maxbw_mbps`（**默认 0=不限制，行为与旧版完全一致，部署零变化**）、`SRT_MAXBW_MBPS`
+   env 覆盖（真机扫参用 0/30/60/80）；注释写明 `SRTO_MAXBW` 单位是**字节/秒**（srt.h:190），对外按 Mbps 内部 /8 换算。
+2. `src/srt/connection.rs`：`SrtConfig.maxbw_mbps` + `apply_options` 里 `max_bw = if 0 { -1 } else { mbps*1e6/8 }`；
+   `src/client/mod.rs`、`src/server/mod.rs` 透传配置。
+3. **修复一个会静默吃掉配置的 bug**：`apply_env` 里 `if let Ok(mp) = parse_env_opt_u16("SRT_METRICS_PORT")` ——
+   该 helper 在环境变量**不存在**时返回 `Ok(None)`，于是 `metrics_port` 被无条件覆盖成 None，
+   配置文件里的 `metrics_port` 失效 → **指标 HTTP 服务从未 bind**（我从 0.6.0 起在 SG 上 curl :9090 一直为空的真正原因，
+   也被迫把"重排现场/RTT/缓冲"诊断改走日志）。现改为"仅当变量确实存在才覆盖"。已用 `curl` 实测恢复：返回完整 JSON。
+
+### 验证（本机无损回环——链路不是瓶颈，速度差异只能来自码率设置本身）
+- **码率控制精确生效且分方向**：A 两端不限 **81 MB/s**；B 仅服务端限 20Mbps → 下行 **2.12 MB/s/9.9s**；
+  C 仅客户端限 20Mbps → 上行 **1.91 MB/s/11.0s**；D 两端限 → 2.12 MB/s。
+- **完整性**：限 20Mbps 下 20MB 单流 **MD5 一致**；8 路并发（每路内容互不相同，可发现跨会话串数据）**8/8 一致**。
+- **metrics**：修复后首次取到 JSON（`last_rtt_ms`、`reorder_out_of_order`、`rx/tx_bytes` 等全部可用）。
+- 注：本轮再次出现"自己的遗留测试服务伪装成故障"——18090 被上一轮 httpd（工作目录不同、同名文件内容不同）
+  占走，导致"MD5 不一致"假警报（**同一天第三次**）。已在 `target/tmp/final_check.sh` 里把
+  `F1 端口预清理 + F2 源服务直连自校验`做成**强制前置、不通过即终止**，不再依赖人工记忆。
+
+### 状态
+- 两端 0.6.5 构建中→双端同时替换（默认 `maxbw=0`，行为等同已验证的 0.6.4，仅多了可用的 metrics）。
+- **待办**：链路恢复时段用 `SRT_MAXBW_MBPS` 扫参（0/30/60/80），验证固定码率能否把"多线程上传 0"变成可用吞吐；
+  多线程上传 0 的另一半（跨会话队头阻塞）已证明**不能**用 `inorder=0` 换（0.6.3 真机吞吐坍塌），需另寻方案。
+
+
+## [2026-10-05 16:50] - v0.6.4：回退 inorder=1（v0.6.3 真机吞吐坍塌），保留心跳插队与断链归因
+
+### 改动前总结
+- 用户补充：① 已关闭 passwall 的 UDP 代理（本轮问题与 UDP 无关）；② 当前时段国际出口限速（hy1 单线上传也只 10M）；③ **hy1 多线程下载 400M / 多线程上传 100M**，而我们多线程上传仍为 0 → 要求注重学习 hy1 源码如何处理多线程；④ 新报：**连接不稳定、经常间歇中断无法连接**。
+- 中断根因：SG 日志 30 分钟内“隧道仅建立 5 次、客户端断开 6 次、epoll 错误 6 次”成对出现；并非应用层心跳判死（无“心跳超时”日志），而是 SRT socket 进入 `SRTS_BROKEN(state=6)`。`connection.rs` 只要 epoll 报一次 `SRT_EPOLL_ERR` 就投空消息→整条隧道断开重连；而**心跳帧走可靠队列**（排在各会话 TCP 数据之后），拥塞时被自己发的数据拖住 → NAT/对端视为空闲 → SRT 判无响应 → BROKEN → 每隔几分钟断一次。
+- hy2 源码（`docs/reference/hysteria` 实为 core/v2）：`core/client/client.go:185-231` 显示 **每条 TCP 连接 = 一条独立 QUIC bidirectional stream**，STREAM frame 自带 `{stream_id, offset}` → 某条流缺包只卡它自己；请求/响应也在同一 stream 的不同 offset（`FastOpen` 可省一个 RTT）；拥塞控制可选 BBR / **Brutal**（`core/internal/congestion/brutal`，固定目标码率、不因丢包降窗）。
+
+<!-- PART2 -->
+
+## [2026-10-05 16:50] - v0.6.4：回退 inorder=1（v0.6.3 真机吞吐坍塌），保留心跳插队与断链归因
+
+### 改动前总结
+- 用户补充：**已关闭 passwall 的 UDP 代理**（所以本轮问题与 UDP 完全无关）；当前时段国际出口限速（hy1 单线上传也只 10M）；但 **hy1 多线程下载 400M / 多线程上传 100M**，而我们多线程上传仍为 0 → 明确要求“注重学习 hy1 源码如何处理多线程”。
+- 新报：**连接不稳定、经常间歇中断无法连接**。
+- 中断根因定位：SG 日志 30 分钟内“隧道只建立 5 次但客户端断开 6 次、epoll 错误 6 次”成对出现；服务端并非应用层心跳判死（无“心跳超时”日志），而是 SRT socket 进入 `SRTS_BROKEN(state=6)`。代码 `connection.rs` 只要 epoll 报一次 `SRT_EPOLL_ERR` 就投空消息→整条隧道断开重连；而**心跳帧走的是可靠队列**（排在各会话 TCP 数据后面），拥塞时被自己发的数据拖住→NAT/对端视为空闲→SRT 判无响应→BROKEN→每隔几分钟断一次。
+- hy2 源码学习（`docs/reference/hysteria` 实为 core/v2）：`core/client/client.go:185-231`——**每条 TCP 连接 = 一条独立 QUIC bidirectional stream**，STREAM frame 自带 `{stream_id, offset}`，因此“某条流缺包只卡它自己”；请求/响应也在同一 stream 的不同 offset（`FastOpen` 可省一个 RTT 等待）；拥塞控制可选 BBR / **Brutal**（`core/internal/congestion/brutal`，固定目标码率、不因丢包降窗）。
+
+### 改动后总结（v0.6.3 主体 + v0.6.4 回退）
+1. **v0.6.3（已完成但吞吐不过关，代码保留为直通状态）**：把 hy2 的 per-stream 语义移植到 SRT 单连接：`PROTOCOL_VERSION` 1→2（两端不一致时立即拒收而非静默错乱）；`seq(u32)` 拆为 `[epoch:8 | 会话内序号:24]`（Open 恒为 0，sid 复用时换新 epoch 天然隔离旧会话残留）；新增 `FLAG_DIR_ACCEPT=0x10` 方向位，接收端按 **(sid, 方向)** 维护重排状态（=QUIC 每 stream 双向各自 offset）；`MuxDecoder::feed()` 每会话重排（preopen 有界 64、缓冲有界 4096、epoch 回绕安全比较、重复帧去重）；可靠帧 `inorder=1→0`；新增 8 个重排/方向单测（共 40 个）。
+2. **中途被 netem 拦住的两个真 bug**（均因“回环零丢包”而多年未暴露）：① “等 Open 才建基线”对**回传方向**不成立（Open 只存在于发起方→对端单向）→ 客户端把全部下行数据塞进 preopen 直到溢出，实测刷出 **82065 条告警、下载完全卡死**；已改为按方向分流（回传方向首帧即建基线）并补两个专项单测。② netem 直接挂在 `lo` 会把 HTTP 源/SOCKS 一起拖慢 → 15 分钟不收敛；改为 `prio + u32 filter` **只对隧道 UDP 端口注入损伤**，并用 `trap` 保证任何退出都拆 netem。
+3. **v0.6.4（当前生产版本）**：`inorder` 回退为 `if item.reliable { 1 } else { 0 }`（真机吞吐不过关，详见下方实测）；**保留**三项本次实测剖出的真修复：心跳/控制帧走**优先队列**（插队不被 TCP 积压拖住，对症“间歇中断”）、`epoll 错误`日志输出 `sock_state/last_error/buffered`（断链归因，以前只有一句话无法定位）、重排层与周期现场日志（有序交付时为直通、`buffered` 恒 0，作为后续方案的现成基础设施）。
+4. 客户端/服务端 `SrtConfig` 均为 `cfg.udp_datagram` 透传；`src/srt` 报文封装、帧头 15B 布局完全未变（SRT 流量特征保留）。
+
+### 实测数据
+- **netem 有损回环（只对隧道端口注入：往返≈20ms + 2% 丢包，实测丢包率 2.04%）—— 正确性全部达标**：16 并发下载 + 16 并发上传同时跑，**32/32 `code=200`、零超时**，抽样 MD5 双向全一致；`out_of_order=84/10`（乱序确实发生）、`stale_dropped=0`、`buffered=0`（空洞最终全部补齐）、无“缓冲溢出”、无“Open 未到”、无“无法路由”、无 ERROR、无 epoll 错误。
+- **真机（OpenWrt 16核→SG 单核，RTT≈222ms）—— 0.6.3 失败**：数据正确性同样成立（`out_of_order=229~284`、`stale_dropped=0`、`buffered=0`、单流 MD5 一致、版本错配=0、epoll 错误=0），但**吞吐退化两个量级**：单流下载 136KB/s、上传 582KB/s 且 180s 未完成（而 0.6.2 同期记录为下载 12-19MB/s、上传 3.5-7MB/s）。**机制判定**：`inorder=1` 的“有序流 + 应用背压”实际上充当了整流/限流器；一旦允许越过空洞提前交付，发送端变得激进、接收缓冲更快耗尽，FileCC 在真实丢包下退避到地板，“跳过空洞”换来的并发收益远不够赔。
+- **0.6.4 部署验证**：SG systemd active + OpenWrt `/usr/bin` 均 0.6.4（双端同时替换，无错配窗口）；passwall 2 实例、1070/3001 在听；单流 `1m.bin` **MD5 一致**、版本拒收=0。（吞吐数字本轮**因当前时段链路极度拥堵而不可信**，连 SSH 都需 1-2 分钟；需在链路恢复时段与 0.6.2 做同刻 A/B 才下结论。）
+
+### 下一步（真正对症的吞吐杠杆）
+- **`SRTO_MAXBW` 固定码率** = SRT 侧的 hy1/hy2 **Brutal** 等价物：直接消除“FileCC 把丢包当拥塞而大幅降速”（已用源码核实：`srtcore/congctl.cpp` L469-470 注释“Slowdown to avoid further losses”、L302 `TEV_LOSSREPORT→onLossReport`、L552-553 拥塞期内连乘 `m_dPktSndPeriod*1.03`、L406-407 恢复天花板钉在上次丢包点）。预期能同时改善“多线程上传 0”与单流吞吐，且不破坏单流伪装。
+- 间歇中断：依靠新增的 `sock_state/last_error` 日志拿到一次真实断链原因后再定点修复（候选：NAT 空闲超时、接收缓冲溢出、对端无响应）。
+
+## [2026-10-05 14:05] - v0.6.2（版本号复用）：0.6.1 稳定基线 + UDP 默认改回 hy2 式不可靠数据报
+
+> 说明：本条为**全新的 0.6.2**。上一条被废弃的 0.6.2（每会话重排 + `inorder=0`）存在数据错乱 bug，
+> 已从源码完全移除（`multiplex.rs` 回到 HEAD 全局 seq + `decode_srt_message`，`inorder: if item.reliable {1} else {0}`）。
+
+### 改动前总结
+- 用户指令：**只把 UDP 改成 hy1/hy2 那样的不可靠**，其余保持已验证稳定的 0.6.1 行为，先出 0.6.2 供其浏览器验证再定下一步。
+- 依据：浏览器实测已证明 Ookla speedtest 是纯 HTTP/1.1 TCP，其“多线程上传 0”与 UDP 模式无关（那是跨会话队头阻塞，重排方案暂搁）；UDP 不背此锅，按 hy2 处理。
+- 起点代码=0.6.1 行为（全局 seq / 可靠帧 inorder=1 / latency 500 / RETRANSMITALGO=1 / SNDBUF·RCVBUF 16M / UDP 可靠），版本号此前误留 0.6.3。
+
+### 改动后总结
+1. **`src/config.rs`**：`default_udp_datagram()` 由 false→**true**；`from_env` 改为“默认不可靠，仅显式 `SRT_UDP_DATAGRAM=false/0` 回退可靠”；`apply_env` 同步为“只支持显式关闭”；字段注释重写（去掉“重排已修复”的过时表述，明确本版本**不含**重排）。
+2. **`src/srt/connection.rs`**：`SrtConfig::default().udp_datagram` false→**true**；两处“实验模式/默认 false”注释更新为 v0.6.2 默认开启。
+3. **`src/tunnel/dispatch.rs`**：`send_unreliable` 分流注释更新——默认（开）=Datagram 帧+RTT 自适应 TTL 走优先队列（丢即弃、绝不无限补发）；关=Data 帧可靠+优先队列（v0.5.4/0.6.1 行为）。逻辑未变。
+4. **`Cargo.toml`**：version 0.6.3→**0.6.2**，description 改为“UDP 走 hy2 式不可靠数据报”。
+5. 客户端/服务端 `SrtConfig` 均为 `cfg.udp_datagram` 透传，未改结构；`src/srt` 传输内核与帧格式未动（SRT 报文特征天然保留）。
+
+### 部署与实测（真实 OpenWrt16核→SG单核，RTT≈222ms）
+- 构建：本地 `cargo build --release` 0 警告 + `cargo test` **32/32 通过**；musl 客户端（`apk update`+`pkgconf` 修正后成功）+ SG 本地 aarch64 重编译；**双端同时替换**（SG systemd + OpenWrt `/usr/bin` + passwall 重启，实例 2 个、1070/3001 在听、`-V` 均 0.6.2），切换前后清点进程，无遗留测试实例。
+- 完整性：单流下载 `1m.bin` **MD5 一致**（`004ab4aa…`），并发跑完后复测仍一致；SG `ERROR/无法路由=0`（仅 1 条重启期 epoll WARN）。
+- **同刻 A/B（同一 0.6.2 二进制，仅 `SRT_UDP_DATAGRAM` 不同，串行交替 2 轮）**：
+  | 轮次 | A=不可靠UDP 上传 | B=可靠UDP 上传 | A 下载 | B 下载 |
+  |---|---|---|---|---|
+  | 1 | 3.48 MB/s(200) | **0.87 MB/s 超时000** | 7.68 MB/s | 2.13 MB/s |
+  | 2 | 3.97 MB/s(200) | 5.70 MB/s(200) | **12.97 MB/s** | 4.06 MB/s |
+  结论：**不可靠 UDP 总体不劣于且多数场景优于可靠 UDP**；可靠 UDP 出现一次上传 120s 超时（补发堆积），与“补发风暴”判断一致。
+- 并发：**8 并发上传全 200**（聚合 ~4.0 MB/s、公平无饿死）；**8 并发下载全 200**（聚合 ~20 MB/s≈161M）——上一条“8 并发下载塌/000”实为**我遗留多版本测试客户端混连**造成的假象，清理后不复现。
+- SRT 特征抓包（SG `tcpdump udp port 9000`）：主流 `客户端公网IP:99xx ↔ SG:9000`，**包长 1332 占绝对多数（=1316 payload+16B SRT 头）**，另有 20/32/39/44/274 控制报文（ACK/NAK/KM），未出现任何非 SRT 外壳。
+- **教训补记**：跨时刻的绝对速度数字不可直接比较（链路占用/慢启动状态不同），必须同刻 A/B；本轮先误判“0.6.2 比 0.6.1 慢”，同刻对照后推翻。
+
+### 当前状态与待验证
+- 两端运行 0.6.2（UDP 不可靠 + 0.6.1 全部传输参数）。**待用户浏览器实测** speedtest 单线/多线程上传；若“上传 0”复现，则回到 TCP 队头阻塞主线（重排需在 netem 有损环境先验证）。
+- 回退开关：`SRT_UDP_DATAGRAM=false`（无需重编译）即可临时回到可靠 UDP 对照。
+
+## [2026-10-05 13:35] - 回退 0.6.2 每会话重排（有 bug），两端恢复到一致的 0.6.1 稳定对
+
+### 事件
+- 为根治“多线程上传/下载卡死”，尝试 v0.6.2：帧序号改每会话独立 + 接收侧 `MuxDecoder::feed` 重排 + 可靠帧 `inorder=0`（消除跨会话队头阻塞）。
+- **回环 16 路并发全绿就上机了，但真实 222ms 丢包链路上暴露 bug**：首帧未到齐时误设重排基线、Open 可能晚于 Data 到达→乱序直投→**数据错乱**（单流下载 MD5 变 `9090f1ba/984b40` ≠ `004ab4`）、上传 code=000、SG 刷 Rst。
+- **回滚教训**：重排/乱序相关改动 **必须先在【有损环境 netem】验证**（注入 1-3% 丢包 + 200ms+ 延迟），回环（零丢包）根本不会触发重排路径，是无效验证。
+
+### 处置（已完成）
+- 源码回退到**真正的 0.6.1 行为**：`git checkout HEAD -- src/tunnel/multiplex.rs`（恢复全局 seq/`decode_srt_message`）+ 三处调用点（client recv_loop / listener 认证与主循环）还原 + `inorder` 恢复 `if reliable {1} else {0}` + UDP 默认回可靠。
+- 两端重新编译并**一起切换**（避免版本错配）：SG systemd = 0.6.1-behavior（-V 显示 0.6.3），OpenWrt /usr/bin = 0.6.1（设备现成 `/tmp/srt-vpn-061`）。两者均全局 seq/inorder=1，本就互兼容。
+- “上传 000/Rst 洪水”的**真正原因是我遗留的多个不同版本手动客户端同时连 SG 互搅会话**，非隧道 bug；kill 残留 + 用户重启 passwall 后：**单流上下行 MD5 一致、上传 200、8并发上传聚合 8.9MB/s、SG Rst/err=0**。
+- **残留待办**：8 并发下载仍塔（单条 FileCC 窗口/跨会话 HOL 未解）。重排修复需：修正基线初始化/“Open 前缓冲 Data”/会话 ID 复用重置，并用 netem 有损回环验证后再上。当前以稳定为先，**不将未验证的重排上生产**。
+
+## [2026-10-05 12:02] - v0.6.1 修正：UDP 默认回归可靠转发（不可靠数据报会丢 QUIC/WebRTC 握手导致上传 0）
+
+### 改动前总结
+- v0.6.0 把 UDP 默认改为“不可靠数据报”后，用户反馈 **speedtest 网页上传仍为 0**。
+- 复现定位：经真实可用 passwall SOCKS(1070) 测 **12 路并行 TCP 上传→聚合 ~55M、无一流饿死**（纯 TCP 路径正常）→ 判定“上传 0”不是 TCP 而是 **UDP 侧**。
+- 反思：现代浏览器/测速大量走 **HTTP/3(QUIC)=UDP**（部分站 WebRTC）；v0.6.0 的不可靠 UDP 在 222ms+拥塞下会丢 STUN/DTLS/QUIC-Initial 握手小包 → 浏览器建连失败 → **上传显示 0**——与 **v0.5.2 血泪完全同源**。
+
+### 改动后总结
+1. **UDP 默认回归“可靠转发”**（`config.rs`/`connection.rs` 的 `udp_datagram` 默认 true→**false**）：VPN/代理应像真 VPN 那样忠实承载 QUIC/WebRTC，不丢握手。可靠 UDP 仍走**优先队列**插队（不被 TCP 大流量拖延）。
+2. **保留 v0.6.0 的真正修复**：SRT 延迟 500ms(≥RTT) + `RETRANSMITALGO=1`(高效重传) + SNDBUF/RCVBUF 16M——**补发风暴的病根是 latency<RTT + 激进重传，不是“可靠 UDP”本身**，修复后可靠 UDP 不再打满 CPU。不可靠数据报降为 `SRT_UDP_DATAGRAM=true` 可选（纯实时）。
+3. 版本 `0.6.0→0.6.1`；两端重编译部署（SG systemd + OpenWrt /usr/bin，passwall 重启），隧道 MD5 一致。
+
+### 待验证（需用户浏览器实测）
+- 请用户重跑 speedtest 网页上传：若不再为 0 → 确认可靠 UDP 修复；若仍 0 → 需抓 SG 会话日志看上传到底以 TCP(proto=0) 还是 UDP(proto=1) 进入隧道（浏览器/代理可能根本不把 WebRTC UDP 送进 SOCKS 代理，那就与隧道无关）。
+
+## [2026-10-05 11:42] - v0.6.0 单流带宽瓶颈根治：hy2 式 UDP 不可靠 + RTT 自适应延迟（真实 222ms 链路补发风暴）
+
+### 改动前总结
+- **用户报告**：上传/下载带宽有瓶颈；回忆起 speedtest 网页测试用 WebRTC 多 UDP 连接，SRT 大量“补发”把 CPU 跑满卡死、断网，需等卡住连接超时才恢复；要求参照 hysteria1/hysteria2（hy2）的处理重构，保留 SRT 流量特征、保持单流。
+- **编译前提被破坏**：工作树 `src/config.rs` 被误替换为 v0.4 TUIC 旧版（`use uuid::Uuid` + `uuid/cert/key`），但 `Cargo.toml` 无 `uuid` 依赖、其余代码为 v0.5.5 libsrt 版（需 `crypto_to_pbkeylen`/`udp_datagram`）→ 工作树无法编译。`git status` 显示仅 config.rs 一个文件偏离 HEAD `f963bc3(v0.5.5)`。`git checkout HEAD -- src/config.rs` 恢复绿色基线（32 单测通过）后再改造。
+- **真实链路量化基线（OpenWrt 16核 x86_64 → SG 1核 aarch64，RTT=222ms，空闲丢包~1%）**：
+  - 裸链路：TCP 单流下行 258Mbps、4 并行 828Mbps、单流上行 105Mbps、UDP 下行 279Mbps。
+  - 隧道 v0.5.5：单流下行 ~129M；4 并发下载聚合 162M→**8 并发塌到 74M（并发越多越慢=拥塞塌陷）**；srt-vpn 进程 CPU 频繁 88~100%（1 核）。
+- **根因（一条主线串起所有症状）**：v0.5.0 起所有时间常数都按**开发机→SG 的 ~70ms** 链路调，而真实链路 **222ms**：
+  - `rcv_latency=120ms < RTT` → SRT 丢包时**等不到重传返回**就无法恢复 → FileCC 判持续丢包疯狂补发；
+  - v0.5.4 把 UDP 改回**可靠**（Data 帧 `msgttl=-1` + `SNDDROPDELAY=-1` 无限重传）→ WebRTC 多 UDP 洪峰下**无限补发风暴** → 单核 CPU 打满 → 全隧道卡死/断网（正是用户描述）；
+  - UDP 不可靠 TTL 下限 150ms < RTT（v0.5.2 曾因此握手小包全丢→上传归 0）。
+  - **注**：并发下载塌陷主因是单条 FileCC 窗口 + 补发包软中断（`sy/si`），非纯用户态 CPU；单流稳态小文件“上传 88s”是 222ms 慢启动未爬满的测速假象（大文件稳态实测校正）。
+- **hy2 参照（`docs/reference/hysteria/PROTOCOL.md` + `core/client/udp.go`）**：UDP 一律走 QUIC **不可靠 datagram（RFC9221）**，丢一片即整包丢弃、传输层**绝不重传**；每 UDP 会话有界接收队列(1024)队满即 `drop`；CC 可用速率目标(Brutal)或 BBR/Cubic。我们 v0.5.4 的“可靠 UDP”恰与其相反。
+
+### 改动后总结
+1. **UDP 默认改不可靠数据报（对齐 hy2）**：`config.rs` `udp_datagram` 默认 **false→true**；`connection.rs` `RttTracker::adaptive_ttl()` 由 `max(2×RTT,150)` 改为 **`max(3×RTT, ttl_min)` 且封顶 1500ms**，`ttl_min` 来自新配置 `udp_ttl_min`（默认 400ms ≥ RTT，保护连接初期握手小包）。不可靠 UDP `inorder=0` 不阻塞 TCP，过期即弃不无限补发 → **从结构上消除 WebRTC 补发风暴/CPU 打满/断网**。
+2. **SRT 延迟 120→500ms（≥2×RTT）**：`SrtConfig.rcv_latency` 默认 500，`client/mod.rs`/`server/mod.rs` 由硬编码 120 改为读 `cfg.latency_ms`（协商取两端 max，客户端通告 PEERLATENCY=500 即把旧服务端也抬到 500）。TSBPD 关闭 → 不引入投递延时，仅扩大重传容忍窗。
+3. **高效重传算法**：`SRTO_RETRANSMITALGO` 0→**1**（`retrans_efficient` 默认 true），222ms 丢包链路补发包显著减少 → 降低软中断/CPU。
+4. **缓冲扩容支撑 500ms**：`SNDBUF/RCVBUF` 8/11MB→**16/16MB**（16MB/1316≈12.8k 包 < FC 65536 约束内）。
+5. **新增 env/配置旋钮**（便于真机扫参、不改架构）：`SRT_LATENCY`、`SRT_UDP_TTL_MIN`、`SRT_UDP_DATAGRAM=false` 可回退旧可靠行为。
+6. **版本号** `0.5.5→0.6.0`；保持单流（未引入多连接池），不改帧格式/报文封装 → **原生 libsrt SRT 特征完好**（SG 抓包 9000/UDP：数据包头字节 `0x46` PH=0、握手/ACK 齐备）。
+
+### 验证（真实 222ms 路径，两端 0.6.0）
+- 并发下载 4x10m 聚合 **162M→239M（+47%）**；单流持续下载 100m **13.4~19.1 MB/s（107-153M，旧版~129M）**；**两端全栈 0.6.0 持续上传 100m 5.8~7.1 MB/s（47-56M）**（仅客户端阶段~24M，服务端也升后延迟对称+高效重传使上传再翻倍）；srt-vpn CPU **多数 <25%**（旧版频繁 90%+）。下行 1m.bin **MD5 一致**；8 并发下载后隧道**自愈**（旧版永久冻结不复现）；libsrt 内部 `RTT EWMA≈215ms` 印证驱动 TTL=645ms>RTT。
+- **单流物理上限如实记录**：受单条 FileCC 窗口在 222ms+1% 丢包约束，全栈优化后上传稳态 ~50M（裸上行 105M，~48%）、单流下载 ~130-150M（裸 258M，~55%）、8 并发下载仍塔（~66M）。**严格单流下无法逼近裸链路**；多窗口(连接池)可但违背单流，故未启用（用户拍板保持单流）。
+- 涉及文件：`Cargo.toml`、`src/config.rs`、`src/srt/connection.rs`、`src/client/mod.rs`、`src/server/mod.rs`。部署：SG `systemd` 已换 0.6.0（旧版备份 `/usr/local/bin/srt-vpn.bak-*`），OpenWrt 测试实例 `/tmp/srt-vpn-new`。详见 DEVTIPS 2026-10-05 与 PROJECT_PLAN 第六节。
 
 ## [2026-08-24 02:10] - v0.5.5 根治"僵尸下载"挤占上行（用户上传归零的真正根因）
 

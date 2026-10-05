@@ -30,6 +30,15 @@ pub struct Metrics {
     pub heartbeat_timeouts: AtomicU64,
     /// 最近一次心跳 RTT（毫秒，M8 2026-08-19 新增：pong 时间戳差值）
     pub last_rtt_ms: AtomicU64,
+    /// v0.6.3（2026-10-05）：复用层确实收到乱序帧的累计次数。
+    /// 这是“每会话重排是否真正生效”的唯一硬指标：恒为 0 则说明 SRT 仍在有序
+    /// 投递（inorder=0 未生效），跨会话队头阻塞依旧存在，重排只是白付开销。
+    pub reorder_out_of_order: AtomicU64,
+    /// 旧代次/重复/缓冲溢出而丢弃的帧数（sid 复用隔离是否正常工作）
+    pub reorder_stale_dropped: AtomicU64,
+    /// 重排缓冲深度峰值（历史最大）：持续高位说明空洞长时间补不上（重传在追赶）。
+    /// v0.6.3：由 feed() 在插入缓冲时用 fetch_max 记录，不占正常路径开销
+    pub reorder_buffered: AtomicU64,
 }
 
 /// 全局指标实例（OnceLock 懒初始化）
@@ -83,6 +92,11 @@ fn render_metrics_json() -> String {
         "auth_failures": m.auth_failures.load(Ordering::Relaxed),
         "heartbeat_timeouts": m.heartbeat_timeouts.load(Ordering::Relaxed),
         "last_rtt_ms": m.last_rtt_ms.load(Ordering::Relaxed),
+        // v0.6.3：每会话重排的现场指标。out_of_order>0 才能证明乱序投递真的发生、
+        // 队头阻塞被打破；reorder_buffered 峰值过高则说明重传在苦苦追赶。
+        "reorder_out_of_order": m.reorder_out_of_order.load(Ordering::Relaxed),
+        "reorder_stale_dropped": m.reorder_stale_dropped.load(Ordering::Relaxed),
+        "reorder_buffered_peak": m.reorder_buffered.load(Ordering::Relaxed),
     })
     .to_string()
 }

@@ -35,6 +35,8 @@ pub async fn run(cfg: &Config) -> Result<(), String> {
         udp_datagram: cfg.udp_datagram,
         udp_ttl_min: cfg.udp_ttl_min,
         retrans_efficient: true,
+        // v0.6.5：固定码率透传（0=不限制，行为与旧版一致；SRT_MAXBW_MBPS 真机扫参）
+        maxbw_mbps: cfg.maxbw_mbps,
         is_server: true,
     };
 

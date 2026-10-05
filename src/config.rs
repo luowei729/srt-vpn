@@ -47,12 +47,13 @@ pub struct Config {
     /// UDP 模式：reliable（默认）/ best-effort（-m 可覆盖）
     #[serde(default = "default_udp_mode")]
     pub udp_mode: UdpMode,
-    /// v0.6.0（2026-10-05，参照 hysteria2）：UDP 隧道帧默认走【不可靠数据报】
-    /// true （默认）= UDP 帧走 Datagram + RTT 自适应 TTL（inorder=0，过期即弃、
-    ///         绝不无限补发）——对齐 hy2 "UDP 走 QUIC 不可靠 datagram、丢即整包丢弃"，
-    ///         根治 WebRTC 多 UDP 无限补发打满单核导致的卡死/断网。
-    /// false= 回退 v0.5.4 可靠行为（Data 帧无限重传，低 RTT 链路可用）。
-    /// 环境变量 SRT_UDP_DATAGRAM=false/0 可关闭。
+    /// v0.6.2（2026-10-05）：UDP 隧道帧默认走 hy1/hy2 式【不可靠数据报】。
+    /// 背景：浏览器实测证实 Ookla speedtest 是纯 HTTP/1.1 TCP，其“多线程上传 0”
+    /// 与 UDP 模式无关（是单条有序流的跨会话队头阻塞，重排方案已因 bug 回退，
+    /// 本版本【不含】重排）。既然 UDP 不背这个锅，就按 hy2 正确做法处理 UDP：
+    /// Datagram 帧 + RTT 自适应 TTL（inorder=0，过期即弃、绝不无限补发），
+    /// 避免实时/WebRTC/QUIC 洪峰在拥塞时制造补发风暴打满 SG 单核。
+    /// 需回退“可靠 UDP + 优先队列”（v0.5.4/0.6.1 行为）：环境变量 SRT_UDP_DATAGRAM=false。
     #[serde(default = "default_udp_datagram")]
     pub udp_datagram: bool,
     /// v0.6.0：SRT 收发缓冲延迟毫秒（SRTO_RCVLATENCY/PEERLATENCY）。
@@ -67,6 +68,16 @@ pub struct Config {
     /// 环境变量 SRT_UDP_TTL_MIN 覆盖。
     #[serde(default = "default_udp_ttl_min")]
     pub udp_ttl_min: i32,
+    /// v0.6.5（2026-10-05）：固定发送码率（兆比特/秒），= hy1/hy2 的 Brutal 等价物。
+    /// 0（默认）= 不限制（保持原有 SRTO_MAXBW=-1 行为，部署零变化）；>0 = 把发送码率钉住。
+    /// 【为何需要】FileCC 把丢包当拥塞（libsrt congctl.cpp L469-470 “Slowdown to avoid
+    /// further losses”、L552-553 拥塞期内连乘 *1.03），在 222ms+丢包链路上会退避到地板；
+    /// 而无限发送下多线程又会把共享上行灌满→ACK/响应出不去→拥塞崩溃（浏览器多线程
+    /// 上传显示 0）。钉住码率可同时缓解两者，且不改变单流伪装、不改报文封装。
+    /// 注意 SRTO_MAXBW 单位是字节/秒（srt.h:190），对外按兆比特/秒更直观，内部换算。
+    /// 环境变量 SRT_MAXBW_MBPS 覆盖（真机扫参用：0/30/60/80）。
+    #[serde(default = "default_maxbw_mbps")]
+    pub maxbw_mbps: u32,
     /// 最大并发客户端数（默认 32）
     #[serde(default = "default_max_clients")]
     pub max_clients: usize,
@@ -174,7 +185,7 @@ fn default_udp_mode() -> UdpMode {
     UdpMode::Reliable
 }
 
-/// v0.6.0：UDP 不可靠数据报默认开启（参照 hy2，根治补发风暴）
+/// v0.6.2：UDP 默认走不可靠数据报（hy1/hy2 对齐）；SRT_UDP_DATAGRAM=false 可回退可靠
 fn default_udp_datagram() -> bool {
     true
 }
@@ -187,6 +198,11 @@ fn default_latency() -> i32 {
 /// v0.6.0：不可靠 UDP TTL 下限默认 400ms（须 ≥ RTT，保护握手小包）
 fn default_udp_ttl_min() -> i32 {
     400
+}
+
+/// v0.6.5：固定码率默认 0 = 不限制（保持既有行为，需扫参时再开）
+fn default_maxbw_mbps() -> u32 {
+    0
 }
 
 fn default_max_clients() -> usize {
@@ -354,7 +370,7 @@ impl Config {
                 .map(|s| UdpMode::parse_str(&s).map_err(|e| e.to_string()))
                 .transpose()?
                 .unwrap_or_else(default_udp_mode),
-            // v0.6.0：SRT_UDP_DATAGRAM 显式设为 false/0 才关闭不可靠 UDP；默认开启
+            // v0.6.2：默认不可靠 UDP（hy2 对齐）；仅显式 SRT_UDP_DATAGRAM=false/0 才回退可靠
             udp_datagram: std::env::var("SRT_UDP_DATAGRAM")
                 .map(|s| s != "false" && s != "0")
                 .unwrap_or(true),
@@ -370,6 +386,12 @@ impl Config {
                 .map(|s| s.parse::<i32>().map_err(|_| "SRT_UDP_TTL_MIN 不是有效数字".to_string()))
                 .transpose()?
                 .unwrap_or_else(default_udp_ttl_min),
+            // v0.6.5：SRT_MAXBW_MBPS 兆比特/秒（0=不限制，与旧行为一致）
+            maxbw_mbps: std::env::var("SRT_MAXBW_MBPS")
+                .ok()
+                .map(|s| s.parse::<u32>().map_err(|_| "SRT_MAXBW_MBPS 不是有效数字".to_string()))
+                .transpose()?
+                .unwrap_or_else(default_maxbw_mbps),
             max_clients: std::env::var("SRT_MAX_CLIENTS")
                 .ok()
                 .map(|s| s.parse::<usize>().map_err(|_| "SRT_MAX_CLIENTS 不是有效数字".to_string()))
@@ -404,8 +426,14 @@ impl Config {
         if let Ok(c) = std::env::var("SRT_CRYPTO") {
             self.crypto = c;
         }
-        if let Ok(mp) = parse_env_opt_u16("SRT_METRICS_PORT") {
-            self.metrics_port = mp;
+        // 修复（v0.6.5）：parse_env_opt_u16 在变量【不存在】时返回 Ok(None)，
+        // 旧写法 `if let Ok(mp) = ...` 会把配置文件里已读到的 metrics_port 静默清空，
+        // 导致指标 HTTP 服务从未 bind（SG 上 curl :9090 一直为空的真正原因，
+        // 也使本次“重排现场/RTT/缓冲”类诊断只能改走日志）。现在仅当变量确实存在才覆盖。
+        if std::env::var("SRT_METRICS_PORT").is_ok() {
+            if let Ok(Some(mp)) = parse_env_opt_u16("SRT_METRICS_PORT") {
+                self.metrics_port = Some(mp);
+            }
         }
         if let Ok(l) = std::env::var("SRT_LISTEN") {
             self.listen = Some(l);
@@ -415,9 +443,9 @@ impl Config {
                 self.udp_mode = udp;
             }
         }
-        // v0.6.0：环境变量覆盖 UDP 不可靠开关（仅显式 false/0 才关，缺省沿用结构默认 true）
+        // v0.6.2：默认已为不可靠，此处仅支持显式关闭（false/0）回退可靠 UDP
         if let Ok(u) = std::env::var("SRT_UDP_DATAGRAM") {
-            self.udp_datagram = u != "false" && u != "0";
+            self.udp_datagram = !(u == "false" || u == "0");
         }
         // v0.6.0：环境变量覆盖 SRT 延迟（毫秒）
         if let Ok(v) = std::env::var("SRT_LATENCY") {
@@ -429,6 +457,12 @@ impl Config {
         if let Ok(v) = std::env::var("SRT_UDP_TTL_MIN") {
             if let Ok(n) = v.parse::<i32>() {
                 self.udp_ttl_min = n;
+            }
+        }
+        // v0.6.5：环境变量覆盖固定码率（兆比特/秒，0=不限制）
+        if let Ok(v) = std::env::var("SRT_MAXBW_MBPS") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.maxbw_mbps = n;
             }
         }
         if let Ok(mc) = std::env::var("SRT_MAX_CLIENTS") {

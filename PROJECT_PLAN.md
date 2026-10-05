@@ -355,6 +355,30 @@ srt-vpn/
 - [x] **上行吞吐澄清（2026-08-23 16:40 破案）**：初测"回环上行 699KB/s"经五组对照实验定性为**测试工具假象**（自写 sink 等连接关闭才回响应，curl 发完 body 互等至 max-time 超时，speed_upload=数据量/超时秒数）；修正后 **curl 经隧道上行 12.4MB/s、Python 裸 socket 经隧道 513MB/s**——v0.5.0→v0.5.2 上行无任何回归
 - [ ] **待办**：SG 公网三档验证（bench_sg.py + Chrome speedtest 观察 TTFB/多线上传/UDP 延时改善）；tag v0.5.2 发布需确认
 
+### v0.6.0 单流带宽瓶颈根治（2026-10-05，hy2 式 UDP 不可靠 + RTT 自适应延迟，见 CHANGELOG/DEVTIPS 2026-10-05）
+
+> **触发**：用户报告上传/下载带宽瓶颈 + speedtest WebRTC 多 UDP 把 CPU 跑满卡死断网；指示参照 hy1/hy2 处理、**保留 SRT 流量特征、保持单流**。
+> **决定性发现（测速驱动，纠正历史误判）**：真实 **OpenWrt(16核 x86_64)→SG(1核 aarch64) 链路 RTT=222ms**，而 v0.5.0 起所有时间常数（`rcv_latency=120ms`、UDP TTL 下限 `150ms`、TCP 背压 `300ms`）全按开发机→SG 的 ~70ms 链路调——历史“已达 141-161M 天花板”结论全部基于 70ms 路径，**非用户真实路径**。
+> **根因主线**：延迟<RTT → SRT 丢包等不到重传返回无法恢复 → FileCC 疯狂补发；叠加 v0.5.4 把 UDP 改回**可靠无限补发**(`msgttl=-1`+`SNDDROPDELAY=-1`) → WebRTC 多 UDP 洪峰 = 补发风暴 → 1 核 CPU 打满 → 并发下载塌陷 + 全隧道卡死/断网。
+> **hy2 定论（`docs/reference/hysteria/`）**：UDP 一律走 QUIC 不可靠 datagram(RFC9221)、丢即整包丢弃、传输层绝不重传、每会话有界队列队满即 drop。
+
+- [x] 修复编译前提：工作树 config.rs 被误换 v0.4 TUIC 版（无 uuid 依赖/缺 crypto_to_pbkeylen），`git checkout HEAD` 恢复后扩展
+- [x] **UDP 默认不可靠数据报**（`udp_datagram` 默认 false→true，对齐 hy2）；**TTL=max(3×RTT, `udp_ttl_min`默认400)≤1500**（`RttTracker::adaptive_ttl` 改造，`inorder=0` 不阻塞 TCP）→ 结构消除补发风暴
+- [x] **SRT 延迟 120→500ms**（`latency_ms` 配置驱动，`client/server mod.rs` 去硬编码；协商取两端 max，仅升客户端即抬旧服务端 RCVLATENCY）
+- [x] **RETRANSMITALGO 0→1**（高效重传，补发包锐减，SG CPU 频繁 90%+→多数<25%）；SNDBUF/RCVBUF 8/11→**16/16MB** 支撑 500ms
+- [x] **env 旋钮**：`SRT_LATENCY`/`SRT_UDP_TTL_MIN`/`SRT_UDP_DATAGRAM=false`(回退) 便于真机扫参
+- [x] 版本 0.5.5→0.6.0；**保持单流**（未引入多连接池）；帧格式/报文封装不变 → 原生 libsrt SRT 特征完好（SG 抓包 0x46 数据包/握手 ACK 齐备）
+- [x] 两端 0.6.0 部署（SG systemd + OpenWrt /usr/bin，旧版各留备份）+ 真实 222ms 路径 A/B 复测
+- [x] **v0.6.1 修正**：speedtest 上传仍 0 → 不可靠 UDP 丢 QUIC/WebRTC 握手（v0.5.2 同坑）；`udp_datagram` 默认改回 **false（可靠转发）**，保留 latency500/RETRANSMITALGO=1/缓冲16M（风暴真正病根）；两端重部署 0.6.1。不可靠降为 `SRT_UDP_DATAGRAM=true` 纯实时可选。
+- [x] **v0.6.2（版本号复用，不含重排）**：按用户指令“既然不是 UDP 的锅，把 UDP 改成 hy1/hy2 那样不可靠”——在 0.6.1 稳定基线（全局 seq / inorder=1 / latency500 / RETRANSMITALGO=1 / 16M 缓冲）上仅改 `udp_datagram` 默认 false→**true**（env `SRT_UDP_DATAGRAM=false` 可回退）；两端同时部署 0.6.2。**同刻 A/B 实测**：不可靠 UDP（上传 3.5-4.0MB/s、下载 7.7-13.0MB/s）优于可靠 UDP（一次上传 120s 超时 000、下载 2.1-4.1MB/s）；8 并发上传/下载全 200（聚合 4.0/20 MB/s）、MD5 一致、SG ERROR=0、抓包仍为标准 SRT（包长 1332 为主）。上一轮“并发塔/000”确认为我遗留多版本测试客户端混连的假象。
+- [x] **v0.6.5（2026-10-05 21:05）**：新增 `SRTO_MAXBW` 固定码率能力（`maxbw_mbps`/`SRT_MAXBW_MBPS`，**默认 0=不限制、行为零变化**）= hy1/hy2 Brutal 的 SRT 等价物；修复 `apply_env` 用 `if let Ok(..)` 判 `Result<Option<T>>` 导致 `metrics_port` 被静默清空、指标 HTTP 从未 bind 的 bug。本机无损回环验证：81MB/s→限 20Mbps 后下行 2.12MB/s、上行 1.91MB/s（分方向均生效），限 20Mbps 下 20MB 单流 MD5 一致、8 路并发 8/8 一致，metrics 首次返回完整 JSON。
+- [ ] **链路恢复时段扫参 `SRT_MAXBW_MBPS`（0/30/60/80）**：验证固定码率能否把"浏览器多线程上传 0"变成可用吞吐（另一半跨会话队头阻塞已证明不能用 inorder=0 换取，需另寻方案）。当前时段裸链路仅 349Kbit/s（上午 258Mbps），任何吞吐判优都不可信。
+
+- [ ] **待用户浏览器实测** speedtest 单线/多线程上传；若“上传 0”复现 → 回到 TCP 跨会话队头阻塞主线（每会话重排必须在 **netem 有损环境**（注入 1-3% 丢包 + 220ms）先跑通多流 MD5 才能上线，回环无丢包属无效验证）。
+
+> **实测结果（真实 222ms）**：单流持续下载 100m **13.4-19.1MB/s(107-153M)**、4 并发下载聚合 **162→239M(+47%)**、持续上传 100m **5.8-7.1MB/s(47-56M)**、srt-vpn CPU **多数<25%**、MD5 一致、8 并发后隧道自愈、WebRTC 补发风暴/卡死结构消除。
+> **单流物理上限（如实记录）**：受单条 FileCC 窗口在 222ms+丢包约束，全栈优化后上传 ~50M(裸 105M ~48%)、下载 ~130-150M(裸 258M ~55%)、**8 并发下载仍塌(~66M)**——严格单流无法逼近裸链路，多连接池(多窗口)可破但**用户拍板保持单流**故不引入（历史 B 方案 +4.5x 备选）。
+
 ### P2（规划：重构后更新）：TUN 模式 + iptables NAT + 动态 PID + 黑名单
 
 > P2 原规划基于 libsrt 时代，待 PX 重构落地后按新内核重新评估 TUN/NAT/动态 PID 可行性。

@@ -105,10 +105,11 @@ pub struct SrtConfig {
     pub message_api: bool,
     /// payload 大小（SRT 消息模式单包上限，1316 官方默认）
     pub payload_size: i32,
-    /// v0.5.3：UDP DATAGRAM 实验模式开关（默认 false）
-    /// false = UDP 帧走可靠传输（Data 帧 + 可靠队列，= v0.5.0 行为，WebRTC 必达）
-    /// true  = UDP 帧走 Datagram 帧 + 自适应 TTL（低延时实验特性，拥塞时会丢包，
-    ///         仅适合游戏/实时等可容忍丢包场景；参考 hy2 后结论：默认必须关）
+    /// v0.5.3 引入、v0.6.2 改为默认开启：UDP 隧道帧不可靠数据报开关
+    /// true （默认）= UDP 帧走 Datagram 帧 + RTT 自适应 TTL（inorder=0，过期即弃、
+    ///         绝不无限补发）——对齐 hy1/hy2 “UDP 不做传输层重传”的做法，
+    ///         避免拥塞时补发风暴打满单核；
+    /// false = UDP 帧走可靠 Data 帧 + 优先队列（v0.5.4/0.6.1 行为，SRT_UDP_DATAGRAM=false）。
     pub udp_datagram: bool,
     /// v0.6.0（2026-10-05）：不可靠 UDP 消息 TTL 下限毫秒。
     /// 自适应 TTL = max(3×EWMA_RTT, 本值)，下限须 ≥ 链路 RTT，保证连接初期尚未
@@ -118,6 +119,11 @@ pub struct SrtConfig {
     /// true  = 高效算法，只在必要时重传，222ms 高 RTT 丢包链路下大幅减少
     ///         补发量与单核 CPU 开销（根治补发风暴）；false=旧版激进算法(0)。
     pub retrans_efficient: bool,
+    /// v0.6.5（2026-10-05）：固定发送码率（兆比特/秒）；0=不限制（=旧行为 SRTO_MAXBW=-1）。
+    /// 这是 hy1/hy2 Brutal 在 SRT 上的等价物：把码率钉住，既不让多线程灌满共享上行
+    ///（否则 ACK/TLS 响应出不去→拥塞崩溃→浏览器多线程上传显示 0），也不让 FileCC
+    /// 因丢包反复退避（源码实证：congctl.cpp “Slowdown to avoid further losses”）。
+    pub maxbw_mbps: u32,
     /// 是否服务端（listen 模式）
     /// （P1 后半段用于区分收发策略，当前仅日志参考）
     #[allow(dead_code)]
@@ -139,10 +145,12 @@ impl Default for SrtConfig {
             reliable: true,
             message_api: true,
             payload_size: 1316, // SRT 官方默认 payload
-            // v0.6.0：UDP 不可靠数据报默认开启（参照 hy2，根治 WebRTC 无限补发风暴）
+            // v0.6.2：UDP 默认不可靠数据报（hy1/hy2 对齐；可靠为 SRT_UDP_DATAGRAM=false 可选）
             udp_datagram: true,
             udp_ttl_min: 400,
             retrans_efficient: true,
+            // v0.6.5：默认不限制码率（与旧版 SRTO_MAXBW=-1 完全一致），待真机扫参再开
+            maxbw_mbps: 0,
             is_server: false,
         }
     }
@@ -315,7 +323,7 @@ pub struct SrtConnection {
     send_rel_tx: std::sync::Mutex<Option<Sender<SendItem>>>,
     #[allow(dead_code)]
     send_prio_tx: std::sync::Mutex<Option<Sender<SendItem>>>,
-    /// v0.5.3：是否启用 UDP DATAGRAM 实验模式（来自 SrtConfig.udp_datagram，默认 false）
+    /// 是否启用 UDP 不可靠数据报（来自 SrtConfig.udp_datagram，v0.6.2 默认 true）
     /// false = UDP 走可靠 Data 帧（= v0.5.0 行为，WebRTC 必达）；true = Datagram 帧 + 自适应 TTL
     udp_datagram: bool,
     /// v0.5.2：RTT 跟踪器（接收线程采样写入，上层 adaptive_ttl_ms 读取）
@@ -748,9 +756,17 @@ impl SrtConnection {
         set(SRT_SOCKOPT::SRTO_UDP_SNDBUF, &udp_sndbuf)?;
         set(SRT_SOCKOPT::SRTO_UDP_RCVBUF, &udp_rcvbuf)?;
 
-        // 发送带宽上限：-1 = 无限（官方文档：Live Mode 上限 1Gbps）。
-        // 不限制发送带宽，让发送端全力发送，由接收端缓冲 + 流控窗口做背压。
-        let max_bw: i64 = -1; // 官方：-1 = infinite
+        // 发送带宽上限（v0.6.5 改为可配）：
+        // - maxbw_mbps=0 → -1（无限）：保持旧行为，发送端全力发，由接收端缓冲+流控窗做背压；
+        // - maxbw_mbps>0 → 钉住码率：= hy1/hy2 Brutal 的 SRT 等价物。动机是两类已知病：
+        //   ① FileCC 把丢包当拥塞，222ms+丢包下会退避到地板（congctl.cpp L469-470/L552-553）；
+        //   ② 多线程上传时无限发送会把窄上行灌满→ACK/响应出不去→拥塞崩溃（表现为上传 0）。
+        // 注意：SRTO_MAXBW 单位是【字节/秒】（srt.h:190 注释），故对外 Mbps 需 /8 换算。
+        let max_bw: i64 = if cfg.maxbw_mbps == 0 {
+            -1 // 官方：-1 = infinite
+        } else {
+            (cfg.maxbw_mbps as i64) * 1_000_000 / 8
+        };
         set(SRT_SOCKOPT::SRTO_MAXBW, &max_bw)?;
         // SRTO_MININPUTBW 是 int64（仅 MAXBW=0 时生效，这里保持 0）
         let min_input_bw: i64 = 0;
@@ -964,7 +980,18 @@ impl SrtConnection {
             let mut broken = false;
             for ev in events_buf.iter().take(n as usize) {
                 if ev.events & SRT_EPOLL_ERR != 0 {
-                    tracing::warn!("SRT epoll 错误事件");
+                    // v0.6.3（2026-10-05）：补上断链归因上下文。
+                    // 此前这里只有一句“SRT epoll 错误事件”就终止连接，导致“间歇性中断”
+                    // 无法定位（NAT 空闲超时？收包溢出？对端无响应？三者处置方式完全不同）。
+                    // 现在同时输出 socket 状态码与 libsrt 最后一次错误串。
+                    let st = unsafe { srt_getsockstate(recv_sock) };
+                    let err = unsafe { last_error_str() };
+                    tracing::warn!(
+                        sock_state = st as i32,
+                        last_error = %err,
+                        buffered = recv_len.load(std::sync::atomic::Ordering::Relaxed),
+                        "SRT epoll 错误事件（连接终止，待重连）"
+                    );
                     let _ = recv_tx.send(SrtMessage { data: Vec::new() });
                     broken = true;
                     break;
@@ -1066,6 +1093,17 @@ impl SrtConnection {
             let mut mctrl = super::bindings::SRT_MSGCTRL {
                 // QUIC 语义映射核心：
                 msgttl: if item.reliable { -1 } else { item.ttl_ms },
+                // v0.6.4（2026-10-05）：回退为可靠帧 inorder=1（真机实测结论）。
+                // 【为何不用 inorder=0】0.6.3 把它改成统一 0 + 每会话重排，真机（真实
+                // OpenWrt→SG 222ms）实测：数据正确性完全成立（out_of_order=229~284、
+                // stale_dropped=0、buffered=0、MD5 一致），但吞量退化两个量级：
+                // 单流下载 136KB/s、上传 582KB/s 且超时（而 0.6.2 为 12-19MB/s）。
+                // 机制：inorder=1 时“有序流 + 应用背压”实际上充当了整流/限流器；一旦允许
+                // 越过空洞提前交付，发送端变得激进、接收缓冲更快耗尽，FileCC 在真实丢包下
+                // 退避到地板——“跳过空洞”换来的并发收益远不够赔。
+                // 【保留的部分】复用层 [epoch|会话内序号] + 每会话重排仍在：有序交付时它
+                // 是“直通”（buffered 恒 0），但它是未来改方案（如固定码率）的现成基础设施；
+                // 心跳走优先队列、断链归因日志均为本次实测剖出的真问题修复。
                 inorder: if item.reliable { 1 } else { 0 },
                 ..super::bindings::SRT_MSGCTRL::default()
             };
@@ -1104,8 +1142,8 @@ impl SrtConnection {
 
     /// 发送不可靠数据（QUIC DATAGRAM 语义，v0.5.2 引入；v0.5.3 路由到优先队列）
     ///
-    /// 仅当 udp_datagram=true（实验开关）时才真正以不可靠消息发送；
-    /// 该开关关闭时上层（TunnelSession）会直接走可靠 Data 帧，不会调用到这里。
+    /// v0.6.2 起为 UDP 隧道的默认发送路径（udp_datagram=true）；
+    /// 开关关闭时上层（TunnelSession）会走可靠 Data 帧 + 优先队列，不会调用到这里。
     pub fn send_unreliable(&self, data: Vec<u8>, ttl_ms: i32) -> Result<(), SrtError> {
         self.send_item_to(true, SendItem::unreliable(data, ttl_ms))
     }

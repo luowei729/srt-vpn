@@ -63,6 +63,8 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
         udp_datagram: cfg.udp_datagram,
         udp_ttl_min: cfg.udp_ttl_min,
         retrans_efficient: true,
+        // v0.6.5：固定码率透传（0=不限制，行为与旧版一致；SRT_MAXBW_MBPS 真机扫参）
+        maxbw_mbps: cfg.maxbw_mbps,
         is_server: false,
     };
 
@@ -145,7 +147,13 @@ pub async fn run(cfg: &Config, args: &crate::cli::Args) -> Result<(), String> {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(heartbeat_secs)).await;
                 let hb = hb_mux.encode_heartbeat();
-                if let Err(e) = hb_conn.send(hb) {
+                // v0.6.3（2026-10-05）：心跳改走【优先队列】。
+                // 之前走可靠队列，会排在各会话的 TCP 数据帧后面：大流量拥塞时心跳被
+                // 自己发的数据拖住几十秒发不出去 → NAT/对端视为空闲 → SRT 判无响应进
+                // BROKEN → 整条隧道每隔几分钟间歇中断（用户报告的现场，SG 日志
+                // “epoll 错误事+客户端断开”成对出现即此）。
+                // 优先队列每轮先清空，保活小包插队；仍为可靠必达（send_priority）。
+                if let Err(e) = hb_conn.send_priority(hb) {
                     tracing::warn!(error = %e, "心跳发送失败");
                     break; // 连接不可用，退出心跳任务（由重连循环重建）
                 }
@@ -235,10 +243,10 @@ async fn run_recv_inner(
         match conn.recv_batch_async(512).await {
             Ok(batch) => {
                 for msg in batch {
-                    // SRT 消息 → 复用层帧（无 TS 壳，直接解析帧头）
-                    if let Some(frame) =
-                        crate::tunnel::multiplex::decode_srt_message(&msg.data, &mut mux_dec)
-                    {
+                    // v0.6.3：feed 解析 + 每会话重排。inorder=0 后会话内字节序由此保证；
+                    // 某会话出现丢包空洞时只缓冲它自己的帧，不阻塞其他会话
+                    //（跨会话队头阻塞的根治点）。
+                    for frame in mux_dec.feed(&msg.data) {
                         // 先用分发器处理 Data/Fin/Close 帧
                         match crate::tunnel::dispatch::dispatch_frame(&frame, &registry) {
                             crate::tunnel::dispatch::DispatchAction::Routed => {
@@ -314,8 +322,6 @@ async fn run_recv_inner(
                                 }
                             }
                         }
-                    } else {
-                        tracing::warn!("收到无效隧道帧");
                     }
                 }
             }

@@ -176,10 +176,12 @@ async fn authenticate(
             // 异步批量接收（真正的 async 等待，不阻塞 worker）
             // S3：非 Response 业务帧缓存到本地 Vec，认证完成后随 payload 一起返回
             let mut buffered: Vec<crate::tunnel::multiplex::Frame> = Vec::new();
+            // 解码器持久（与主循环一致；全局 seq inorder=1 下仅用于 last_seq 连续性）
+            let mut mux_dec = MuxDecoder::new();
             loop {
                 match conn_for_wait.recv_async().await {
                     Ok(msg) => {
-                        let mut mux_dec = MuxDecoder::new();
+                        // 0.6.1 行为：decode_srt_message 解析单帧
                         if let Some(f) = crate::tunnel::multiplex::decode_srt_message(&msg.data, &mut mux_dec) {
                             if f.ftype == FrameType::Response {
                                 return Some((f.payload, buffered));
@@ -261,7 +263,9 @@ async fn handle_client(
     // 每客户端独立会话空间（决策 Q20）：SessionRegistry 按客户端隔离
     let registry = crate::tunnel::dispatch::SessionRegistry::new();
     let mut mux_dec = MuxDecoder::new();
-    let mux_enc = MuxEncoder::new(reliable);
+    // v0.6.3：服务端是会话的 acceptor，它发出的会话帧必须标“回传方向”，
+    // 客户端才能按 (sid, 回传方向) 建立独立序号空间（否则下行数据会被当成“Open 未到”丢弃）
+    let mux_enc = MuxEncoder::new_acceptor(reliable);
     let mux_enc_arc = Arc::new(mux_enc);
 
     tracing::info!("客户端隧道处理开始");
@@ -311,16 +315,13 @@ async fn handle_client(
                 };
                 g_rx_frames += batch.len() as u64;
                 for msg in batch {
-                    let frame = match crate::tunnel::multiplex::decode_srt_message(&msg.data, &mut mux_dec) {
-                        Some(f) => f,
-                        None => {
-                            tracing::warn!("收到无效隧道帧");
-                            continue;
-                        }
-                    };
-                    g_rx_total += frame.payload.len() as u64;
-                    // S3 抽取：单帧分发（与认证回放共用同一路径，行为一致）
-                    dispatch_one_frame(&frame, &conn, &mux_enc_arc, &registry);
+                    // v0.6.3：feed 解析 + 每会话重排（与客户端对称）。
+                    // inorder=0 后会话内有序由此保证，且一个会话丢包不再冻结其他会话。
+                    for frame in mux_dec.feed(&msg.data) {
+                        g_rx_total += frame.payload.len() as u64;
+                        // S3 抽取：单帧分发（与认证回放共用同一路径，行为一致）
+                        dispatch_one_frame(&frame, &conn, &mux_enc_arc, &registry);
+                    }
                 }
             }
             // 分支 2：心跳定时周期到 -- 主动发心跳，检测死连接
@@ -335,7 +336,10 @@ async fn handle_client(
                 }
                 // 其它情况：主动发心跳帧保活（对端 NAT/中间态保持）
                 let hb = mux_enc_arc.encode_heartbeat();
-                if let Err(e) = conn.send(hb) {
+                // v0.6.3（2026-10-05）：心跳走【优先队列】，不被本端待发的 TCP 数据
+                // 积压拖住（与客户端同一修复：保活小包必须插队，否则拥塞时会误判对端
+                // 无响应导致隧道间歇中断）。
+                if let Err(e) = conn.send_priority(hb) {
                     tracing::warn!(error = %e, "主动发送心跳失败");
                     break;
                 }

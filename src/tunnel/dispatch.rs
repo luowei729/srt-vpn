@@ -229,16 +229,15 @@ impl TunnelSession {
         Ok(())
     }
 
-    /// 发送 UDP 隧道数据（v0.5.4 按 udp_datagram 开关分流）
+    /// 发送 UDP 隧道数据（按 udp_datagram 开关分流）
     ///
-    /// 默认（开关关）：Data 帧【可靠传输】+ 【优先队列】——可靠必达保 WebRTC 的
-    /// STUN/DTLS 握手存活（v0.5.2 教训：拥塞时 TTL 丢弃导致上传归零），同时
-    /// 优先队列让 UDP 小包不被 TCP 大流量积压拖延（v0.5.3 引入的调度能力）。
-    /// 开关开（实验）：Datagram 帧 + 自适应 TTL 走优先队列——低延时但会丢包，
-    /// 仅适合游戏/实时等可容忍丢包场景。
+    /// v0.6.2 默认（开关开）：Datagram 帧 + RTT 自适应 TTL 走优先队列——丢即弃、
+    /// 绝不无限补发（hy1/hy2 对 UDP 的做法），拥塞时不会制造补发风暴打满单核。
+    /// 开关关（SRT_UDP_DATAGRAM=false，v0.5.4/0.6.1 行为）：Data 帧【可靠传输】+
+    /// 【优先队列】——必达但拥塞时可能重传堆积，适合对丢包敏感的 UDP 应用。
     pub async fn send_unreliable(&self, data: &[u8]) -> Result<(), String> {
         if !self.conn.udp_datagram_enabled() {
-            // 默认路径：Data 帧可靠 + 优先队列（必达且低排队延时）
+            // 回退路径：Data 帧可靠 + 优先队列（必达且低排队延时）
             for chunk in data.chunks(FRAME_DATA_MAX) {
                 let frame = self.mux_enc.encode_frame(FrameType::Data, self.session_id, 0, chunk);
                 // 同步投递到优先队列（crossbeam unbounded 不阻塞）
@@ -250,7 +249,7 @@ impl TunnelSession {
             m.tx_bytes.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
-        // 实验路径：同一数据报的所有分片共用一个 TTL，避免部分分片先弃导致重组失败
+        // 不可靠路径（v0.6.2 默认）：同一数据报的所有分片共用一个 TTL，避免部分分片先弃导致重组失败
         let ttl = self.conn.adaptive_ttl_ms();
         for chunk in data.chunks(FRAME_DATA_MAX) {
             let frame = self.mux_enc.encode_frame(FrameType::Datagram, self.session_id, 0, chunk);
